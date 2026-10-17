@@ -1,0 +1,167 @@
+"""Symbol extraction and chunking (tree-sitter parsers load lazily).
+
+Language dispatch goes through the plugin registry (registry.py): builtin and
+user drop-in plugins declare allowlist extensions, grammar names, symbol node
+maps, and optional specialized extractors.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Any
+
+from simple_code_indexer.models import Chunk, Symbol
+from simple_code_indexer.registry import LanguageSpec, get_registry
+
+_GENERIC_SYMBOL_NODES: dict[str, str] = {
+    "function_declaration": "function",
+    "function_definition": "function",
+    "class_declaration": "class",
+    "interface_declaration": "interface",
+    "method_definition": "method",
+}
+
+# Fallback scan for languages without a loaded grammar (TDD §7.4).
+_REGEX_SYMBOLS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^\s*def\s+([A-Za-z_]\w*)"), "function"),
+    (
+        re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_]\w*)"),
+        "function",
+    ),
+    (re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)"), "function"),
+    (re.compile(r"^\s*class\s+([A-Za-z_]\w*)"), "class"),
+    (re.compile(r"^\s*interface\s+([A-Za-z_]\w*)"), "interface"),
+)
+
+_parsers: dict[str, Any] = {}
+
+
+def detect_language(path: Path) -> str | None:
+    """Map a path to a plugin language name, or None if not allowlisted."""
+    spec = get_registry().detect(path)
+    return spec.name if spec is not None else None
+
+
+def chunk_source(
+    source: str, *, max_lines: int = 80, max_chars: int = 2000
+) -> list[Chunk]:
+    """Line-aligned chunk windows bounded by max_lines and max_chars."""
+    lines = source.splitlines()
+    chunks: list[Chunk] = []
+    start = 0
+    while start < len(lines):
+        end = min(start + max_lines, len(lines))
+        content = "\n".join(lines[start:end])
+        while len(content) > max_chars and end > start + 1:
+            end -= 1
+            content = "\n".join(lines[start:end])
+        if content.strip():
+            chunks.append(
+                Chunk(
+                    chunk_index=len(chunks),
+                    start_line=start + 1,
+                    end_line=end,
+                    content=content,
+                )
+            )
+        start = end
+    return chunks
+
+
+def _parser(lang: str) -> Any:
+    """Lazy parser load: keeps server startup <3 s (TDD §7.9)."""
+    if lang not in _parsers:
+        from tree_sitter_language_pack import get_parser
+
+        _parsers[lang] = get_parser(lang)
+    return _parsers[lang]
+
+
+def extract_symbols(path: Path, source: str) -> list[Symbol]:
+    """Extract symbols from source; regex fallback when no grammar is loadable."""
+    spec = get_registry().detect(path)
+    if spec is None:
+        return _regex_symbols(source)
+    try:
+        parser = _parser(spec.grammar)
+    except (ImportError, LookupError, OSError, ValueError):
+        return _regex_symbols(source)
+    tree = parser.parse(source.encode("utf-8"))
+    return extract_from_tree(spec, tree.root_node, source)
+
+
+def extract_from_tree(spec: LanguageSpec, root: Any, source: str) -> list[Symbol]:
+    """Run the plugin's extractor, or the generic name-field walker."""
+    if spec.extract is not None:
+        return spec.extract(root, source)
+    return _extract_generic(
+        root, source, {**_GENERIC_SYMBOL_NODES, **spec.symbol_nodes}
+    )
+
+
+def _walk(root: Any) -> list[Any]:
+    nodes: list[Any] = []
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        nodes.append(node)
+        stack.extend(reversed(node.children))
+    return nodes
+
+
+def _text(node: Any, source: str) -> str:
+    return source.encode("utf-8")[node.start_byte : node.end_byte].decode("utf-8")
+
+
+def _signature(node: Any, source: str) -> str:
+    """Node text up to its body — e.g. `uint32_t f(const Widget&)`."""
+    body = node.child_by_field_name("body")
+    end = body.start_byte if body is not None else node.end_byte
+    return (
+        source.encode("utf-8")[node.start_byte : end]
+        .decode("utf-8")
+        .rstrip()
+        .rstrip(";")
+    )
+
+
+def _extract_generic(
+    root: Any, source: str, symbol_nodes: dict[str, str]
+) -> list[Symbol]:
+    symbols: list[Symbol] = []
+    for node in _walk(root):
+        kind = symbol_nodes.get(node.type)
+        if kind is None:
+            continue
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            continue
+        symbols.append(
+            Symbol(
+                name=_text(name_node, source),
+                kind=kind,
+                line=node.start_point[0] + 1,
+                line_end=node.end_point[0] + 1,
+                signature=_signature(node, source) or None,
+            )
+        )
+    return symbols
+
+
+def _regex_symbols(source: str) -> list[Symbol]:
+    symbols: list[Symbol] = []
+    for line_no, line in enumerate(source.splitlines(), start=1):
+        for pattern, kind in _REGEX_SYMBOLS:
+            match = pattern.match(line)
+            if match:
+                symbols.append(
+                    Symbol(
+                        name=match.group(1),
+                        kind=kind,
+                        line=line_no,
+                        signature=line.strip(),
+                    )
+                )
+                break
+    return symbols

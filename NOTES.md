@@ -1,0 +1,16 @@
+# Notes
+
+Gotchas, oddities and findings that are not open issues ([`ISSUES.md`](ISSUES.md)). 
+Read this before a live-model session — the provider and harness quirks below cost real time to rediscover.
+
+## simple-code-indexer
+- **Workspace walks must prune ignored dirs (`os.walk` + `dirnames[:]`), never `Path.rglob("*")`** — rglob descends into `.venv` (tens of thousands of files) over the Docker Desktop bind mount, which made the startup reconcile take so long that the phase-2 probe timed out with only 6 files indexed. `indexer.iter_workspace_files` prunes; keep it that way if refactoring.
+- **Recursive `observer.schedule(..., recursive=True)` has the same .venv problem** (registration blocked >10 s, `watcher_alive` never went true). The watcher registers one non-recursive watch per interesting directory (`watcher.interesting_dirs`) and adds watches for newly created dirs from directory-created events.
+- MCP SDK is **2.x** (installed `mcp==2.3.0`): the TDD's decorator API (`@server.list_tools`) no longer exists — handlers are constructor kwargs (`Server(name, on_list_tools=…, on_call_tool=…)`), and models are constructed with **snake_case** field names (`input_schema=`, `is_error=`), serialized camelCase on the wire.
+- Ruff 0.17 formats Python code blocks inside `*.md` and wanted to rewrite `docs/tdd.md` (the build contract) — `pyproject.toml` excludes `*.md` from ruff.
+- **llama.cpp embedding endpoint has physical batch size 512**: any single input over ~512 tokens returns HTTP 500 (`input (N tokens) is too large to process`). Batches of many short texts are fine. `embed.embed_texts` splits oversized texts into ≤1200-char pieces and mean-pools the piece vectors — keep that guard even if chunk sizes change.
+- Loopback connections to closed ports on this Windows host take **2–4 s to fail** (not instant RST) — unit tests must not hit the network; `test_indexer`/`test_watcher` stub `embed.embed_texts`, and `embed.py` caps connect timeout at 1 s.
+- **Plugin allowlist needs filename matching**: `Path("CMakeLists.txt").suffix == ".txt"` and `Path("Dockerfile").suffix == ""` — `path.suffix` alone cannot express those, hence `Settings.allowed_filenames` + `config.is_allowed`. `Path(".vimrc").suffix` is also empty; `.vimrc` is registered as a FILENAME (and `.vimrc` as an extension for `foo.vimrc`).
+- **tree-sitter-language-pack downloads grammars on demand**: on a fresh machine only `['cpp','python']` are local until `get_parser` fetches the rest. Server startup prefetches in a daemon thread (`PREFETCH_GRAMMARS=0` to disable); offline first-use falls back to the regex symbol scan. Unit tests that parse non-python/cpp languages must stub `parse._parser`.
+- **Plugin user override is silent** (debug log only): a `plugins/cpp.py` replaces the builtin by `NAME` and frees/reclaims its extensions — redeclare the original extensions in the user plugin or `.cpp`/`.py` stop matching. `detect_language` returns the plugin `NAME` (`c_sharp`), not the pack grammar (`csharp`).
+- **Data/doc formats are deliberately not in the builtin set** (json, yaml, toml, xml, csv, markdown, plaintext, rst, latex, regex) — the original registry's 47 entries ship as 36 builtin plugins (those 10 skipped, matlab omitted because `.m` is owned by objc).

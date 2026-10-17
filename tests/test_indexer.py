@@ -1,0 +1,132 @@
+from pathlib import Path
+
+import pytest
+
+from simple_code_indexer import db, embed, indexer
+from simple_code_indexer.config import IGNORE_DIRS, Settings
+from simple_code_indexer.errors import EmbedError
+from simple_code_indexer.registry import get_registry
+
+FIXTURE = """\
+#include <cstdint>
+
+uint32_t calculateWidgetChecksum(int seed) {
+    uint32_t acc = static_cast<uint32_t>(seed);
+    return acc ^ 0x9E3779B9u;
+}
+"""
+
+
+@pytest.fixture(autouse=True)
+def _no_embed_network(monkeypatch) -> None:
+    """Unit tests index lexically; embedding failure path is test_embed's job."""
+
+    def _stub(settings, texts):
+        raise EmbedError("stubbed out in unit tests")
+
+    monkeypatch.setattr(embed, "embed_texts", _stub)
+
+
+def _settings(workspace: Path) -> Settings:
+    registry = get_registry()
+    return Settings(
+        workspace_root=workspace,
+        index_db_path=workspace / ".index" / "index.db",
+        qdrant_url="http://localhost:6333",
+        qdrant_collection="code_index_2560",
+        embed_base_url="http://localhost:1",  # hermetic: fail-soft embed path
+        embed_model="Qwen3-Embedding-4B-Q6_K",
+        embed_dim=2560,
+        embed_timeout_s=15.0,
+        sweep_seconds=45.0,
+        debounce_ms=400,
+        allowed_exts=registry.extension_allowlist(),
+        allowed_filenames=registry.filename_allowlist(),
+        ignore_dirs=IGNORE_DIRS,
+    )
+
+
+def test_index_one_file_end_to_end(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    source = tmp_path / "widget_checksum.cpp"
+    source.write_text(FIXTURE, encoding="utf-8")
+
+    outcome = indexer.index_one_file(settings, source)
+    assert outcome.status == "indexed"
+    assert outcome.path == "widget_checksum.cpp"
+    assert outcome.duration_ms >= 0
+
+    with db.connect(settings.index_db_path, readonly=True) as conn:
+        assert db.stats(conn) == {"files": 1, "symbols": 1, "chunks": 1}
+        hits = db.fts_search(conn, "calculateWidgetChecksum", limit=5)
+        assert len(hits) == 1
+        assert hits[0].path == "widget_checksum.cpp"
+        symbols = db.symbol_lookup(conn, "calculateWidgetChecksum")
+        assert len(symbols) == 1
+        assert symbols[0].line == 3
+
+
+def test_hash_short_circuit(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    source = tmp_path / "a.cpp"
+    source.write_text("int a() { return 1; }", encoding="utf-8")
+    assert indexer.index_one_file(settings, source).status == "indexed"
+    second = indexer.index_one_file(settings, source)
+    assert second.status == "skipped_unchanged"
+
+
+def test_skipped_filtered_and_missing_file(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    md = tmp_path / "notes.md"
+    md.write_text("hi", encoding="utf-8")
+    assert indexer.index_one_file(settings, md).status == "skipped_filtered"
+    missing = tmp_path / "ghost.cpp"
+    assert indexer.index_one_file(settings, missing).status == "error"
+
+
+def test_sweep_prunes_ignored_dirs(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / ".venv" / "lib.py").write_text(
+        "def hidden():\n    pass\n", encoding="utf-8"
+    )
+    (tmp_path / "node_modules" / "x.py").write_text(
+        "def also_hidden():\n    pass\n", encoding="utf-8"
+    )
+    (tmp_path / "visible.py").write_text("def visible():\n    pass\n", encoding="utf-8")
+
+    stats = indexer.sweep(settings)
+    assert stats.indexed == 1
+    with db.connect(settings.index_db_path, readonly=True) as conn:
+        paths = [str(r["path"]) for r in conn.execute("SELECT path FROM files")]
+    assert paths == ["visible.py"]
+
+
+def test_sweep_indexes_drift_and_removes_deleted(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    a = tmp_path / "a.cpp"
+    b = tmp_path / "b.py"
+    a.write_text("int a() { return 1; }", encoding="utf-8")
+    b.write_text("def b():\n    return 2\n", encoding="utf-8")
+
+    first = indexer.sweep(settings)
+    assert first.indexed == 2
+    assert first.errors == 0
+
+    again = indexer.sweep(settings)
+    assert again.indexed == 0
+    assert again.unchanged == 2
+
+    a.write_text("int a() { return 42; }  // changed", encoding="utf-8")
+    b.unlink()
+    third = indexer.sweep(settings)
+    assert third.indexed == 1
+
+    with db.connect(settings.index_db_path, readonly=True) as conn:
+        stats = db.stats(conn)
+        assert stats["files"] == 1
+        assert db.fts_search(conn, "return", limit=10) and all(
+            h.path == "a.cpp" for h in db.fts_search(conn, "return", limit=10)
+        )
+        assert db.symbol_lookup(conn, "b") == []

@@ -1,8 +1,18 @@
 # AGENTS.md
 
-## What this is
+## Project Overview
 
-Minimal **code-index MCP server** (Python): watch files, index on save into **SQLite/FTS5** (lexical) + **Qdrant** (semantic vectors). Background/context: [`code-index-mcp-handoff.md`](code-index-mcp-handoff.md) and [`code-index-mcp-report.md`](code-index-mcp-report.md) — trust those over prose here when they conflict with unfinished code.
+Minimal **code-index MCP server** (Python): watch files, index on save into **SQLite/FTS5** (lexical) + **Qdrant** (semantic vectors).
+
+## Project Docs
+
+Read the relevant doc before planning or reporting work:
+- @ISSUES.md — the ongoing issue tracker. **Add every issue, bug or defect flagged during an LLM session here — even if it is only mentioned in passing in the summary — and delete the entry once it is fixed.** 
+- @NOTES.md — gotchas, watch-outs and oddities. **Add anything a future session needs to know that is not an open issue here.**
+
+## Generated Files
+
+- @/artifacts/ — All intermediate/throwaway artifact files (markdown, test files, scratch outputs, etc.) that aren't production code.
 
 ## Toolchain (verified)
 
@@ -34,7 +44,7 @@ tests/                     # pytest
 pyproject.toml             # deps + ruff / pyright / pytest config
 ```
 
-## Runtime / external services (from handoff — not wired in code yet)
+## Runtime / external services (not wired in code yet)
 
 These are the decided targets when the indexer is implemented; do not invent different defaults:
 

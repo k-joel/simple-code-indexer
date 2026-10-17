@@ -1,0 +1,254 @@
+"""Index unit of work: index_one_file, reconciliation sweep (backstop),
+and the single-writer queue consumer."""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+import queue
+import sqlite3
+import time
+from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import NamedTuple
+
+from simple_code_indexer import db, embed, parse, qdrant_store
+from simple_code_indexer.config import Settings, is_allowed, is_temp_name
+from simple_code_indexer.errors import EmbedError, QdrantUnavailable
+from simple_code_indexer.models import Chunk, FileRecord
+
+logger = logging.getLogger(__name__)
+
+# Last successful sweep completion (UTC ISO); read by get_status.
+LAST_SWEEP: str | None = None
+
+
+class IndexOutcome(NamedTuple):
+    path: str
+    status: str  # indexed | skipped_unchanged | skipped_filtered | error
+    duration_ms: int
+
+
+class SweepStats(NamedTuple):
+    checked: int
+    indexed: int
+    unchanged: int
+    removed: int
+    errors: int
+
+
+@dataclass(frozen=True, slots=True)
+class WorkItem:
+    """Queue item: index path (or remove it when deleted=True)."""
+
+    path: Path
+    deleted: bool = False
+
+
+class SweepRequest:
+    """Queue sentinel: run a reconciliation sweep in the writer thread."""
+
+
+SWEEP_REQUEST = SweepRequest()
+WorkQueue = queue.Queue[WorkItem | SweepRequest]
+
+
+def new_work_queue(maxsize: int = 500) -> WorkQueue:
+    return queue.Queue(maxsize=maxsize)
+
+
+def _relative(settings: Settings, path: Path) -> str | None:
+    try:
+        return path.resolve().relative_to(settings.workspace_root.resolve()).as_posix()
+    except ValueError:
+        return None
+
+
+def _is_ignored(settings: Settings, path: Path) -> bool:
+    return any(part in settings.ignore_dirs for part in path.parts)
+
+
+def iter_workspace_files(settings: Settings) -> Iterator[Path]:
+    """Yield allowlisted files, pruning ignored dirs (rglob would walk .venv)."""
+    root = settings.workspace_root
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        dirnames[:] = [d for d in dirnames if d not in settings.ignore_dirs]
+        for name in filenames:
+            if is_temp_name(name):
+                continue
+            path = Path(dirpath) / name
+            if is_allowed(settings, path):
+                yield path
+
+
+def index_one_file(settings: Settings, path: Path) -> IndexOutcome:
+    """Parse + store one file; hash short-circuit on no-op saves."""
+    start = time.perf_counter()
+    rel = _relative(settings, path)
+
+    def done(status: str) -> IndexOutcome:
+        return IndexOutcome(
+            path=rel or str(path),
+            status=status,
+            duration_ms=int((time.perf_counter() - start) * 1000),
+        )
+
+    if (
+        rel is None
+        or not is_allowed(settings, path)
+        or is_temp_name(path.name)
+        or _is_ignored(settings, path)
+    ):
+        return done("skipped_filtered")
+    try:
+        data = path.read_bytes()
+    except OSError:
+        logger.warning("cannot read %s", path, exc_info=True)
+        return done("error")
+
+    digest = hashlib.sha256(data).hexdigest()
+    source = data.decode("utf-8", errors="replace")
+    try:
+        with db.connect(settings.index_db_path) as conn:
+            db.ensure_schema(conn)
+            if db.file_hash(conn, rel) == digest:
+                return done("skipped_unchanged")
+            record = FileRecord(
+                path=rel,
+                language=parse.detect_language(path) or "text",
+                size=len(data),
+                sha256=digest,
+                mtime=path.stat().st_mtime,
+            )
+            symbols = parse.extract_symbols(path, source)
+            chunks = parse.chunk_source(source)
+            with conn:
+                file_id = db.upsert_file(conn, record)
+                db.replace_file_symbols(conn, file_id, symbols)
+                db.replace_file_chunks(conn, file_id, chunks)
+        _embed_and_store(settings, rel, chunks)
+        return done("indexed")
+    except (sqlite3.Error, OSError, ValueError):
+        logger.exception("failed to index %s", path)
+        return done("error")
+
+
+def _embed_and_store(settings: Settings, rel: str, chunks: list[Chunk]) -> None:
+    """Embed + upsert vectors; fail soft and record embedding_state (TDD §7.5)."""
+    if not chunks:
+        return
+    points = {
+        c.chunk_index: str(qdrant_store.point_id(rel, c.chunk_index)) for c in chunks
+    }
+    status = "ok"
+    try:
+        vectors = embed.embed_texts(settings, [c.content for c in chunks])
+        try:
+            qdrant_store.upsert_chunks(settings, rel, list(zip(chunks, vectors)))
+        except QdrantUnavailable:
+            status = "error"
+            logger.warning("qdrant upsert failed for %s", rel, exc_info=True)
+    except EmbedError:
+        status = "error"
+        logger.warning("embedding failed for %s", rel, exc_info=True)
+    try:
+        with db.connect(settings.index_db_path) as conn, conn:
+            rows = [
+                (chunk_id, points[chunk_index], status)
+                for chunk_id, chunk_index in db.chunk_ids_for_path(conn, rel)
+                if chunk_index in points
+            ]
+            db.record_embedding_state(conn, rows)
+    except sqlite3.Error:
+        logger.warning("embedding_state update failed for %s", rel, exc_info=True)
+
+
+def sweep(settings: Settings) -> SweepStats:
+    """Walk the workspace; re-index drift, drop deleted paths (TDD §4.3)."""
+    global LAST_SWEEP
+
+    with db.connect(settings.index_db_path) as conn:
+        db.ensure_schema(conn)
+        stored = {
+            str(row["path"]): (float(row["mtime"]), int(row["size"]))
+            for row in conn.execute("SELECT path, mtime, size FROM files")
+        }
+
+    checked = indexed = unchanged = errors = 0
+    seen: set[str] = set()
+    for path in iter_workspace_files(settings):
+        rel = _relative(settings, path)
+        if rel is None:
+            continue
+        seen.add(rel)
+        checked += 1
+        try:
+            stat = path.stat()
+        except OSError:
+            continue  # vanished mid-sweep; next pass handles removal
+        if stored.get(rel) == (stat.st_mtime, stat.st_size):
+            unchanged += 1
+            continue
+        status = index_one_file(settings, path).status
+        if status == "indexed":
+            indexed += 1
+        elif status == "skipped_unchanged":
+            unchanged += 1
+        else:
+            errors += 1
+
+    stale_paths = sorted(stored.keys() - seen)
+    removed = 0
+    with db.connect(settings.index_db_path) as conn, conn:
+        for stale in stale_paths:
+            db.delete_file(conn, stale)
+            removed += 1
+    for stale in stale_paths:
+        _delete_vectors(settings, stale)
+
+    LAST_SWEEP = datetime.now(UTC).isoformat(timespec="seconds")
+    return SweepStats(
+        checked=checked,
+        indexed=indexed,
+        unchanged=unchanged,
+        removed=removed,
+        errors=errors,
+    )
+
+
+def _delete_vectors(settings: Settings, rel: str) -> None:
+    try:
+        qdrant_store.delete_by_path(settings, rel)
+    except QdrantUnavailable:
+        # Orphan points are harmless: semantic hits are re-checked against SQLite.
+        logger.warning("qdrant delete failed for %s", rel, exc_info=True)
+
+
+def remove_file(settings: Settings, path: Path) -> None:
+    """Drop a deleted path from the index (tombstone work item)."""
+    rel = _relative(settings, path)
+    if rel is None:
+        return
+    with db.connect(settings.index_db_path) as conn, conn:
+        db.delete_file(conn, rel)
+    _delete_vectors(settings, rel)
+
+
+def writer_loop(settings: Settings, work_queue: WorkQueue) -> None:
+    """Single index writer: consumes paths, tombstones and sweep requests."""
+    while True:
+        item = work_queue.get()
+        try:
+            if isinstance(item, SweepRequest):
+                sweep(settings)
+            elif item.deleted:
+                remove_file(settings, item.path)
+            else:
+                index_one_file(settings, item.path)
+        except Exception:
+            logger.exception("writer failed on %s", item)
+        finally:
+            work_queue.task_done()

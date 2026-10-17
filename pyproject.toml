@@ -7,7 +7,14 @@ authors = [
     { name = "k-joel", email = "kjoel86@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp>=2.3.0",
+    "qdrant-client>=1.19.1",
+    "tree-sitter>=0.26.0",
+    "tree-sitter-language-pack>=1.22.1",
+    "watchdog>=6.0.0",
+]
 
 [project.scripts]
 simple-code-indexer = "simple_code_indexer:main"
@@ -27,6 +34,7 @@ build-backend = "uv_build"
 line-length = 88
 target-version = "py312"
 src = ["src", "tests"]
+extend-exclude = ["*.md"]  # docs are the build contract; ruff must not rewrite them
 
 [tool.ruff.lint]
 extend-select = [

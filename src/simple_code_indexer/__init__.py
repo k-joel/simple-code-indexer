@@ -1,2 +1,4 @@
 def main() -> None:
-    print("Hello from simple-code-indexer!")
+    from simple_code_indexer.server import main as server_main
+
+    server_main()
