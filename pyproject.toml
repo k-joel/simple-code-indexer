@@ -1,0 +1,44 @@
+[project]
+name = "simple-code-indexer"
+version = "0.1.0"
+description = "Minimal code-index MCP server: file-watcher indexing into SQLite/FTS5 + Qdrant"
+readme = "README.md"
+authors = [
+    { name = "k-joel", email = "kjoel86@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+simple-code-indexer = "simple_code_indexer:main"
+
+[dependency-groups]
+dev = [
+    "pyright[nodejs]>=1.1.400",
+    "pytest>=8.0",
+    "ruff>=0.12",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+extend-select = [
+    "UP",  # pyupgrade
+    "I",   # isort
+]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
