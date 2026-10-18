@@ -5,7 +5,7 @@ A local MCP server that maintains a searchable index of a code workspace so an a
 ## Language
 
 **Workspace**:
-The single root directory whose files are indexed and watched. Mounted at `/workspace` in Docker.
+The single root directory whose files are indexed and watched. The MCP process working directory, unless `WORKSPACE_ROOT` says otherwise.
 _Avoid_: repo, repository, project root, codebase
 
 **File record**:
@@ -32,6 +32,10 @@ _Avoid_: vector index, embedding index
 The combined lexical index and semantic index for one workspace.
 _Avoid_: database, catalog, store
 
+**Collection name**:
+The Qdrant collection holding one workspace's vectors: `code_index_{folder_slug}_{sha256(path)[:8]}_{embed_dim}`, derived from the workspace so projects never share vectors. Overridable with `QDRANT_COLLECTION`.
+_Avoid_: namespace, index name, vector store name
+
 **Index on save**:
 Re-indexing a file immediately when a save event is observed, independent of version-control state.
 _Avoid_: live indexing, hot reload, auto-sync
@@ -45,11 +49,11 @@ One reconciliation sweep at process start covering changes made while the system
 _Avoid_: cold start index, bootstrap scan
 
 **Point ID**:
-Stable Qdrant point identifier derived from workspace path and chunk index so upserts are idempotent.
+Stable Qdrant point identifier derived from the indexed file path and chunk index so upserts are idempotent.
 _Avoid_: vector ID, embedding ID
 
 **Harness**:
-The MCP client host (MiMoCode) that spawns the server over stdio and loads tools from `.mimocode/mimocode.json`.
+The MCP client host (MiMoCode) that spawns the server over stdio — with the session's project as its working directory — and loads tools from `.mimocode/mimocode.json`.
 _Avoid_: client, IDE, agent host
 
 ## Search
@@ -89,7 +93,7 @@ Short delay (300–500 ms) that collapses editor temp+rename bursts into one ind
 _Avoid_: throttle, delay, cooldown
 
 **All-in-one topology**:
-One container process hosts both the MCP stdio server and the watcher/writer. MVP default.
+One host process per harness session hosts both the MCP stdio server and the watcher/writer. Shipped default.
 _Avoid_: embedded mode, combined mode
 
 **Sidecar topology**:

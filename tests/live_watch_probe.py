@@ -1,10 +1,10 @@
 """Index-on-save probe (TDD Phase 3): create a file, find it via MCP in <5 s.
 
-Runs inside the container: spawns the MCP server as a subprocess, creates a
-temp .cpp in the workspace, polls symbol_lookup until the symbol appears,
-then cleans up. Prints PROBE OK + elapsed seconds.
+Runs on the host: spawns the MCP server as a subprocess, creates a temp .cpp in
+the workspace (the process cwd, or `WORKSPACE_ROOT`), polls symbol_lookup until
+the symbol appears, then cleans up. Prints PROBE OK + elapsed seconds.
 
-Usage: python tests/live_watch_probe.py
+Usage: uv run python tests/live_watch_probe.py
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from pathlib import Path
 from mcp_probe import ProbeError, _read_until, _rpc, _send
 
 SYMBOL = f"liveWatchProbeIndexOnSave{os.getpid()}"
-WORKSPACE = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
+WORKSPACE = Path(os.environ.get("WORKSPACE_ROOT") or Path.cwd()).resolve()
 PROBE_FILE = WORKSPACE / f"watch_probe_tmp_{os.getpid()}.cpp"
 SOURCE = f"""\
 // index-on-save probe fixture (created and removed by live_watch_probe.py)

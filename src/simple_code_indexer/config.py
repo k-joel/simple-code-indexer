@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -43,24 +45,48 @@ def is_allowed(settings: Settings, path: Path) -> bool:
     )
 
 
+def normalize_workspace_path(workspace_root: Path) -> str:
+    """Canonical hash input for a workspace: resolved, lowercased, forward slashes.
+
+    Lowercasing keeps Windows drive-letter and directory case from splitting one
+    project across two collections.
+    """
+    return str(workspace_root.resolve()).lower().replace("\\", "/")
+
+
+def derive_collection_name(workspace_root: Path, embed_dim: int) -> str:
+    """Per-workspace Qdrant collection: readable slug + path hash + vector dim."""
+    digest = hashlib.sha256(
+        normalize_workspace_path(workspace_root).encode("utf-8")
+    ).hexdigest()[:8]
+    slug = re.sub(r"[^a-z0-9]+", "-", workspace_root.resolve().name.lower())
+    return f"code_index_{slug.strip('-')[:32] or 'root'}_{digest}_{embed_dim}"
+
+
+def workspace_root_from_env() -> Path:
+    """`WORKSPACE_ROOT` when set, else the process cwd (the harness spawn dir)."""
+    env_root = os.environ.get("WORKSPACE_ROOT")
+    return Path(env_root).resolve() if env_root else Path.cwd().resolve()
+
+
 def load_settings() -> Settings:
     from simple_code_indexer.registry import get_registry
 
     registry = get_registry()
-    workspace_root = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
+    workspace_root = workspace_root_from_env()
+    embed_dim = int(os.environ.get("EMBED_DIM", "2560"))
     index_db = Path(
         os.environ.get("INDEX_DB", str(workspace_root / ".index" / "index.db"))
     )
     return Settings(
         workspace_root=workspace_root,
         index_db_path=index_db,
-        qdrant_url=os.environ.get("QDRANT_URL", "http://host.docker.internal:6333"),
-        qdrant_collection=os.environ.get("QDRANT_COLLECTION", "code_index_2560"),
-        embed_base_url=os.environ.get(
-            "EMBED_BASE_URL", "http://host.docker.internal:8080"
-        ),
+        qdrant_url=os.environ.get("QDRANT_URL", "http://localhost:6333"),
+        qdrant_collection=os.environ.get("QDRANT_COLLECTION")
+        or derive_collection_name(workspace_root, embed_dim),
+        embed_base_url=os.environ.get("EMBED_BASE_URL", "http://localhost:8080"),
         embed_model=os.environ.get("EMBED_MODEL", "Qwen3-Embedding-4B-Q6_K"),
-        embed_dim=int(os.environ.get("EMBED_DIM", "2560")),
+        embed_dim=embed_dim,
         embed_timeout_s=15.0,
         sweep_seconds=float(os.environ.get("SWEEP_SECONDS", "45")),
         debounce_ms=int(os.environ.get("DEBOUNCE_MS", "400")),

@@ -5,6 +5,12 @@
 **Project:** `D:\Projects\Python\simple-code-indexer`  
 **Domain terms:** [`GLOSSARY.md`](../GLOSSARY.md) · **Decisions:** [`docs/adr/`](./adr/)
 
+**Deployment note (2026-10-18):** the shipped runtime is a **host-spawned** MCP process whose
+workspace is its working directory, with one derived Qdrant collection per workspace
+([ADR-0008](./adr/0008-host-spawned-cwd-per-repo-collections.md)). The Docker topology these
+sections originally assumed was removed along with `Dockerfile` / `docker-compose.yml`
+([ADR-0003](./adr/0003-all-in-one-mvp-topology.md)).
+
 This document is the build contract for a **new, simplified** code-index MCP server. It is informed by a full investigation of upstream Code-Index-MCP but is **not** a port of that codebase. When this document and unfinished code disagree, this document wins.
 
 ---
@@ -36,7 +42,7 @@ Give an AI coding assistant a fast search index over one local workspace — lex
 
 ## 2. Requirements (verbatim contract)
 
-1. Must run in a Docker container via `docker-compose.yml`.
+1. Must run in a Docker container via `docker-compose.yml`. *(Superseded by ADR-0008: the server runs on the host; no container ships in this repo.)*
 2. Must use an **externally configured embedding model**:
    - Model: `Qwen3-Embedding-4B-Q6_K`, dim **2560**
    - URL: `http://localhost:8080/v1/embeddings` (llama.cpp, OpenAI-compatible)
@@ -61,10 +67,10 @@ Nice-to-haves proven in the reference deployment and **in scope**: symbol lookup
 
 | Fact | Value |
 |---|---|
-| Host | Windows + Docker Desktop; bind mounts propagate **inotify** into containers |
+| Host | Windows; the MCP process runs natively and sees native filesystem events (bind-mount inotify is history — ADR-0008) |
 | Embeddings | llama.cpp (CUDA) `0.0.0.0:8080`; accepts short name and full GGUF path as `model`; 2560-dim; also exposes `/v1/chat/completions` (do **not** depend on it for bulk work) |
-| Qdrant | host `0.0.0.0:6333`, no auth; collection `code_index_2560` exists (dim 2560, cosine, empty — reuse) |
-| Container → host | `http://host.docker.internal:<port>` |
+| Qdrant | host `0.0.0.0:6333`, no auth; one derived collection per workspace, created on first use (the retired global `code_index_2560` is orphaned) |
+| Workspace | the MCP process cwd (`WORKSPACE_ROOT` overrides) |
 | MiMoCode | v0.1.15; local MCP = `{"type":"local","command":[…],"timeout":<ms>,"sampling":"deny\|ask\|allow"}` in `.mimocode/mimocode.json` |
 | Default tools timeout | **5000 ms** — set `"timeout": 60000` on the server entry |
 | Harness reload | config read at session start; restart harness after changes |
@@ -75,13 +81,13 @@ Nice-to-haves proven in the reference deployment and **in scope**: symbol lookup
 
 ### 4.1 Topology (MVP)
 
-**All-in-one** ([ADR-0003](./adr/0003-all-in-one-mvp-topology.md)): one long-lived container; harness attaches via `docker exec -i`.
+**All-in-one** ([ADR-0003](./adr/0003-all-in-one-mvp-topology.md), host-spawned per [ADR-0008](./adr/0008-host-spawned-cwd-per-repo-collections.md)): one process per harness session, started with the session's project as its working directory.
 
 ```
-MiMoCode harness
+MiMoCode harness  (session cwd = project root)
     │  stdio JSON-RPC (newline-delimited)
     ▼
-docker exec -i code-index python -m simple_code_indexer.server
+uvx --from <repo> simple-code-indexer      # host process; cwd inherited
     │
     ├─ MCP stdio loop: initialize / tools/list / tools/call
     │     search_code | symbol_lookup | get_status [| reindex]
@@ -90,7 +96,7 @@ docker exec -i code-index python -m simple_code_indexer.server
     │     debounce queue → index_one_file → SQLite + Qdrant
     │
     └─ Watcher (watchdog Observer, background thread)
-          /workspace recursive → events → queue
+          workspace root (cwd), one watch per interesting directory → events → queue
 ```
 
 **Sidecar (post-MVP, config change only):** compose runs `watcher+indexer` as PID 1; MCP is a read-only query process. Queue/worker interface is identical.
@@ -99,8 +105,8 @@ docker exec -i code-index python -m simple_code_indexer.server
 
 ```
 host file save
-  → Docker Desktop bind mount inotify in container
-  → watchdog Observer (recursive, /workspace)     [start on background thread]
+  → native filesystem event (no bind mount, no inotify forwarding)
+  → watchdog Observer (workspace root)        [start on background thread]
   → per-path DEBOUNCE (300–500 ms)                [collapse temp+rename bursts]
   → bounded work queue (never index in the callback)
   → index_one_file(path):
@@ -110,7 +116,7 @@ host file save
        chunk → DELETE chunks/chunks_fts by file → INSERT
        UPDATE files(path, hash, mtime, language, size, indexed_at)
        embed chunk texts (batched) → Qdrant upsert by stable point id
-         point id = uuid5(NAMESPACE, workspace|path|chunk_index)
+         point id = uuid5(NAMESPACE, path|chunk_index)
   on deleted/moved → DELETE rows by path + Qdrant delete-by-filter(path)
 ```
 
@@ -118,7 +124,7 @@ host file save
 
 1. **Reconciliation sweep** every `SWEEP_SECONDS` (default 45): walk workspace (respect ignores), compare `mtime+size`, then `sha256` on candidates; run `index_one_file` for mismatches.
 2. **Startup reconcile:** same pass once at process start.
-3. Optional `watchdog.polling.PollingObserverV2` behind env flag (not needed on Docker Desktop).
+3. Optional `watchdog.polling.PollingObserverV2` behind env flag — **not implemented**; native filesystems deliver events reliably, and the sweep is the backstop.
 
 Design rules:
 
@@ -143,7 +149,7 @@ See [`GLOSSARY.md`](../GLOSSARY.md) for canonical terms. Core entities:
 
 | Entity | Identity | Key attributes |
 |---|---|---|
-| Workspace | single root path | mount `/workspace`, index under `.index/` |
+| Workspace | single root path | the process cwd, index under `.index/` |
 | File record | `path` (unique) | language, size, sha256, mtime, indexed_at |
 | Symbol | (`file_id`, name, line) | kind, line_end, signature |
 | Chunk | (`file_id`, chunk_index) | start_line, end_line, content |
@@ -155,7 +161,7 @@ Relationships: File 1—* Symbol, File 1—* Chunk. Qdrant points reference chun
 
 ## 6. Data model
 
-### 6.1 SQLite (`/workspace/.index/index.db`)
+### 6.1 SQLite (`$WORKSPACE_ROOT/.index/index.db`)
 
 WAL mode, `busy_timeout=5000`, single writer.
 
@@ -209,14 +215,28 @@ CREATE TABLE IF NOT EXISTS embedding_state (
   status          TEXT NOT NULL,  -- pending | ok | error
   updated_at      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS meta (          -- binds the DB to one endpoint + collection
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL                      -- qdrant_url | qdrant_collection
+);
 ```
+
+`meta` records the Qdrant endpoint and collection this DB feeds. When either differs — or
+when rows exist with no recorded identity — every row is dropped at startup: those chunks
+have no vectors where the next write lands and the hash/mtime short circuits would never
+re-embed them, so the reconcile must re-index from scratch.
 
 **Update protocol for one file:** in a single writer transaction — delete symbols/chunks (and FTS rows via `chunks_fts` delete trigger or explicit `INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES('delete', …)`), insert fresh rows, upsert `files`. Keep triggers or an explicit FTS sync so `chunks` and `chunks_fts` never diverge.
 
 ### 6.2 Qdrant
 
-- URL: `QDRANT_URL` (default `http://host.docker.internal:6333` in Docker, `http://localhost:6333` on host).
-- Collection: `code_index_2560` (reuse existing), vector dim **2560**, distance **Cosine**.
+- URL: `QDRANT_URL` (default `http://localhost:6333`).
+- Collection: `code_index_{slug}_{sha256(normalized path)[:8]}_{embed_dim}` — derived per
+  workspace (`slug` = folder name, non-alphanumerics → `-`, capped at 32, `root` when empty;
+  normalized path = resolved, lowercased, forward slashes). `QDRANT_COLLECTION` overrides it.
+  Vector dim **2560**, distance **Cosine**. Created on first use; `ensure_collection` caches
+  per `(url, collection)`.
 - Point ID: `uuid5(NS, f"{path}:{chunk_index}")`.
 - Payload: `{"path": str, "chunk_index": int}`.
 - Delete: filter `path == deleted_path`.
@@ -225,12 +245,11 @@ CREATE TABLE IF NOT EXISTS embedding_state (
 ### 6.3 Filesystem layout
 
 ```
-/workspace/                  # bind-mounted project (user code)
+<workspace>/                 # the project the harness opened (process cwd)
   .index/
     index.db                 # SQLite WAL (gitignore this)
   …user files…
-/app/                        # in image
-  simple_code_indexer/…
+<repo>/src/simple_code_indexer/…   # the server itself (uvx-built env; no image)
 ```
 
 Never write logs into the workspace root (gitignore `.index/`; logs go to stderr or a gitignored path).
@@ -267,7 +286,7 @@ class Settings:
     index_db_path: Path
     qdrant_url: str
     qdrant_collection: str
-    embed_base_url: str          # e.g. http://host.docker.internal:8080
+    embed_base_url: str          # e.g. http://localhost:8080
     embed_model: str             # Qwen3-Embedding-4B-Q6_K
     embed_dim: int               # 2560
     embed_timeout_s: float       # 15
@@ -283,11 +302,11 @@ Env names (minimum set):
 
 | Variable | Default |
 |---|---|
-| `WORKSPACE_ROOT` | `/workspace` |
+| `WORKSPACE_ROOT` | the process cwd |
 | `INDEX_DB` | `$WORKSPACE_ROOT/.index/index.db` |
-| `QDRANT_URL` | `http://host.docker.internal:6333` |
-| `QDRANT_COLLECTION` | `code_index_2560` |
-| `EMBED_BASE_URL` | `http://host.docker.internal:8080` |
+| `QDRANT_URL` | `http://localhost:6333` |
+| `QDRANT_COLLECTION` | derived per workspace: `code_index_{slug}_{path_hash}_{embed_dim}` |
+| `EMBED_BASE_URL` | `http://localhost:8080` |
 | `EMBED_MODEL` | `Qwen3-Embedding-4B-Q6_K` |
 | `EMBED_DIM` | `2560` |
 | `SWEEP_SECONDS` | `45` |
@@ -324,7 +343,7 @@ v1 allowlist minimum: `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`, `.py`, `.ts`, `.js`. 
 
 ### 7.6 `qdrant_store.py`
 
-- `ensure_collection(client, name, dim, distance="Cosine")`.
+- `ensure_collection(settings)` — create when missing, cached per `(qdrant_url, qdrant_collection)`.
 - `upsert_chunks(path, chunk_vectors)` using stable point IDs.
 - `delete_by_path(path)`.
 - `search(vector, limit) -> list[point]`.
@@ -340,8 +359,8 @@ v1 allowlist minimum: `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`, `.py`, `.ts`, `.js`. 
 
 ### 7.8 `watcher.py`
 
-- `Observer.schedule(handler, root, recursive=True)`.
-- `observer.start()` **on a daemon thread** (recursive inotify over bind mounts blocks).
+- One non-recursive `Observer.schedule(handler, directory, recursive=False)` per interesting directory — a recursive watch over `.venv` blocks registration for seconds; new directories are picked up from directory-created events.
+- `observer.start()` **on a daemon thread** (registration blocks).
 - Debounce per path 300–500 ms; on fire enqueue; never index in the callback.
 - Handle `on_created` / `on_modified` / `on_moved` / `on_deleted`.
 - Ignore: `.git`, `.index`, `__pycache__`, `.venv`, `node_modules`, temp editor names (`*~`, `*.tmp`, `.#*`).
@@ -356,7 +375,7 @@ Official `mcp` SDK:
 - `mcp.server.stdio.stdio_server()`
 - Initialize result: **no** `capabilities.tasks`
 - Per-tool: **no** `execution.taskSupport`
-- Startup: open DB, ensure schema, `startup_reconcile` on worker thread, start watcher on daemon thread, **then** serve (target ready <3 s)
+- Startup: open DB, ensure schema, `ensure_index_identity` (wipe rows left by another endpoint or collection), `startup_reconcile` on worker thread, start watcher on daemon thread, **then** serve (target ready <3 s)
 
 ---
 
@@ -428,10 +447,13 @@ Ambiguous: `found: true` with `matches[]` sorted by path.
   "last_sweep": "2026-10-17T20:01:02Z",
   "qdrant_ok": true,
   "embed_ok": true,
-  "workspace": "/workspace",
-  "index_db": "/workspace/.index/index.db"
+  "workspace": "d:/projects/my-app",
+  "collection": "code_index_my-app_a1b2c3d4_2560",
+  "index_db": "d:/projects/my-app/.index/index.db"
 }
 ```
+
+`workspace` and `collection` are how a live harness's workspace inference is verified.
 
 ### 8.4 `reindex` (optional, phase 5+)
 
@@ -441,39 +463,19 @@ Ambiguous: `found: true` with `matches[]` sorted by path.
 
 ## 9. Deployment
 
-### 9.1 `Dockerfile`
+### 9.1 Host process
 
-- Base: `python:3.12-slim`
-- Install `uv`; `uv sync --locked --no-install-project` pattern; copy package; no custom compile steps.
-- `WORKDIR /app`
-- Default command: keep-alive for topology A (`tail -f /dev/null`) **or** `python -m simple_code_indexer.server` if you prefer the process to be PID 1 — either is fine as long as MCP attach and watcher lifetime match §4.1.
-- Build context **outside** the watched workspace (avoid watcher startup blow-up).
+- Run `uvx --from <repo> simple-code-indexer`; the harness does this for you. `uv tool install --from <repo> simple-code-indexer` once, then the bare command, skips the ~5 s first build.
+- The process inherits the harness cwd as its workspace (`WORKSPACE_ROOT` overrides); it writes `$WORKSPACE_ROOT/.index/index.db` and exits with the session.
+- No image, no container: `Dockerfile` and `docker-compose.yml` were removed with the Docker topology ([ADR-0008](./adr/0008-host-spawned-cwd-per-repo-collections.md)).
 
-### 9.2 `docker-compose.yml`
+### 9.2 Backing services
 
-```yaml
-services:
-  code-index:
-    build: .
-    container_name: code-index
-    working_dir: /workspace
-    volumes:
-      - .:/workspace
-    environment:
-      WORKSPACE_ROOT: /workspace
-      QDRANT_URL: http://host.docker.internal:6333
-      EMBED_BASE_URL: http://host.docker.internal:8080
-      EMBED_MODEL: Qwen3-Embedding-4B-Q6_K
-      EMBED_DIM: "2560"
-      SWEEP_SECONDS: "45"
-      # no OPENAI_API_KEY — ever
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    restart: unless-stopped
-    command: ["tail", "-f", "/dev/null"]
+Qdrant and llama.cpp/embeddings are owned by the user and must already be listening; this repo ships no compose file.
+
+```bash
+docker run -d --name qdrant -p 6333:6333 -v qdrant_storage:/qdrant/storage qdrant/qdrant
 ```
-
-Own **only** this service. User's Qdrant and llama.cpp live in their own compose projects.
 
 ### 9.3 `.mimocode/mimocode.json`
 
@@ -483,7 +485,7 @@ Own **only** this service. User's Qdrant and llama.cpp live in their own compose
   "mcp": {
     "code-index": {
       "type": "local",
-      "command": ["docker", "exec", "-i", "code-index", "python", "-m", "simple_code_indexer.server"],
+      "command": ["uvx", "--from", "<this repo>", "simple-code-indexer"],
       "enabled": true,
       "timeout": 60000,
       "sampling": "deny"
@@ -494,20 +496,16 @@ Own **only** this service. User's Qdrant and llama.cpp live in their own compose
 
 Restart the harness after any change to this file.
 
-### 9.4 From-container probes (run first, always)
+### 9.4 Host probes (run first, always)
 
 ```bash
-docker exec code-index python -c "import urllib.request,json; \
-  req=urllib.request.Request('http://host.docker.internal:8080/v1/embeddings', \
-  data=json.dumps({'model':'Qwen3-Embedding-4B-Q6_K','input':'probe'}).encode(), \
-  headers={'Content-Type':'application/json'}); \
-  print(len(json.load(urllib.request.urlopen(req,timeout=15))['data'][0]['embedding']))"
-
-docker exec code-index python -c "import urllib.request,json; \
-  print(json.load(urllib.request.urlopen('http://host.docker.internal:6333/collections'))['status'])"
+uv run python tests/service_probe.py     # embeddings dim + qdrant status
+uv run python tests/mcp_probe.py         # stdio contract, tool shapes, status keys
+uv run python tests/live_watch_probe.py  # index-on-save latency
 ```
 
-Expect `2560` and an OK collections payload. Debug nothing else until both pass.
+Run them from the workspace to index — the server inherits that cwd. Expect `dim=2560` and an
+OK collections payload. Debug nothing else until both pass.
 
 ---
 
@@ -517,12 +515,12 @@ Expect `2560` and an OK collections payload. Debug nothing else until both pass.
 |---|---|
 | Oversized tools/list | No `outputSchema`; short descriptions; 2–3 tools at first |
 | 5 s tool timeout | `timeout: 60000` + <3 s startup (lazy parsers, watcher on thread) |
-| `localhost` in container | Always `host.docker.internal` |
+| Services not reachable | `uv run python tests/service_probe.py` (Qdrant `localhost:6333`, embeddings `localhost:8080`) before anything else |
 | Dummy `OPENAI_API_KEY` | Never set it — enables real api.openai.com retries |
 | Config blocks that enable features | If unused, omit entirely (no empty `summarization:` key) |
-| PowerShell + `docker exec` quoting | Write script files; `docker exec … python /workspace/foo.py` |
-| Wrong CWD for compose | Compose runs against CWD file — always start from project root |
-| Docker Desktop idle restarts | `restart: unless-stopped`; re-check `docker ps` at session start |
+| Harness cwd ≠ project | `get_status.workspace` reports the resolved workspace; set `WORKSPACE_ROOT` when a harness spawns servers from elsewhere |
+| Cold `uvx` build on first launch | ~5 s once per source change, cached afterwards; `uv tool install` removes even that |
+| Collection switch without re-embed | `ensure_index_identity` wipes the index so the reconcile re-embeds; a manual `.index/` delete does the same |
 | Observer.start() blocking | Start on daemon thread; keep watched tree small |
 | Dropped inotify events | Sweep + startup reconcile always on |
 | Multi-writer races | One writer; design out, don't lock harder |
@@ -549,14 +547,14 @@ Exceptions: define a small hierarchy (`IndexerError` → `EmbedError`, `ParseErr
 
 ### 11.3 Acceptance (manual / scripted, through harness)
 
-1. `docker compose up -d --build`
-2. From-container probes (§9.4)
-3. `mimo mcp list` → `✓ connected`
-4. Harness session reload
-5. Create `widget_checksum.cpp` with unique symbol `calculateWidgetChecksum`
-6. Poll `search_code` / `symbol_lookup` until found (target <5 s)
-7. `search_code(..., semantic=true)` returns a hit (vectors may lag a few seconds)
-8. `get_status` healthy; `docker compose down && up -d` resilience check
+1. `uv run python tests/service_probe.py` — Qdrant and embeddings reachable
+2. `mimo mcp list` → `✓ connected`
+3. Harness session reload (config is read at session start)
+4. Create `widget_checksum.cpp` with unique symbol `calculateWidgetChecksum`
+5. Poll `search_code` / `symbol_lookup` until found (target <5 s)
+6. `search_code(..., semantic=true)` returns a hit (vectors may lag a few seconds)
+7. `get_status` healthy, with the expected `workspace` and `collection`
+8. Open a second project in another session → different `collection`, no cross-hits
 
 ### 11.4 Quality gates
 
@@ -573,11 +571,11 @@ uv run pytest
 
 | Phase | Deliverable | Exit criteria |
 |---|---|---|
-| **0 Scaffold** | package layout, `pyproject` deps, Dockerfile, compose | `uv run pytest` smoke green; image builds |
+| **0 Scaffold** | package layout, `pyproject` deps | `uv run pytest` smoke green |
 | **1 Harness gate** | MCP server with **only** `get_status`, mimocode.json | `mimo mcp list` `✓ connected`; stdio probe works |
 | **2 Indexer** | SQLite schema + FTS, `.cpp` parse, `search_code`/`symbol_lookup` over startup-built index | unit tests pass; probe finds fixture symbols |
 | **3 Watcher** | observer + debounce + per-file upsert; sweep + startup reconcile | create `test.cpp` → found in <5 s without manual reindex |
-| **4 Embeddings + Qdrant** | embed-on-index, embed-on-query, `semantic=true` | from-container probes + semantic hit on acceptance file |
+| **4 Embeddings + Qdrant** | embed-on-index, embed-on-query, `semantic=true` | host probes + semantic hit on acceptance file |
 | **5 Acceptance** | full test through harness; resilience check | DoD §2.1 |
 | **6 Optional** | topology B sidecar | always-on watch with harness closed |
 
@@ -610,6 +608,7 @@ uv run pytest
 | [0005](./adr/0005-python-mcp-stack.md) | Python 3.12 + official MCP SDK stack |
 | [0006](./adr/0006-harness-safe-mcp-surface.md) | Harness-safe minimal MCP tool surface |
 | [0007](./adr/0007-single-workspace-no-multi-repo.md) | Single workspace, no multi-repo registry |
+| [0008](./adr/0008-host-spawned-cwd-per-repo-collections.md) | Host-spawned process, cwd workspace, per-repo collections |
 
 ---
 
@@ -618,7 +617,7 @@ uv run pytest
 - [ ] Phase 1 harness gate first (`mimo mcp list`)
 - [ ] No `outputSchema` / `capabilities.tasks` / `execution.taskSupport`
 - [ ] No `OPENAI_API_KEY`; no unused config blocks
-- [ ] Probes from **inside** the container before debugging
+- [ ] `tests/service_probe.py` + `tests/mcp_probe.py` before debugging
 - [ ] Watcher never blocks; debounce + queue + sweep
 - [ ] Single writer; hash short-circuit on no-op saves
 - [ ] Acceptance test through the harness (not only unit tests)

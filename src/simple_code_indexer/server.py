@@ -85,6 +85,7 @@ def _status_payload(settings: Settings) -> dict[str, Any]:
         "plugins_loaded": len(registry),
         "grammars_ready": len(_parsers),
         "workspace": str(settings.workspace_root),
+        "collection": settings.qdrant_collection,
         "index_db": str(settings.index_db_path),
     }
 
@@ -223,6 +224,16 @@ async def _run() -> None:
     start_prefetch_thread()
     with db.connect(settings.index_db_path) as conn:
         db.ensure_schema(conn)
+        with conn:
+            if db.ensure_index_identity(
+                conn,
+                qdrant_url=settings.qdrant_url,
+                collection=settings.qdrant_collection,
+            ):
+                logger.warning(
+                    "collection changed to %s — index cleared for a full re-index",
+                    settings.qdrant_collection,
+                )
     threading.Thread(
         target=_probe_services, args=(settings,), name="service-probe", daemon=True
     ).start()

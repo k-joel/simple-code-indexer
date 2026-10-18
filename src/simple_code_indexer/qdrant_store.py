@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from typing import NamedTuple
 
@@ -18,7 +19,8 @@ LAST_OK: bool | None = None
 # Fixed namespace so point IDs are stable across processes (TDD §6.2).
 POINT_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "simple-code-indexer")
 
-_ensured_urls: set[str] = set()
+_ensured_collections: set[tuple[str, str]] = set()
+_ensure_lock = threading.Lock()
 
 
 def point_id(path: str, chunk_index: int) -> uuid.UUID:
@@ -41,26 +43,45 @@ def _client(settings: Settings):
 
 
 def ensure_collection(settings: Settings) -> None:
-    """Create the collection if missing (idempotent; cached per URL)."""
+    """Create the collection if missing (idempotent; cached per URL + name).
+
+    Serialized, and tolerant of a lost create race: the service probe, the index
+    writer, and a semantic search all hit a fresh workspace's collection at
+    once, and an unguarded check-then-create answers HTTP 409 to the losers —
+    which fail-soft indexing would turn into permanently missing vectors.
+    """
     global LAST_OK
     from qdrant_client.models import Distance, VectorParams
 
-    if settings.qdrant_url in _ensured_urls:
+    cache_key = (settings.qdrant_url, settings.qdrant_collection)
+    if cache_key in _ensured_collections:
         return
-    try:
-        client = _client(settings)
-        if not client.collection_exists(settings.qdrant_collection):
-            client.create_collection(
-                settings.qdrant_collection,
-                vectors_config=VectorParams(
-                    size=settings.embed_dim, distance=Distance.COSINE
-                ),
-            )
-        _ensured_urls.add(settings.qdrant_url)
-        LAST_OK = True
-    except Exception as exc:
-        LAST_OK = False
-        raise QdrantUnavailable(f"cannot ensure collection: {exc}") from exc
+    with _ensure_lock:
+        if cache_key in _ensured_collections:
+            return
+        try:
+            client = _client(settings)
+            if not client.collection_exists(settings.qdrant_collection):
+                try:
+                    client.create_collection(
+                        settings.qdrant_collection,
+                        vectors_config=VectorParams(
+                            size=settings.embed_dim, distance=Distance.COSINE
+                        ),
+                    )
+                except Exception as exc:
+                    if not client.collection_exists(settings.qdrant_collection):
+                        raise
+                    logger.debug(
+                        "collection %s was created concurrently (%s)",
+                        settings.qdrant_collection,
+                        exc,
+                    )
+            _ensured_collections.add(cache_key)
+            LAST_OK = True
+        except Exception as exc:
+            LAST_OK = False
+            raise QdrantUnavailable(f"cannot ensure collection: {exc}") from exc
 
 
 def upsert_chunks(

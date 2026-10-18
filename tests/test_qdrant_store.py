@@ -1,5 +1,7 @@
+import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -49,6 +51,76 @@ def test_point_id_is_stable_and_index_sensitive() -> None:
     assert a == b
     assert len({a, c, d}) == 3
     assert a.int == a.int  # uuid5, fixed namespace
+
+
+class _FakeClient:
+    """Stands in for QdrantClient so collection-cache behaviour needs no server."""
+
+    def __init__(self) -> None:
+        self.created: list[str] = []
+        self.attempts = 0
+
+    def collection_exists(self, name: str) -> bool:
+        return False
+
+    def create_collection(self, name: str, vectors_config: object = None) -> None:
+        self.attempts += 1
+        self.created.append(name)
+        time.sleep(0.05)  # open the check-then-create window for the race test
+
+
+def test_ensure_collection_is_keyed_by_url_and_collection(monkeypatch) -> None:
+    client = _FakeClient()
+    monkeypatch.setattr(qdrant_store, "_client", lambda settings: client)
+    monkeypatch.setattr(qdrant_store, "_ensured_collections", set())
+    first = _settings()
+    second = replace(first, qdrant_collection="code_index_other_2560")
+
+    qdrant_store.ensure_collection(first)
+    qdrant_store.ensure_collection(second)
+    qdrant_store.ensure_collection(first)  # cached: no third create
+
+    assert client.created == [first.qdrant_collection, second.qdrant_collection]
+
+
+class _RaceClient(_FakeClient):
+    """An observer that checks first and loses the create race (Qdrant 409)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.exists = False
+
+    def collection_exists(self, name: str) -> bool:
+        return self.exists
+
+    def create_collection(self, name: str, vectors_config: object = None) -> None:
+        self.attempts += 1
+        self.exists = True  # the other writer won
+        raise RuntimeError("409 Conflict: collection already exists")
+
+
+def test_ensure_collection_tolerates_a_concurrent_create(monkeypatch) -> None:
+    client = _RaceClient()
+    monkeypatch.setattr(qdrant_store, "_client", lambda settings: client)
+    monkeypatch.setattr(qdrant_store, "_ensured_collections", set())
+
+    qdrant_store.ensure_collection(_settings())  # must not raise
+
+    assert qdrant_store.LAST_OK is True
+    qdrant_store.ensure_collection(_settings())
+    assert client.attempts == 1  # now cached, not retried
+
+
+def test_concurrent_first_use_creates_the_collection_once(monkeypatch) -> None:
+    client = _FakeClient()
+    monkeypatch.setattr(qdrant_store, "_client", lambda settings: client)
+    monkeypatch.setattr(qdrant_store, "_ensured_collections", set())
+    settings = _settings()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda _: qdrant_store.ensure_collection(settings), range(8)))
+
+    assert client.created == [settings.qdrant_collection]
 
 
 def test_unreachable_qdrant_raises_and_marks_not_ok() -> None:

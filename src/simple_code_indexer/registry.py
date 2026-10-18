@@ -182,12 +182,13 @@ def load_registry(
 
 def default_user_plugin_dirs() -> list[Path]:
     """Repo-root plugins/ (walk up to pyproject.toml) then workspace plugins/."""
+    from simple_code_indexer.config import workspace_root_from_env
+
     dirs: list[Path] = []
     repo_plugins = _repo_plugins_dir()
     if repo_plugins is not None:
         dirs.append(repo_plugins)
-    workspace = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
-    dirs.append(workspace / "plugins")
+    dirs.append(workspace_root_from_env() / "plugins")
     return dirs
 
 

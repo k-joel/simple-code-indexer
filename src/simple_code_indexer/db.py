@@ -69,6 +69,11 @@ CREATE TABLE IF NOT EXISTS embedding_state (
   status          TEXT NOT NULL,
   updated_at      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 """
 
 _FTS_SELECT = """
@@ -264,6 +269,48 @@ def record_embedding_state(
         """,
         rows,
     )
+
+
+_COLLECTION_KEY = "qdrant_collection"
+_QDRANT_URL_KEY = "qdrant_url"
+
+
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return None if row is None else str(row["value"])
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO meta (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (key, value),
+    )
+
+
+def ensure_index_identity(
+    conn: sqlite3.Connection, *, qdrant_url: str, collection: str
+) -> bool:
+    """Bind the index to one Qdrant endpoint + collection; drop stale rows.
+
+    Rows indexed elsewhere have no vectors where the next write lands, and the
+    hash/mtime short circuits would never re-embed them, so they must go. Rows
+    with no recorded identity are stale by the same argument.
+    Returns True when the index was invalidated — an earlier binding existed, or
+    rows were present.
+    """
+    stored = (get_meta(conn, _QDRANT_URL_KEY), get_meta(conn, _COLLECTION_KEY))
+    if stored == (qdrant_url, collection):
+        return False
+    has_rows = conn.execute("SELECT EXISTS(SELECT 1 FROM files)").fetchone()
+    invalidated = stored != (None, None) or bool(has_rows[0])
+    if invalidated:
+        conn.execute("DELETE FROM files")  # cascades symbols/chunks/embedding_state
+    set_meta(conn, _QDRANT_URL_KEY, qdrant_url)
+    set_meta(conn, _COLLECTION_KEY, collection)
+    return invalidated
 
 
 class ChunkSpan(NamedTuple):

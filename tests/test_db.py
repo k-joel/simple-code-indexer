@@ -140,3 +140,82 @@ def test_delete_file_removes_rows(tmp_path: Path) -> None:
         db.delete_file(conn, "src/foo.cpp")
         assert db.stats(conn) == {"files": 0, "symbols": 0, "chunks": 0}
         assert db.fts_search(conn, "f", limit=5) == []
+
+
+def _seed_rows(conn) -> None:
+    file_id = db.upsert_file(conn, _record())
+    db.replace_file_chunks(
+        conn,
+        file_id,
+        [Chunk(chunk_index=0, start_line=1, end_line=1, content="int widget()")],
+    )
+    db.record_embedding_state(
+        conn,
+        [
+            (chunk_id, "point-1", "ok")
+            for chunk_id, _ in db.chunk_ids_for_path(conn, "src/foo.cpp")
+        ],
+    )
+
+
+def _bind(conn, collection: str, url: str = "http://localhost:6333") -> bool:
+    return db.ensure_index_identity(conn, qdrant_url=url, collection=collection)
+
+
+COLLECTION_A = "code_index_a_11111111_2560"
+COLLECTION_B = "code_index_b_22222222_2560"
+
+
+def test_index_identity_leaves_an_empty_index_alone(tmp_path: Path) -> None:
+    with db.connect(db_path=tmp_path / "index.db") as conn:
+        db.ensure_schema(conn)
+        assert _bind(conn, COLLECTION_A) is False
+        assert _bind(conn, COLLECTION_A) is False
+
+
+def test_index_identity_treats_unrecorded_rows_as_stale(tmp_path: Path) -> None:
+    # Rows written before identities were recorded belong to an unknown
+    # collection, so their vectors cannot be assumed to exist in the current one.
+    with db.connect(db_path=tmp_path / "index.db") as conn:
+        db.ensure_schema(conn)
+        _seed_rows(conn)
+        assert db.stats(conn) == {"files": 1, "symbols": 0, "chunks": 1}
+
+        assert _bind(conn, COLLECTION_A) is True
+        assert db.stats(conn) == {"files": 0, "symbols": 0, "chunks": 0}
+        assert _bind(conn, COLLECTION_A) is False
+
+
+def test_index_identity_wipes_rows_when_the_collection_changes(tmp_path: Path) -> None:
+    with db.connect(db_path=tmp_path / "index.db") as conn:
+        db.ensure_schema(conn)
+        assert _bind(conn, COLLECTION_A) is False
+        _seed_rows(conn)
+        assert _bind(conn, COLLECTION_A) is False
+        assert db.stats(conn) == {"files": 1, "symbols": 0, "chunks": 1}
+
+        # A different collection invalidates every row: no vectors exist in it,
+        # and unchanged files would never be re-embedded.
+        assert _bind(conn, COLLECTION_B) is True
+        assert db.stats(conn) == {"files": 0, "symbols": 0, "chunks": 0}
+        embedding_rows = conn.execute("SELECT COUNT(*) FROM embedding_state").fetchone()
+        assert embedding_rows[0] == 0
+        assert db.fts_search(conn, "widget", limit=5) == []
+
+        # The new binding sticks.
+        assert _bind(conn, COLLECTION_B) is False
+
+
+def test_index_identity_wipes_rows_when_the_qdrant_endpoint_changes(
+    tmp_path: Path,
+) -> None:
+    other = "http://other-host:6333"
+    with db.connect(db_path=tmp_path / "index.db") as conn:
+        db.ensure_schema(conn)
+        assert _bind(conn, COLLECTION_A) is False
+        _seed_rows(conn)
+
+        # Same collection name, different server: the vectors are not there.
+        assert _bind(conn, COLLECTION_A, other) is True
+        assert db.stats(conn) == {"files": 0, "symbols": 0, "chunks": 0}
+        assert _bind(conn, COLLECTION_A, other) is False

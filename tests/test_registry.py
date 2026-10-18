@@ -2,7 +2,7 @@ from pathlib import Path
 
 from simple_code_indexer.config import is_allowed, load_settings
 from simple_code_indexer.parse import detect_language, extract_symbols
-from simple_code_indexer.registry import load_registry
+from simple_code_indexer.registry import default_user_plugin_dirs, load_registry
 
 VALID_PLUGIN = """\
 NAME = "mylang"
@@ -127,3 +127,13 @@ def test_builtin_python_extract_still_works() -> None:
 def test_detect_language_returns_plugin_name() -> None:
     assert detect_language(Path("x.cs")) == "c_sharp"
     assert detect_language(Path("x.sh")) == "bash"
+
+
+def test_workspace_plugins_follow_the_resolved_workspace(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    assert tmp_path.resolve() / "plugins" in default_user_plugin_dirs()
+
+    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    assert Path.cwd().resolve() / "plugins" in default_user_plugin_dirs()

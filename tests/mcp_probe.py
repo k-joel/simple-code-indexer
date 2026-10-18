@@ -1,10 +1,12 @@
 """Stdio probe: initialize → tools/list → tools/call get_status.
 
 Usage:
-    python tests/mcp_probe.py [cmd ...]      # default: current interpreter -m server
+    uv run python tests/mcp_probe.py [cmd ...]   # default: current interpreter -m server
 
-Dumps the exact wire payloads so harness rejections (outputSchema, tasks) can be
-inspected byte-for-byte. Exits non-zero if any contract check fails.
+Run it from the workspace to index: the server inherits the process cwd unless
+`WORKSPACE_ROOT` is set. Dumps the exact wire payloads so harness rejections
+(outputSchema, tasks) can be inspected byte-for-byte. Exits non-zero if any
+contract check fails.
 """
 
 from __future__ import annotations
@@ -112,6 +114,7 @@ def main() -> None:
             "chunks_indexed",
             "watcher_alive",
             "workspace",
+            "collection",
             "index_db",
         ):
             if key not in payload:

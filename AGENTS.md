@@ -44,22 +44,23 @@ tests/                     # pytest
 pyproject.toml             # deps + ruff / pyright / pytest config
 ```
 
-## Runtime / external services (not wired in code yet)
+## Runtime / external services
 
-These are the decided targets when the indexer is implemented; do not invent different defaults:
+Host-spawned MCP process (no container in this repo — [ADR-0008](docs/adr/0008-host-spawned-cwd-per-repo-collections.md)):
 
 | Service | Endpoint / value |
 |---|---|
 | Embeddings (OpenAI-compatible) | `http://localhost:8080/v1/embeddings` — model `Qwen3-Embedding-4B-Q6_K`, **2560-dim** |
-| Qdrant | `http://localhost:6333` (no auth) |
-| In Docker | reach host services as `http://host.docker.internal:<port>` |
+| Qdrant | `http://localhost:6333` (no auth) — one derived collection per workspace |
+| Workspace | the MCP process cwd (`WORKSPACE_ROOT` overrides); index at `$WORKSPACE_ROOT/.index/index.db` |
 
-Config via env (e.g. `QDRANT_URL`, embedding base URL + key if any) — never hardcode secrets or local URLs in committed code.
+Config via env (e.g. `QDRANT_URL`, `EMBED_BASE_URL`) — never hardcode secrets or local URLs in committed code.
+Probe the services with `uv run python tests/service_probe.py` before a live-model session.
 
 ## Conventions
 
 - Prefer stdlib where it matters: **SQLite + FTS5** for lexical index (stdlib `sqlite3`).
 - Semantic path: embed with the same endpoint used for queries; store in Qdrant.
 - File-watcher / MCP surface should stay small: `search_code`, `symbol_lookup`, `get_status` (optional `reindex`).
-- MCP config for the harness lives in `.mimocode/mimocode.json`; changes need a session restart to reload.
+- MCP config for the harness lives in `.mimocode/mimocode.json` (gitignored); changes need a session restart to reload. It points at the host-spawned `uvx --from <repo> simple-code-indexer`.
 - No migrations/codegen tool yet — note them here when added.
