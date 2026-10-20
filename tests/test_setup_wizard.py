@@ -150,9 +150,7 @@ def _wizard(
     return wizard, project, home
 
 
-def test_existing_endpoint_writes_probed_dimension(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_existing_endpoint_writes_probed_dimension(tmp_path: Path, monkeypatch) -> None:
     prompts = ScriptedPrompter(
         yes=[True, False, True, False],
         texts=[
