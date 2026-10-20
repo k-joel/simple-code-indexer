@@ -58,7 +58,7 @@ Nice-to-haves proven in the reference deployment and **in scope**: symbol lookup
 - All four original requirements + acceptance test green **through the harness**.
 - `mimo mcp list` shows `✓ connected`.
 - Semantic path exercised (`search_code(..., semantic=true)` with real embeddings + Qdrant).
-- README runbook (commands, config reload, diagnosis).
+- README runbook + “How to use” (setup wizard, config precedence, diagnosis).
 - `ruff check` → `pyright` → `pytest` clean.
 
 ---
@@ -68,11 +68,11 @@ Nice-to-haves proven in the reference deployment and **in scope**: symbol lookup
 | Fact | Value |
 |---|---|
 | Host | Windows; the MCP process runs natively and sees native filesystem events (bind-mount inotify is history — ADR-0008) |
-| Embeddings | llama.cpp (CUDA) `0.0.0.0:8080`; accepts short name and full GGUF path as `model`; 2560-dim; also exposes `/v1/chat/completions` (do **not** depend on it for bulk work) |
+| Embeddings | OpenAI-compatible at `0.0.0.0:8080` (llama.cpp on this host); accepts short name and full GGUF path as `model`; the dimension is whatever `config.yaml`/`EMBED_DIM` says and the wizard probes it (this host's original service was 2560-dim); also exposes `/v1/chat/completions` (do **not** depend on it for bulk work) |
 | Qdrant | host `0.0.0.0:6333`, no auth; one derived collection per workspace, created on first use (the retired global `code_index_2560` is orphaned) |
 | Workspace | the MCP process cwd (`WORKSPACE_ROOT` overrides) |
 | MiMoCode | v0.1.15; local MCP = `{"type":"local","command":[…],"timeout":<ms>,"sampling":"deny\|ask\|allow"}` in `.mimocode/mimocode.json` |
-| Default tools timeout | **5000 ms** — set `"timeout": 60000` on the server entry |
+| Default tools timeout | **5000 ms** — set `"timeout": 120000` on the server entry (startup may wait for managed containers) |
 | Harness reload | config read at session start; restart harness after changes |
 
 ---
@@ -149,7 +149,7 @@ See [`GLOSSARY.md`](../GLOSSARY.md) for canonical terms. Core entities:
 
 | Entity | Identity | Key attributes |
 |---|---|---|
-| Workspace | single root path | the process cwd, index under `.index/` |
+| Workspace | single root path | the process cwd, index under `.simple-ci/` |
 | File record | `path` (unique) | language, size, sha256, mtime, indexed_at |
 | Symbol | (`file_id`, name, line) | kind, line_end, signature |
 | Chunk | (`file_id`, chunk_index) | start_line, end_line, content |
@@ -161,9 +161,10 @@ Relationships: File 1—* Symbol, File 1—* Chunk. Qdrant points reference chun
 
 ## 6. Data model
 
-### 6.1 SQLite (`$WORKSPACE_ROOT/.index/index.db`)
+### 6.1 SQLite (`$WORKSPACE_ROOT/.simple-ci/index.db`)
 
-WAL mode, `busy_timeout=5000`, single writer.
+WAL mode, `busy_timeout=5000`, single writer. Startup takes an OS advisory lock on
+`<index_db>.lock`; a second server process for the same workspace refuses to start.
 
 ```sql
 PRAGMA journal_mode=WAL;
@@ -236,7 +237,8 @@ re-embed them, so the reconcile must re-index from scratch.
   workspace (`slug` = folder name, non-alphanumerics → `-`, capped at 32, `root` when empty;
   normalized path = resolved, lowercased, forward slashes). `QDRANT_COLLECTION` overrides it.
   Vector dim **2560**, distance **Cosine**. Created on first use; `ensure_collection` caches
-  per `(url, collection)`.
+  per `(url, collection)`. An existing collection's configured vector size is validated
+  against `embed_dim` — a mismatch (or named vectors) raises rather than failing every upsert.
 - Point ID: `uuid5(NS, f"{path}:{chunk_index}")`.
 - Payload: `{"path": str, "chunk_index": int}`.
 - Delete: filter `path == deleted_path`.
@@ -246,13 +248,14 @@ re-embed them, so the reconcile must re-index from scratch.
 
 ```
 <workspace>/                 # the project the harness opened (process cwd)
-  .index/
-    index.db                 # SQLite WAL (gitignore this)
+  .simple-ci/
+    index.db                 # SQLite WAL (gitignore this whole directory)
+    config.yaml              # optional per-project config (may hold an API key)
   …user files…
 <repo>/src/simple_code_indexer/…   # the server itself (uvx-built env; no image)
 ```
 
-Never write logs into the workspace root (gitignore `.index/`; logs go to stderr or a gitignored path).
+Never write logs into the workspace root (gitignore `.simple-ci/`; logs go to stderr or a gitignored path).
 
 ---
 
@@ -266,7 +269,9 @@ Python conventions follow [`python-patterns`](../../AGENTS.md): type hints on pu
 ```
 src/simple_code_indexer/
   __init__.py          # version, main() entry
-  config.py            # Settings from env (frozen dataclass)
+  config.py            # Settings from config.yaml + env (frozen dataclass)
+  configfile.py        # config discovery, YAML load/write, typed getters
+  errors.py            # IndexerError hierarchy (Embed, Parse, Qdrant, Config)
   models.py            # FileRecord, Symbol, Chunk, SearchHit (dataclasses)
   db.py                # schema ensure, connection helpers, FTS queries
   parse.py             # tree-sitter symbol extraction + chunking
@@ -274,12 +279,23 @@ src/simple_code_indexer/
   qdrant_store.py      # ensure_collection, upsert, delete_by_path, search
   indexer.py           # index_one_file, sweep, startup reconcile
   watcher.py           # Observer + debounce queue → indexer
+  services.py          # start managed containers, wait for readiness (fail-soft)
   server.py            # MCP stdio: initialize, tools/list, tools/call
+  builtin/             # language plugins
+  harnesses/           # MCP-client plugins used by the setup wizard
+  setup_wizard/        # interactive setup (prompts, probes, provisioning, writes)
 ```
 
 ### 7.2 `config.py`
 
 ```python
+@dataclass(frozen=True, slots=True)
+class ManagedService:
+    container: str
+    compose_file: Path | None = None
+    compose_service: str | None = None
+    startup_timeout_s: float = 45.0
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     workspace_root: Path
@@ -288,27 +304,40 @@ class Settings:
     qdrant_collection: str
     embed_base_url: str          # e.g. http://localhost:8080
     embed_model: str             # Qwen3-Embedding-4B-Q6_K
-    embed_dim: int               # 2560
+    embed_dim: int               # 2560 (config.yaml / EMBED_DIM; probe it when unsure)
     embed_timeout_s: float       # 15
     sweep_seconds: float         # 45
     debounce_ms: int             # 400
     allowed_exts: frozenset[str]
     ignore_dirs: frozenset[str]
+    allowed_filenames: frozenset[str] = frozenset()
+    embed_api_key: str | None = None
+    embedding_service: ManagedService | None = None
+    qdrant_service: ManagedService | None = None
+    config_source: Path | None = None
 ```
 
-Load via `os.environ` (EAFP: try/except KeyError → default). **Never** hardcode secrets. **Never** set `OPENAI_API_KEY`. If a feature is unused, omit it from config entirely (no empty blocks that enable fallbacks).
+Load order: `SIMPLE_CI_CONFIG` (an explicit path; `none`/`off` disables discovery) →
+`<workspace>/.simple-ci/config.yaml` → `~/.simple-ci/config.yaml` → built-in defaults.
+Individual environment variables override whatever the file provided. **Never** hardcode
+secrets in code; `EMBED_API_KEY` / `embedding.api_key` is optional and sent as a bearer
+token. If a feature is unused, omit it from config entirely (no empty blocks that enable
+fallbacks).
 
 Env names (minimum set):
 
 | Variable | Default |
 |---|---|
 | `WORKSPACE_ROOT` | the process cwd |
-| `INDEX_DB` | `$WORKSPACE_ROOT/.index/index.db` |
+| `SIMPLE_CI_CONFIG` | discovery (`none` disables; tests set this) |
+| `INDEX_DB` | `$WORKSPACE_ROOT/.simple-ci/index.db` |
 | `QDRANT_URL` | `http://localhost:6333` |
 | `QDRANT_COLLECTION` | derived per workspace: `code_index_{slug}_{path_hash}_{embed_dim}` |
 | `EMBED_BASE_URL` | `http://localhost:8080` |
 | `EMBED_MODEL` | `Qwen3-Embedding-4B-Q6_K` |
 | `EMBED_DIM` | `2560` |
+| `EMBED_API_KEY` | unset |
+| `EMBED_TIMEOUT_S` | `15` |
 | `SWEEP_SECONDS` | `45` |
 | `DEBOUNCE_MS` | `400` |
 
@@ -340,10 +369,14 @@ v1 allowlist minimum: `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`, `.py`, `.ts`, `.js`. 
 - Measure dim on first response; assert equals `Settings.embed_dim` (2560).
 - `embed_query(text) -> list[float]` = `embed_texts([text])[0]`.
 - Fail soft on index path: log, mark `embedding_state.status='error'`, continue lexical indexing.
+- Retry on the next sweep: `indexer.reembed_pending` re-embeds chunks whose
+  `embedding_state.status != 'ok'` (or that lack a row), independent of the hash/mtime
+  short circuits, stopping at the first failing file.
 
 ### 7.6 `qdrant_store.py`
 
-- `ensure_collection(settings)` — create when missing, cached per `(qdrant_url, qdrant_collection)`.
+- `ensure_collection(settings)` — create when missing, validate an existing collection's
+  vector size, cached per `(qdrant_url, qdrant_collection)`.
 - `upsert_chunks(path, chunk_vectors)` using stable point IDs.
 - `delete_by_path(path)`.
 - `search(vector, limit) -> list[point]`.
@@ -351,7 +384,7 @@ v1 allowlist minimum: `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`, `.py`, `.ts`, `.js`. 
 ### 7.7 `indexer.py`
 
 - `index_one_file(path: Path) -> IndexOutcome` — the unit of work (hash short-circuit).
-- `sweep() -> SweepStats` — mtime+size then hash candidates.
+- `sweep() -> SweepStats` — retry pending embeddings, then mtime+size then hash candidates.
 - `startup_reconcile()`.
 - Bounded `queue.Queue` consumer; items are paths or tombstones.
 
@@ -363,7 +396,7 @@ v1 allowlist minimum: `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`, `.py`, `.ts`, `.js`. 
 - `observer.start()` **on a daemon thread** (registration blocks).
 - Debounce per path 300–500 ms; on fire enqueue; never index in the callback.
 - Handle `on_created` / `on_modified` / `on_moved` / `on_deleted`.
-- Ignore: `.git`, `.index`, `__pycache__`, `.venv`, `node_modules`, temp editor names (`*~`, `*.tmp`, `.#*`).
+- Ignore: `.git`, `.index` (legacy), `.simple-ci`, `__pycache__`, `.venv`, `node_modules`, temp editor names (`*~`, `*.tmp`, `.#*`).
 
 ### 7.9 `server.py` (MCP)
 
@@ -449,11 +482,15 @@ Ambiguous: `found: true` with `matches[]` sorted by path.
   "embed_ok": true,
   "workspace": "d:/projects/my-app",
   "collection": "code_index_my-app_a1b2c3d4_2560",
-  "index_db": "d:/projects/my-app/.index/index.db"
+  "index_db": "d:/projects/my-app/.simple-ci/index.db",
+  "config_file": "C:/Users/me/.simple-ci/config.yaml",
+  "services": {"embedding": "running", "qdrant": "started"}
 }
 ```
 
 `workspace` and `collection` are how a live harness's workspace inference is verified.
+`config_file` is `null` when neither config file exists. `services` values are `running`,
+`started`, `unavailable`, or `not_managed`.
 
 ### 8.4 `reindex` (optional, phase 5+)
 
@@ -465,13 +502,19 @@ Ambiguous: `found: true` with `matches[]` sorted by path.
 
 ### 9.1 Host process
 
-- Run `uvx --from <repo> simple-code-indexer`; the harness does this for you. `uv tool install --from <repo> simple-code-indexer` once, then the bare command, skips the ~5 s first build.
-- The process inherits the harness cwd as its workspace (`WORKSPACE_ROOT` overrides); it writes `$WORKSPACE_ROOT/.index/index.db` and exits with the session.
-- No image, no container: `Dockerfile` and `docker-compose.yml` were removed with the Docker topology ([ADR-0008](./adr/0008-host-spawned-cwd-per-repo-collections.md)).
+- Run `uvx --from <repo> simple-code-indexer`; the harness does this for you. `python setup.py`
+  writes that entry into each selected harness config. `uv tool install --from <repo>
+  simple-code-indexer` once, then the bare command, skips the ~5 s first build.
+- The process inherits the harness cwd as its workspace (`WORKSPACE_ROOT` overrides); it writes `$WORKSPACE_ROOT/.simple-ci/index.db` and exits with the session.
+- Before serving, `services.ensure_managed_services` starts any containers named in
+  `embedding.service` / `qdrant.service` and waits for their endpoints (fail-soft).
+- No image for the server itself: `Dockerfile` and `docker-compose.yml` were removed with the Docker topology ([ADR-0008](./adr/0008-host-spawned-cwd-per-repo-collections.md)); the wizard may generate a compose file under `~/.simple-ci/` for the backing services.
 
 ### 9.2 Backing services
 
-Qdrant and llama.cpp/embeddings are owned by the user and must already be listening; this repo ships no compose file.
+Qdrant and llama.cpp/embeddings are owned by the user and must already be listening, or be
+declared as managed services in `config.yaml` so the server starts them. `python setup.py`
+can generate the compose file and download a GGUF.
 
 ```bash
 docker run -d --name qdrant -p 6333:6333 -v qdrant_storage:/qdrant/storage qdrant/qdrant
@@ -487,7 +530,7 @@ docker run -d --name qdrant -p 6333:6333 -v qdrant_storage:/qdrant/storage qdran
       "type": "local",
       "command": ["uvx", "--from", "<this repo>", "simple-code-indexer"],
       "enabled": true,
-      "timeout": 60000,
+      "timeout": 120000,
       "sampling": "deny"
     }
   }
@@ -504,8 +547,8 @@ uv run python tests/mcp_probe.py         # stdio contract, tool shapes, status k
 uv run python tests/live_watch_probe.py  # index-on-save latency
 ```
 
-Run them from the workspace to index — the server inherits that cwd. Expect `dim=2560` and an
-OK collections payload. Debug nothing else until both pass.
+Run them from the workspace to index — the server inherits that cwd. Expect the dimension
+configured for that workspace and an OK collections payload. Debug nothing else until both pass.
 
 ---
 
@@ -514,13 +557,13 @@ OK collections payload. Debug nothing else until both pass.
 | Pitfall | Rule |
 |---|---|
 | Oversized tools/list | No `outputSchema`; short descriptions; 2–3 tools at first |
-| 5 s tool timeout | `timeout: 60000` + <3 s startup (lazy parsers, watcher on thread) |
+| 5 s tool timeout | `timeout: 120000` + fail-soft startup (lazy parsers, watcher on thread, managed containers bounded by `startup_timeout_s`) |
 | Services not reachable | `uv run python tests/service_probe.py` (Qdrant `localhost:6333`, embeddings `localhost:8080`) before anything else |
 | Dummy `OPENAI_API_KEY` | Never set it — enables real api.openai.com retries |
 | Config blocks that enable features | If unused, omit entirely (no empty `summarization:` key) |
 | Harness cwd ≠ project | `get_status.workspace` reports the resolved workspace; set `WORKSPACE_ROOT` when a harness spawns servers from elsewhere |
 | Cold `uvx` build on first launch | ~5 s once per source change, cached afterwards; `uv tool install` removes even that |
-| Collection switch without re-embed | `ensure_index_identity` wipes the index so the reconcile re-embeds; a manual `.index/` delete does the same |
+| Collection switch without re-embed | `ensure_index_identity` wipes the index so the reconcile re-embeds; a manual `.simple-ci/` delete does the same |
 | Observer.start() blocking | Start on daemon thread; keep watched tree small |
 | Dropped inotify events | Sweep + startup reconcile always on |
 | Multi-writer races | One writer; design out, don't lock harder |
@@ -578,6 +621,7 @@ uv run pytest
 | **4 Embeddings + Qdrant** | embed-on-index, embed-on-query, `semantic=true` | host probes + semantic hit on acceptance file |
 | **5 Acceptance** | full test through harness; resilience check | DoD §2.1 |
 | **6 Optional** | topology B sidecar | always-on watch with harness closed |
+| **7 Setup + config** | `setup.py` wizard, layered `config.yaml`, managed services, harness plugins, `.simple-ci/` rename | fresh clone → `python setup.py` → harness connects; `ruff`/`pyright`/`pytest` green |
 
 **Phase 1 is a hard gate** — do not build the indexer until `mimo mcp list` is green (harness integration is risk #1).
 
@@ -609,6 +653,7 @@ uv run pytest
 | [0006](./adr/0006-harness-safe-mcp-surface.md) | Harness-safe minimal MCP tool surface |
 | [0007](./adr/0007-single-workspace-no-multi-repo.md) | Single workspace, no multi-repo registry |
 | [0008](./adr/0008-host-spawned-cwd-per-repo-collections.md) | Host-spawned process, cwd workspace, per-repo collections |
+| [0009](./adr/0009-setup-wizard-managed-services-config.md) | Setup wizard, layered YAML config, managed local services |
 
 ---
 
@@ -616,7 +661,11 @@ uv run pytest
 
 - [ ] Phase 1 harness gate first (`mimo mcp list`)
 - [ ] No `outputSchema` / `capabilities.tasks` / `execution.taskSupport`
-- [ ] No `OPENAI_API_KEY`; no unused config blocks
+- [ ] No `OPENAI_API_KEY`; no unused config blocks; secrets only via `embedding.api_key`/`EMBED_API_KEY`
+- [ ] Tests set `SIMPLE_CI_CONFIG=none` so a developer's global config cannot change defaults
+- [ ] Config discovery: `SIMPLE_CI_CONFIG` → local `.simple-ci/config.yaml` → global → defaults; env overrides
+- [ ] Managed containers are fail-soft: never block the MCP server forever, always report in `get_status.services`
+- [ ] New harness support goes in `src/simple_code_indexer/harnesses/` (bad plugins skipped, never fatal)
 - [ ] `tests/service_probe.py` + `tests/mcp_probe.py` before debugging
 - [ ] Watcher never blocks; debounce + queue + sweep
 - [ ] Single writer; hash short-circuit on no-op saves

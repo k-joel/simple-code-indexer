@@ -4,6 +4,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,7 +21,7 @@ def _settings() -> Settings:
     registry = get_registry()
     return Settings(
         workspace_root=Path("/workspace"),
-        index_db_path=Path("/workspace/.index/index.db"),
+        index_db_path=Path("/workspace/.simple-ci/index.db"),
         qdrant_url=QDRANT_URL,
         qdrant_collection="code_index_2560",
         embed_base_url="http://localhost:8080",
@@ -53,12 +54,21 @@ def test_point_id_is_stable_and_index_sensitive() -> None:
     assert a.int == a.int  # uuid5, fixed namespace
 
 
+def _collection_info(size: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            params=SimpleNamespace(vectors=SimpleNamespace(size=size))
+        )
+    )
+
+
 class _FakeClient:
     """Stands in for QdrantClient so collection-cache behaviour needs no server."""
 
     def __init__(self) -> None:
         self.created: list[str] = []
         self.attempts = 0
+        self.vector_size = 2560
 
     def collection_exists(self, name: str) -> bool:
         return False
@@ -67,6 +77,20 @@ class _FakeClient:
         self.attempts += 1
         self.created.append(name)
         time.sleep(0.05)  # open the check-then-create window for the race test
+
+    def get_collection(self, name: str) -> SimpleNamespace:
+        return _collection_info(self.vector_size)
+
+
+class _ExistingClient(_FakeClient):
+    """A collection that already exists before this process touches it."""
+
+    def __init__(self, vector_size: int = 2560) -> None:
+        super().__init__()
+        self.vector_size = vector_size
+
+    def collection_exists(self, name: str) -> bool:
+        return True
 
 
 def test_ensure_collection_is_keyed_by_url_and_collection(monkeypatch) -> None:
@@ -109,6 +133,29 @@ def test_ensure_collection_tolerates_a_concurrent_create(monkeypatch) -> None:
     assert qdrant_store.LAST_OK is True
     qdrant_store.ensure_collection(_settings())
     assert client.attempts == 1  # now cached, not retried
+
+
+def test_existing_collection_with_matching_size_is_accepted(monkeypatch) -> None:
+    client = _ExistingClient(vector_size=2560)
+    monkeypatch.setattr(qdrant_store, "_client", lambda settings: client)
+    monkeypatch.setattr(qdrant_store, "_ensured_collections", set())
+
+    qdrant_store.ensure_collection(_settings())
+
+    assert qdrant_store.LAST_OK is True
+    assert client.created == []  # existing collection is reused, not recreated
+
+
+def test_existing_collection_with_wrong_vector_size_is_rejected(monkeypatch) -> None:
+    client = _ExistingClient(vector_size=1024)
+    monkeypatch.setattr(qdrant_store, "_client", lambda settings: client)
+    monkeypatch.setattr(qdrant_store, "_ensured_collections", set())
+
+    with pytest.raises(QdrantUnavailable, match="1024"):
+        qdrant_store.ensure_collection(_settings())
+
+    assert qdrant_store.LAST_OK is False
+    assert client.created == []
 
 
 def test_concurrent_first_use_creates_the_collection_once(monkeypatch) -> None:

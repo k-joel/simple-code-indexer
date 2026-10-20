@@ -32,6 +32,29 @@ _Avoid_: vector index, embedding index
 The combined lexical index and semantic index for one workspace.
 _Avoid_: database, catalog, store
 
+**Index directory**:
+The gitignored `.simple-ci/` directory in a workspace. Holds `index.db` (plus WAL and lock
+files) and, when the project uses a local config, `config.yaml`.
+_Avoid_: data directory, cache folder, `.index` (the retired name)
+
+**Config file**:
+Optional `config.yaml` read at server startup: `<workspace>/.simple-ci/config.yaml` first,
+then `~/.simple-ci/config.yaml`. Environment variables override both. Records the embedding
+endpoint/model/dimension, the Qdrant URL, and any Docker services the server should start.
+_Avoid_: settings, preferences, env file
+
+**Managed service**:
+A Docker container named in `config.yaml` (`embedding.service` / `qdrant.service`) that the
+MCP server starts and waits for at boot. Fail-soft: an unavailable service degrades to
+lexical-only search instead of blocking the session.
+_Avoid_: sidecar, dependency, docker service (in prose)
+
+**Setup wizard**:
+The interactive flow started by `python setup.py`: installs `uv`, chooses an embedding
+endpoint (existing or downloaded), provisions Qdrant, probes the vector dimension, registers
+the server with detected harnesses, and writes `config.yaml`.
+_Avoid_: installer, bootstrap, setup script (as a noun for the logic)
+
 **Collection name**:
 The Qdrant collection holding one workspace's vectors: `code_index_{folder_slug}_{sha256(path)[:8]}_{embed_dim}`, derived from the workspace so projects never share vectors. Overridable with `QDRANT_COLLECTION`.
 _Avoid_: namespace, index name, vector store name
@@ -53,8 +76,16 @@ Stable Qdrant point identifier derived from the indexed file path and chunk inde
 _Avoid_: vector ID, embedding ID
 
 **Harness**:
-The MCP client host (MiMoCode) that spawns the server over stdio — with the session's project as its working directory — and loads tools from `.mimocode/mimocode.json`.
+An MCP client host (Claude Code, Codex, OpenCode, MiMoCode, and others) that spawns the
+server over stdio — with the session's project as its working directory — and loads tools
+from its own config file. The *harness plugin* (below) describes where that file lives.
 _Avoid_: client, IDE, agent host
+
+**Harness plugin**:
+A module in `src/simple_code_indexer/harnesses/` (or a user override in `<repo>/harnesses/`
+or `<workspace>/harnesses/`) that declares one harness's detection folders, global/project
+config paths, and how to merge a server entry into its file. Overrides a builtin by `NAME`.
+_Avoid_: adapter, integration, connector
 
 ## Search
 

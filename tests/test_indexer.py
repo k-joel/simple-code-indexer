@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from simple_code_indexer import db, embed, indexer
+from simple_code_indexer import db, embed, indexer, qdrant_store
 from simple_code_indexer.config import IGNORE_DIRS, Settings
 from simple_code_indexer.errors import EmbedError
 from simple_code_indexer.registry import get_registry
@@ -31,7 +31,7 @@ def _settings(workspace: Path) -> Settings:
     registry = get_registry()
     return Settings(
         workspace_root=workspace,
-        index_db_path=workspace / ".index" / "index.db",
+        index_db_path=workspace / ".simple-ci" / "index.db",
         qdrant_url="http://localhost:6333",
         qdrant_collection="code_index_2560",
         embed_base_url="http://localhost:1",  # hermetic: fail-soft embed path
@@ -73,6 +73,69 @@ def test_hash_short_circuit(tmp_path: Path) -> None:
     assert indexer.index_one_file(settings, source).status == "indexed"
     second = indexer.index_one_file(settings, source)
     assert second.status == "skipped_unchanged"
+
+
+def test_sweep_reembeds_failed_chunks_without_file_changes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = _settings(tmp_path)
+    source = tmp_path / "a.cpp"
+    source.write_text("int a() { return 1; }", encoding="utf-8")
+    assert indexer.index_one_file(settings, source).status == "indexed"
+
+    with db.connect(settings.index_db_path, readonly=True) as conn:
+        statuses = [
+            str(r["status"]) for r in conn.execute("SELECT status FROM embedding_state")
+        ]
+    assert statuses == ["error"]
+
+    embedded: list[str] = []
+    upserted: list[str] = []
+
+    def _embed(settings: Settings, texts: list[str]) -> list[list[float]]:
+        embedded.extend(texts)
+        return [[0.0] * 8 for _ in texts]
+
+    monkeypatch.setattr(embed, "embed_texts", _embed)
+    monkeypatch.setattr(
+        qdrant_store,
+        "upsert_chunks",
+        lambda _settings, path, items: upserted.append(path),
+    )
+
+    stats = indexer.sweep(settings)
+    assert stats.unchanged == 1
+    assert embedded  # retried despite the unchanged hash/mtime short circuit
+    assert upserted == ["a.cpp"]
+
+    with db.connect(settings.index_db_path, readonly=True) as conn:
+        statuses = [
+            str(r["status"]) for r in conn.execute("SELECT status FROM embedding_state")
+        ]
+    assert statuses == ["ok"]
+
+    embedded.clear()
+    indexer.sweep(settings)
+    assert embedded == []  # successful chunks are not re-embedded
+
+
+def test_reembed_stops_at_the_first_failing_file(tmp_path: Path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    for name in ("a.cpp", "b.cpp"):
+        (tmp_path / name).write_text(
+            f"int {name[0]}() {{ return 1; }}", encoding="utf-8"
+        )
+    indexer.sweep(settings)  # autouse stub fails both embeds
+
+    calls: list[list[str]] = []
+
+    def _fail(settings: Settings, texts: list[str]) -> list[list[float]]:
+        calls.append(texts)
+        raise EmbedError("down")
+
+    monkeypatch.setattr(embed, "embed_texts", _fail)
+    assert indexer.reembed_pending(settings) == 0
+    assert len(calls) == 1
 
 
 def test_skipped_filtered_and_missing_file(tmp_path: Path) -> None:

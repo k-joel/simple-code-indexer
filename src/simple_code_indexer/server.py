@@ -12,13 +12,22 @@ import logging
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from mcp import types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
-from simple_code_indexer import db, embed, indexer, qdrant_store, watcher
+from simple_code_indexer import (
+    db,
+    embed,
+    indexer,
+    qdrant_store,
+    services,
+    watcher,
+    workspace_lock,
+)
 from simple_code_indexer.config import Settings, load_settings
 from simple_code_indexer.errors import EmbedError, QdrantUnavailable
 from simple_code_indexer.registry import get_registry, start_prefetch_thread
@@ -87,6 +96,8 @@ def _status_payload(settings: Settings) -> dict[str, Any]:
         "workspace": str(settings.workspace_root),
         "collection": settings.qdrant_collection,
         "index_db": str(settings.index_db_path),
+        "config_file": str(settings.config_source) if settings.config_source else None,
+        "services": dict(services.LAST_STATE),
     }
 
 
@@ -219,8 +230,22 @@ def _probe_services(settings: Settings) -> None:
         logger.exception("embed probe failed")
 
 
+def _acquire_workspace_lock(index_db_path: Path) -> workspace_lock.WorkspaceLock:
+    """Enforce one writer per workspace; the lease dies with the process."""
+    lock = workspace_lock.WorkspaceLock(index_db_path)
+    if not lock.acquire():
+        logger.error(
+            "another simple-code-indexer already owns %s; refusing to start",
+            index_db_path,
+        )
+        raise SystemExit(1)
+    return lock
+
+
 async def _run() -> None:
     settings = load_settings()
+    lock = _acquire_workspace_lock(settings.index_db_path)
+    services.ensure_managed_services(settings)
     start_prefetch_thread()
     with db.connect(settings.index_db_path) as conn:
         db.ensure_schema(conn)
@@ -260,6 +285,7 @@ async def _run() -> None:
             write_stream,
             server.create_initialization_options(),
         )
+    lock.release()
 
 
 def main() -> None:

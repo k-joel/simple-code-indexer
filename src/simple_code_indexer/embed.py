@@ -1,4 +1,7 @@
-"""OpenAI-compatible embeddings client (local llama.cpp; never sets a key).
+"""OpenAI-compatible embeddings client (local llama.cpp or a hosted endpoint).
+
+An optional bearer token is sent when `embedding.api_key` / `EMBED_API_KEY` is set.
+
 
 Environment fact: this llama.cpp instance has physical batch size 512, so any
 single input over ~512 tokens is rejected with HTTP 500. Texts are therefore
@@ -72,6 +75,11 @@ def _post_embeddings(settings: Settings, texts: list[str]) -> list[list[float]]:
     global LAST_OK
     url = settings.embed_base_url.rstrip("/") + "/v1/embeddings"
     payload = {"model": settings.embed_model, "input": texts}
+    headers = (
+        {"Authorization": f"Bearer {settings.embed_api_key}"}
+        if settings.embed_api_key
+        else {}
+    )
     error: Exception | None = None
     for attempt in range(_ATTEMPTS):
         try:
@@ -80,6 +88,7 @@ def _post_embeddings(settings: Settings, texts: list[str]) -> list[list[float]]:
             response = httpx.post(
                 url,
                 json=payload,
+                headers=headers,
                 timeout=httpx.Timeout(settings.embed_timeout_s, connect=1.0),
             )
             response.raise_for_status()

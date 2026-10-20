@@ -142,6 +142,36 @@ def test_delete_file_removes_rows(tmp_path: Path) -> None:
         assert db.fts_search(conn, "f", limit=5) == []
 
 
+def test_chunks_needing_embedding_reports_missing_and_failed(
+    tmp_path: Path,
+) -> None:
+    with db.connect(db_path=tmp_path / "index.db") as conn:
+        db.ensure_schema(conn)
+        file_id = db.upsert_file(conn, _record())
+        db.replace_file_chunks(
+            conn,
+            file_id,
+            [
+                Chunk(chunk_index=0, start_line=1, end_line=1, content="int a()"),
+                Chunk(chunk_index=1, start_line=2, end_line=2, content="int b()"),
+            ],
+        )
+        ids = db.chunk_ids_for_path(conn, "src/foo.cpp")
+        # No embedding_state row and an error row both need a retry.
+        db.record_embedding_state(conn, [(ids[1][0], "point-1", "error")])
+        pending = db.chunks_needing_embedding(conn)
+        assert [(path, chunk.chunk_index) for path, chunk in pending] == [
+            ("src/foo.cpp", 0),
+            ("src/foo.cpp", 1),
+        ]
+
+        db.record_embedding_state(
+            conn,
+            [(ids[0][0], "point-0", "ok"), (ids[1][0], "point-1", "ok")],
+        )
+        assert db.chunks_needing_embedding(conn) == []
+
+
 def _seed_rows(conn) -> None:
     file_id = db.upsert_file(conn, _record())
     db.replace_file_chunks(

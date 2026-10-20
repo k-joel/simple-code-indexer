@@ -13,10 +13,13 @@ wheels/
 .pytest_cache/
 .ruff_cache/
 
-# MiMoCode session state
+# Coding harnesses
 .mimocode/
+.commandcode/
 
-# Index database (SQLite WAL)
+# Index database + local config (SQLite WAL)
+.simple-ci/
+# Legacy index directory from before the rename
 .index/
 
 # Project artifacts

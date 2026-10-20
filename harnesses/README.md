@@ -1,0 +1,32 @@
+# User harness plugins
+
+Drop-in modules that teach the setup wizard how a particular MCP client stores
+its server list. They follow the same contract as `src/simple_code_indexer/builtin/`
+language plugins: a plain `.py` file whose module globals are read by the loader.
+
+Search order (later wins): the builtin package → `<repo>/harnesses/` →
+`<workspace>/harnesses/`. A user plugin overrides a builtin by `NAME`; modules
+that fail to import or validate are logged and skipped.
+
+## Contract
+
+```python
+NAME = "my_harness"              # required, unique
+LABEL = "My Harness"             # shown by the wizard
+HOME_DIRS = ["~/.my-harness"]    # detection: any existing dir (or BINARIES on PATH)
+BINARIES = ["my-harness"]
+GLOBAL_CONFIGS = ["~/.my-harness/mcp.json"]   # user scope
+LOCAL_CONFIGS = [".my-harness/mcp.json"]      # project scope (relative to cwd)
+FORMAT = "json"                  # or "toml"
+ROOT_KEY = "mcpServers"          # JSON root key
+
+def entry(command, env):         # optional; default is command/args/env
+    return {"command": command[0], "args": command[1:], "env": env}
+```
+
+If `FORMAT = "toml"`, the plugin must not set `ROOT_KEY`; the loader writes a
+marker-delimited `[mcp_servers."simple-code-indexer"]` block. A plugin can also
+provide `render(existing, *, name, command, env) -> str` to fully control merging.
+
+`%APPDATA%` and `~` are expanded in `HOME_DIRS` and `*_CONFIGS`; entries whose
+variables do not exist on the current platform are ignored.

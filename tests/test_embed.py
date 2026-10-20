@@ -16,7 +16,7 @@ def _settings(base_url: str) -> Settings:
     registry = get_registry()
     return Settings(
         workspace_root=Path("/workspace"),
-        index_db_path=Path("/workspace/.index/index.db"),
+        index_db_path=Path("/workspace/.simple-ci/index.db"),
         qdrant_url="http://localhost:6333",
         qdrant_collection="code_index_2560",
         embed_base_url=base_url,

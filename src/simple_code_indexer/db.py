@@ -271,6 +271,32 @@ def record_embedding_state(
     )
 
 
+def chunks_needing_embedding(conn: sqlite3.Connection) -> list[tuple[str, Chunk]]:
+    """(path, chunk) rows with no successful embedding_state record."""
+    rows = conn.execute(
+        """
+        SELECT f.path AS path, c.chunk_index, c.start_line, c.end_line, c.content
+        FROM chunks c
+        JOIN files f ON f.id = c.file_id
+        LEFT JOIN embedding_state e ON e.chunk_id = c.id
+        WHERE e.chunk_id IS NULL OR e.status != 'ok'
+        ORDER BY f.path, c.chunk_index
+        """
+    ).fetchall()
+    return [
+        (
+            str(row["path"]),
+            Chunk(
+                chunk_index=int(row["chunk_index"]),
+                start_line=int(row["start_line"]),
+                end_line=int(row["end_line"]),
+                content=str(row["content"]),
+            ),
+        )
+        for row in rows
+    ]
+
+
 _COLLECTION_KEY = "qdrant_collection"
 _QDRANT_URL_KEY = "qdrant_url"
 

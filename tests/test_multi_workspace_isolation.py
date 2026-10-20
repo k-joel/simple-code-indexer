@@ -30,15 +30,22 @@ STEP_TIMEOUT_S = 60.0
 
 # Ambient overrides would break the per-workspace contract under test, and could
 # otherwise aim this test's cleanup at a collection outside its temp workspace.
-_CHILD_ENV_EXCLUDES = ("WORKSPACE_ROOT", "INDEX_DB", "QDRANT_COLLECTION")
+_CHILD_ENV_EXCLUDES = (
+    "WORKSPACE_ROOT",
+    "INDEX_DB",
+    "QDRANT_COLLECTION",
+    "SIMPLE_CI_CONFIG",
+)
 
 
 def _child_env() -> dict[str, str]:
-    return {
+    env = {
         name: value
         for name, value in os.environ.items()
         if name not in _CHILD_ENV_EXCLUDES
     }
+    env["SIMPLE_CI_CONFIG"] = "none"
+    return env
 
 
 def _reachable(url: str) -> bool:
@@ -256,8 +263,8 @@ def test_two_workspaces_get_separate_collections(tmp_path: Path) -> None:
             assert _observation_files(observed) <= {own_file}
             assert observed["own_semantic"]["source"] == "semantic"
             assert observed["absent_semantic"]["source"] == "semantic"
-            # Vectors may legitimately be missing (a failed embed is never
-            # retried — ISS-2), so presence is a precondition, not a claim.
+            # Vectors may legitimately still be missing if an embed failed and
+            # the sweep has not retried it yet, so presence is a precondition.
             if client.count(collection).count:
                 assert observed["own_semantic"]["hits"]
     finally:

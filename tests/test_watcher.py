@@ -24,7 +24,7 @@ def _settings(workspace: Path, *, debounce_ms: int = 100) -> Settings:
     registry = get_registry()
     return Settings(
         workspace_root=workspace,
-        index_db_path=workspace / ".index" / "index.db",
+        index_db_path=workspace / ".simple-ci" / "index.db",
         qdrant_url="http://localhost:6333",
         qdrant_collection="code_index_2560",
         embed_base_url="http://localhost:1",  # hermetic: fail-soft embed path

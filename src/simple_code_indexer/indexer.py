@@ -136,10 +136,14 @@ def index_one_file(settings: Settings, path: Path) -> IndexOutcome:
         return done("error")
 
 
-def _embed_and_store(settings: Settings, rel: str, chunks: list[Chunk]) -> None:
-    """Embed + upsert vectors; fail soft and record embedding_state (TDD §7.5)."""
+def _embed_and_store(settings: Settings, rel: str, chunks: list[Chunk]) -> bool:
+    """Embed + upsert vectors; fail soft and record embedding_state (TDD §7.5).
+
+    Returns True when every chunk got a vector, so retry callers can stop at the
+    first failure instead of hammering a service that is down.
+    """
     if not chunks:
-        return
+        return True
     points = {
         c.chunk_index: str(qdrant_store.point_id(rel, c.chunk_index)) for c in chunks
     }
@@ -164,12 +168,38 @@ def _embed_and_store(settings: Settings, rel: str, chunks: list[Chunk]) -> None:
             db.record_embedding_state(conn, rows)
     except sqlite3.Error:
         logger.warning("embedding_state update failed for %s", rel, exc_info=True)
+    return status == "ok"
+
+
+def reembed_pending(settings: Settings) -> int:
+    """Re-embed chunks that have no vector; unaffected by hash/mtime skips.
+
+    Called at the start of every sweep (including the startup reconcile), so a
+    fail-soft embed or Qdrant outage heals without deleting the index. Stops at
+    the first failure: the service is down for the rest too, and the next sweep
+    retries the remainder.
+    """
+    with db.connect(settings.index_db_path) as conn:
+        db.ensure_schema(conn)
+        pending = db.chunks_needing_embedding(conn)
+    by_path: dict[str, list[Chunk]] = {}
+    for rel, chunk in pending:
+        by_path.setdefault(rel, []).append(chunk)
+    reembedded = 0
+    for rel, chunks in by_path.items():
+        if not _embed_and_store(settings, rel, chunks):
+            break
+        reembedded += 1
+    if reembedded:
+        logger.info("re-embedded pending chunks for %d file(s)", reembedded)
+    return reembedded
 
 
 def sweep(settings: Settings) -> SweepStats:
     """Walk the workspace; re-index drift, drop deleted paths (TDD §4.3)."""
     global LAST_SWEEP
 
+    reembed_pending(settings)
     with db.connect(settings.index_db_path) as conn:
         db.ensure_schema(conn)
         stored = {

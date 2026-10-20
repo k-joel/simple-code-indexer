@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from simple_code_indexer.config import Settings
 from simple_code_indexer.errors import QdrantUnavailable
@@ -40,6 +40,27 @@ def _client(settings: Settings):
     # check_compatibility=False: client/server minors differ in this env and
     # the version probe would run on every lazily-created client.
     return QdrantClient(url=settings.qdrant_url, check_compatibility=False)
+
+
+def _validate_collection_config(client: Any, settings: Settings) -> None:
+    """Reject a collection our single unnamed vector cannot be upserted into.
+
+    Trusting an existing collection's name alone silently costs the workspace
+    every vector when its size differs from EMBED_DIM (fail-soft indexing only
+    logs), so fail loudly with the numbers instead.
+    """
+    vectors = client.get_collection(settings.qdrant_collection).config.params.vectors
+    size = getattr(vectors, "size", None)
+    if size is None:
+        raise QdrantUnavailable(
+            f"collection {settings.qdrant_collection} does not use a single "
+            f"unnamed vector of size {settings.embed_dim}"
+        )
+    if int(size) != settings.embed_dim:
+        raise QdrantUnavailable(
+            f"collection {settings.qdrant_collection} has vector size {size}, "
+            f"expected {settings.embed_dim}; delete it or align EMBED_DIM"
+        )
 
 
 def ensure_collection(settings: Settings) -> None:
@@ -77,8 +98,12 @@ def ensure_collection(settings: Settings) -> None:
                         settings.qdrant_collection,
                         exc,
                     )
+            _validate_collection_config(client, settings)
             _ensured_collections.add(cache_key)
             LAST_OK = True
+        except QdrantUnavailable:
+            LAST_OK = False
+            raise
         except Exception as exc:
             LAST_OK = False
             raise QdrantUnavailable(f"cannot ensure collection: {exc}") from exc

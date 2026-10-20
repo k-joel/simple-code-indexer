@@ -14,3 +14,5 @@ One workspace is mounted at `/workspace` and indexed as a whole. Upstream's mult
 - No `repository=` argument on tools.
 - Serving multiple roots later needs a sandbox allowlist (`MCP_ALLOWED_ROOTS`-style) and is out of scope for v1.
 - Index lives under `/workspace/.index/` (see TDD data layout).
+
+**Superseded path:** the index now lives in the workspace under `.simple-ci/` — see [ADR-0009](./0009-setup-wizard-managed-services-config.md). The single-workspace decision above is unchanged.

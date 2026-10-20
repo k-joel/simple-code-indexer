@@ -15,3 +15,7 @@ class ParseError(IndexerError):
 
 class QdrantUnavailable(IndexerError):
     """Qdrant is unreachable or rejected a request."""
+
+
+class ConfigError(IndexerError):
+    """A config file or config-derived value is invalid."""

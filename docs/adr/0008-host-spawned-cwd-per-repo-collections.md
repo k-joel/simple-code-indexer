@@ -18,6 +18,8 @@ The container topology ([ADR-0003](./0003-all-in-one-mvp-topology.md)) mounted *
 - A single static harness snippet works for every project; `get_status` reports the resolved `workspace` and `collection` so the inference is observable.
 - Collection naming is derived, so the pre-existing global `code_index_2560` collection is left orphaned (its points are not migrated); delete it by hand.
 - The index DB stays in the workspace at `$WORKSPACE_ROOT/.index/index.db`; each project should gitignore `.index/`.
+
+**Superseded path:** the index and the local config live under `.simple-ci/` — see [ADR-0009](./0009-setup-wizard-managed-services-config.md). Harness registration is now written by `setup.py`.
 - The workspace is decided by the harness spawn directory, so `WORKSPACE_ROOT` is the escape hatch when a harness spawns servers from elsewhere.
 - Cold `uvx` start is ~5 s (build + install), warm ~0.3 s; harness `timeout: 60000` leaves room, and `uv tool install` is the faster alternative.
 - The process exits with the harness session, so freshness while no session is attached is still unguaranteed (unchanged from ADR-0003).

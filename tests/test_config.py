@@ -25,11 +25,15 @@ def test_defaults_come_from_the_process_cwd(monkeypatch) -> None:
     cwd = Path.cwd().resolve()
     settings = load_settings()
     assert settings.workspace_root == cwd
-    assert settings.index_db_path == cwd / ".index" / "index.db"
+    assert settings.index_db_path == cwd / ".simple-ci" / "index.db"
     assert settings.qdrant_url == "http://localhost:6333"
     assert settings.embed_base_url == "http://localhost:8080"
     assert settings.embed_dim == 2560
     assert settings.embed_timeout_s == 15.0
+    assert settings.embed_api_key is None
+    assert settings.embedding_service is None
+    assert settings.qdrant_service is None
+    assert settings.config_source is None
     assert settings.sweep_seconds == 45.0
     assert settings.debounce_ms == 400
     assert settings.qdrant_collection.startswith("code_index_")
@@ -46,7 +50,7 @@ def test_env_overrides(monkeypatch) -> None:
     monkeypatch.delenv("QDRANT_COLLECTION", raising=False)
     settings = load_settings()
     assert settings.workspace_root == Path("/data").resolve()
-    assert settings.index_db_path == Path("/data").resolve() / ".index" / "index.db"
+    assert settings.index_db_path == Path("/data").resolve() / ".simple-ci" / "index.db"
     assert settings.sweep_seconds == 10.0
     # Collection follows the overridden workspace, not the process cwd.
     assert "_data_" in settings.qdrant_collection
