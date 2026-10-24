@@ -1,8 +1,9 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from simple_code_indexer import db, embed, indexer, qdrant_store
+from simple_code_indexer import db, embed, faiss_store, indexer, qdrant_store
 from simple_code_indexer.config import IGNORE_DIRS, Settings
 from simple_code_indexer.errors import EmbedError
 from simple_code_indexer.registry import get_registry
@@ -43,7 +44,13 @@ def _settings(workspace: Path) -> Settings:
         allowed_exts=registry.extension_allowlist(),
         allowed_filenames=registry.filename_allowlist(),
         ignore_dirs=IGNORE_DIRS,
+        vector_store="qdrant",
     )
+
+
+def _ids(path: str, items) -> list[str]:
+    """Stand-in for qdrant_store.upsert_chunks: one stable id per chunk."""
+    return [f"{path}:{chunk.chunk_index}" for chunk, _ in items]
 
 
 def test_index_one_file_end_to_end(tmp_path: Path) -> None:
@@ -97,11 +104,12 @@ def test_sweep_reembeds_failed_chunks_without_file_changes(
         return [[0.0] * 8 for _ in texts]
 
     monkeypatch.setattr(embed, "embed_texts", _embed)
-    monkeypatch.setattr(
-        qdrant_store,
-        "upsert_chunks",
-        lambda _settings, path, items: upserted.append(path),
-    )
+
+    def _upsert(_settings: Settings, path: str, items) -> list[str]:
+        upserted.append(path)
+        return _ids(path, items)
+
+    monkeypatch.setattr(qdrant_store, "upsert_chunks", _upsert)
 
     stats = indexer.sweep(settings)
     assert stats.unchanged == 1
@@ -138,6 +146,28 @@ def test_reembed_stops_at_the_first_failing_file(tmp_path: Path, monkeypatch) ->
     assert len(calls) == 1
 
 
+def test_a_short_embedding_response_is_recorded_as_an_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = replace(_settings(tmp_path), vector_store="faiss", embed_dim=8)
+    faiss_store._reset_state()
+    faiss_store.LAST_OK = None
+    monkeypatch.setattr(embed, "embed_texts", lambda _settings, _texts: [])
+    try:
+        source = tmp_path / "a.cpp"
+        source.write_text("int a() { return 1; }", encoding="utf-8")
+        assert indexer.index_one_file(settings, source).status == "indexed"
+        with db.connect(settings.index_db_path) as conn:
+            statuses = [
+                str(row["status"])
+                for row in conn.execute("SELECT status FROM embedding_state")
+            ]
+        assert statuses == ["error"]
+    finally:
+        faiss_store._reset_state()
+        faiss_store.LAST_OK = None
+
+
 def test_skipped_filtered_and_missing_file(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     md = tmp_path / "notes.md"
@@ -164,6 +194,53 @@ def test_sweep_prunes_ignored_dirs(tmp_path: Path) -> None:
     with db.connect(settings.index_db_path, readonly=True) as conn:
         paths = [str(r["path"]) for r in conn.execute("SELECT path FROM files")]
     assert paths == ["visible.py"]
+
+
+def test_faiss_backend_records_labels_and_reembeds(tmp_path: Path, monkeypatch) -> None:
+    settings = replace(_settings(tmp_path), vector_store="faiss", embed_dim=8)
+    faiss_store._reset_state()
+    faiss_store.LAST_OK = None
+    vector = [1.0] + [0.0] * 7
+
+    def _embed(_settings: Settings, texts: list[str]) -> list[list[float]]:
+        return [vector for _ in texts]
+
+    monkeypatch.setattr(embed, "embed_texts", _embed)
+    try:
+        source = tmp_path / "a.cpp"
+        source.write_text("int a() { return 1; }", encoding="utf-8")
+        assert indexer.index_one_file(settings, source).status == "indexed"
+
+        with db.connect(settings.index_db_path) as conn:
+            assert db.vector_label_rows(conn, "a.cpp") == [(1, 0)]
+            rows = conn.execute(
+                "SELECT vector_id, status FROM embedding_state"
+            ).fetchall()
+            assert [(str(r["vector_id"]), str(r["status"])) for r in rows] == [
+                ("1", "ok")
+            ]
+            assert db.dirty_vector_chunks(conn) == [("a.cpp", 0)]
+
+        assert indexer.sweep(settings).unchanged == 1
+        with db.connect(settings.index_db_path) as conn:
+            assert db.dirty_vector_chunks(conn) == []
+        assert (tmp_path / ".simple-ci" / "vectors.faiss").is_file()
+
+        # A lost vector is flagged at startup and re-embedded under its label.
+        with db.connect(settings.index_db_path) as conn, conn:
+            db.mark_vectors_dirty(conn, [1])
+            db.flag_chunks_for_reembed(conn)
+        assert indexer.sweep(settings).unchanged == 1
+        with db.connect(settings.index_db_path) as conn:
+            statuses = [
+                str(row["status"])
+                for row in conn.execute("SELECT status FROM embedding_state")
+            ]
+        assert statuses == ["ok"]
+        assert faiss_store.search(settings, vector, 1)[0].path == "a.cpp"
+    finally:
+        faiss_store._reset_state()
+        faiss_store.LAST_OK = None
 
 
 def test_sweep_indexes_drift_and_removes_deleted(tmp_path: Path) -> None:

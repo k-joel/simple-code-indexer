@@ -177,6 +177,30 @@ def test_unreachable_qdrant_raises_and_marks_not_ok() -> None:
     assert qdrant_store.LAST_OK is False
 
 
+class _UpsertClient(_ExistingClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.points: list[object] = []
+
+    def upsert(self, collection: str, points: list, wait: bool) -> None:
+        self.points.extend(points)
+
+
+def test_upsert_chunks_returns_the_point_ids(monkeypatch) -> None:
+    client = _UpsertClient()
+    monkeypatch.setattr(qdrant_store, "_client", lambda settings: client)
+    monkeypatch.setattr(qdrant_store, "_ensured_collections", set())
+    chunk = Chunk(chunk_index=2, start_line=1, end_line=2, content="int f()")
+
+    ids = qdrant_store.upsert_chunks(
+        _settings(), "src/foo.cpp", [(chunk, [0.0] * 2560)]
+    )
+
+    assert ids == [str(qdrant_store.point_id("src/foo.cpp", 2))]
+    assert len(client.points) == 1
+    assert qdrant_store.LAST_OK is True
+
+
 @pytest.mark.skipif(not _qdrant_reachable(), reason="qdrant down")
 def test_roundtrip_upsert_search_delete() -> None:
     settings = _settings()
@@ -186,7 +210,8 @@ def test_roundtrip_upsert_search_delete() -> None:
     vector = [0.01 * ((i % 7) - 3) for i in range(2560)]
     chunk = Chunk(chunk_index=0, start_line=1, end_line=3, content="int roundtrip() {}")
     try:
-        qdrant_store.upsert_chunks(settings, path, [(chunk, vector)])
+        ids = qdrant_store.upsert_chunks(settings, path, [(chunk, vector)])
+        assert ids == [str(qdrant_store.point_id(path, 0))]
         hits = qdrant_store.search(settings, vector, limit=5)
         assert any(h.path == path and h.chunk_index == 0 for h in hits)
     finally:

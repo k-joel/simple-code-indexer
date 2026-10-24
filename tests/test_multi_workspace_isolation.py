@@ -1,8 +1,7 @@
-"""Two workspaces index into separate collections and never see each other.
+"""Two workspaces index into separate FAISS files and never see each other.
 
-Spawns the real server (real Qdrant + real embeddings), so it is skipped when
-those services are down (TDD §11.2 "integration, services when reachable"). The
-collections it creates are deleted again on the way out.
+Spawns the real server (real embeddings, local FAISS), so it is skipped when the
+embedding service is down (TDD §11.2 "integration, services when reachable").
 """
 
 from __future__ import annotations
@@ -21,18 +20,16 @@ from typing import Any
 
 import pytest
 
-from simple_code_indexer.config import derive_collection_name
-
-QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 EMBED_BASE_URL = os.environ.get("EMBED_BASE_URL", "http://localhost:8080")
-EMBED_DIM = 2560
 STEP_TIMEOUT_S = 60.0
 
-# Ambient overrides would break the per-workspace contract under test, and could
-# otherwise aim this test's cleanup at a collection outside its temp workspace.
+# Ambient overrides would break the per-workspace contract under test.
 _CHILD_ENV_EXCLUDES = (
     "WORKSPACE_ROOT",
     "INDEX_DB",
+    "VECTOR_STORE",
+    "FAISS_PATH",
+    "QDRANT_URL",
     "QDRANT_COLLECTION",
     "SIMPLE_CI_CONFIG",
 )
@@ -45,6 +42,7 @@ def _child_env() -> dict[str, str]:
         if name not in _CHILD_ENV_EXCLUDES
     }
     env["SIMPLE_CI_CONFIG"] = "none"
+    env["VECTOR_STORE"] = "faiss"
     return env
 
 
@@ -59,8 +57,7 @@ def _reachable(url: str) -> bool:
 
 
 pytestmark = pytest.mark.skipif(
-    not (_reachable(f"{QDRANT_URL}/collections") and _reachable(EMBED_BASE_URL)),
-    reason="qdrant or embeddings not reachable",
+    not _reachable(EMBED_BASE_URL), reason="embeddings not reachable"
 )
 
 
@@ -210,13 +207,7 @@ def _observe(workspace: Path, own: str, other: str) -> dict[str, Any]:
         server.close()
 
 
-def _track(created: list[str], collection: str, workspace: Path) -> None:
-    """Track only a collection this test derived for its own temp workspace."""
-    if collection == derive_collection_name(workspace, EMBED_DIM):
-        created.append(collection)
-
-
-def test_two_workspaces_get_separate_collections(tmp_path: Path) -> None:
+def test_two_workspaces_get_separate_vector_files(tmp_path: Path) -> None:
     workspace_a = tmp_path / "alpha-project"
     workspace_b = tmp_path / "beta-project"
     fixtures = (
@@ -229,45 +220,36 @@ def test_two_workspaces_get_separate_collections(tmp_path: Path) -> None:
             f"int {symbol}() {{ return 42; }}\n", encoding="utf-8"
         )
 
-    from qdrant_client import QdrantClient
+    seen = _observe(workspace_a, "alphaOnlySymbol", "betaOnlySymbol")
+    other = _observe(workspace_b, "betaOnlySymbol", "alphaOnlySymbol")
+    status_a, status_b = seen["status"], other["status"]
 
-    client = QdrantClient(url=QDRANT_URL, check_compatibility=False)
-    created: list[str] = []
-    try:
-        seen = _observe(workspace_a, "alphaOnlySymbol", "betaOnlySymbol")
-        _track(created, seen["status"]["collection"], workspace_a)
-        other = _observe(workspace_b, "betaOnlySymbol", "alphaOnlySymbol")
-        _track(created, other["status"]["collection"], workspace_b)
-        status_a, status_b = seen["status"], other["status"]
+    assert status_a["workspace"] == str(workspace_a.resolve())
+    assert status_b["workspace"] == str(workspace_b.resolve())
+    assert status_a["vector_store"] == "faiss"
+    assert status_b["vector_store"] == "faiss"
+    vector_a = Path(status_a["vector_index"])
+    vector_b = Path(status_b["vector_index"])
+    assert vector_a == workspace_a.resolve() / ".simple-ci" / "vectors.faiss"
+    assert vector_b == workspace_b.resolve() / ".simple-ci" / "vectors.faiss"
+    assert vector_a != vector_b
+    assert vector_a.is_file()
+    assert vector_b.is_file()
+    assert status_a["vector_store_ok"] is True
+    assert status_b["vector_store_ok"] is True
 
-        assert status_a["workspace"] == str(workspace_a.resolve())
-        assert status_b["workspace"] == str(workspace_b.resolve())
-        assert status_a["collection"] == derive_collection_name(workspace_a, EMBED_DIM)
-        assert status_b["collection"] == derive_collection_name(workspace_b, EMBED_DIM)
-        assert status_a["collection"] != status_b["collection"]
-
-        observations = (
-            (seen, status_a["collection"], "alpha.cpp"),
-            (other, status_b["collection"], "beta.cpp"),
-        )
-        for observed, collection, own_file in observations:
-            assert observed["symbol"]["defined_in"] == own_file
-            # The other workspace's symbol is neither resolvable nor searchable.
-            assert observed["absent_symbol"]["found"] is False
-            # Lexical search reads this workspace's own index DB, so a shared
-            # INDEX_DB (misconfiguration) cannot pass as isolation.
-            assert observed["absent_search"]["hits"] == []
-            # Semantic hits are nearest-chunk, not matches, so they only have to
-            # stay inside this workspace: a hit from beta.cpp in alpha's collection
-            # would be the leak this test exists to catch.
-            assert _observation_files(observed) <= {own_file}
-            assert observed["own_semantic"]["source"] == "semantic"
-            assert observed["absent_semantic"]["source"] == "semantic"
-            # Vectors may legitimately still be missing if an embed failed and
-            # the sweep has not retried it yet, so presence is a precondition.
-            if client.count(collection).count:
-                assert observed["own_semantic"]["hits"]
-    finally:
-        for collection in created:
-            if client.collection_exists(collection):
-                client.delete_collection(collection)
+    observations = ((seen, "alpha.cpp"), (other, "beta.cpp"))
+    for observed, own_file in observations:
+        assert observed["symbol"]["defined_in"] == own_file
+        # The other workspace's symbol is neither resolvable nor searchable.
+        assert observed["absent_symbol"]["found"] is False
+        # Lexical search reads this workspace's own index DB, so a shared
+        # INDEX_DB (misconfiguration) cannot pass as isolation.
+        assert observed["absent_search"]["hits"] == []
+        # Semantic hits are nearest-chunk, not matches, so they only have to
+        # stay inside this workspace: a hit from beta.cpp in alpha's file would
+        # be the leak this test exists to catch.
+        assert _observation_files(observed) <= {own_file}
+        assert observed["own_semantic"]["source"] == "semantic"
+        assert observed["absent_semantic"]["source"] == "semantic"
+        assert observed["own_semantic"]["hits"]

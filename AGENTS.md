@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Minimal **code-index MCP server** (Python): watch files, index on save into **SQLite/FTS5** (lexical) + **Qdrant** (semantic vectors).
+Minimal **code-index MCP server** (Python): watch files, index on save into **SQLite/FTS5** (lexical) + **FAISS** (semantic vectors, default) or **Qdrant** (opt-in).
 
 ## Project Docs
 
@@ -62,19 +62,21 @@ Host-spawned MCP process (no container in this repo — [ADR-0008](docs/adr/0008
 | Service | Endpoint / value |
 |---|---|
 | Embeddings (OpenAI-compatible) | `http://localhost:8080/v1/embeddings` — model `Qwen3-Embedding-4B-Q6_K`, **2560-dim** |
-| Qdrant | `http://localhost:6333` (no auth) — one derived collection per workspace |
+| FAISS (default) | `<workspace>/.simple-ci/vectors.faiss` — no service; `faiss.path` / `FAISS_PATH` override |
+| Qdrant (opt-in) | `http://localhost:6333` (no auth) — one derived collection per workspace |
 | Workspace | the MCP process cwd (`WORKSPACE_ROOT` overrides); index at `$WORKSPACE_ROOT/.simple-ci/index.db` |
 | Config | `<workspace>/.simple-ci/config.yaml` → `~/.simple-ci/config.yaml` → defaults; env vars win (`SIMPLE_CI_CONFIG=none` disables discovery) |
 
-Config comes from the YAML file first, then env (e.g. `QDRANT_URL`, `EMBED_BASE_URL`,
-`EMBED_API_KEY`) — never hardcode secrets or local URLs in committed code. A `service` block
-makes the server start that Docker container at boot (fail-soft).
+Config comes from the YAML file first, then env (e.g. `VECTOR_STORE`, `FAISS_PATH`,
+`QDRANT_URL`, `EMBED_BASE_URL`, `EMBED_API_KEY`) — never hardcode secrets or local URLs in
+committed code. A `service` block makes the server start that Docker container at boot
+(fail-soft); a `qdrant.service` is ignored on the FAISS backend.
 Probe the services with `uv run python tests/service_probe.py` before a live-model session.
 
 ## Conventions
 
 - Prefer stdlib where it matters: **SQLite + FTS5** for lexical index (stdlib `sqlite3`).
-- Semantic path: embed with the same endpoint used for queries; store in Qdrant.
+- Semantic path: embed with the same endpoint used for queries; store through `vector_store.py` (FAISS by default, Qdrant opt-in) so call sites stay backend-agnostic.
 - File-watcher / MCP surface should stay small: `search_code`, `symbol_lookup`, `get_status` (optional `reindex`).
 - MCP config for the harness lives in `.mimocode/mimocode.json` (gitignored); changes need a session restart to reload. It points at the host-spawned `uvx --from <repo> simple-code-indexer`. `python setup.py` writes the same entry for other harnesses.
 - Harness support is a plugin folder (`src/simple_code_indexer/harnesses/`); bad plugins are skipped, never fatal, and user drop-ins override builtins by `NAME`.

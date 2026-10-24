@@ -16,6 +16,7 @@ wheels/
 # Coding harnesses
 .mimocode/
 .commandcode/
+.kilo/
 
 # Index database + local config (SQLite WAL)
 .simple-ci/

@@ -153,6 +153,7 @@ def _wizard(
 def test_existing_endpoint_writes_probed_dimension(tmp_path: Path, monkeypatch) -> None:
     prompts = ScriptedPrompter(
         yes=[True, False, True, False],
+        choices=[1],
         texts=[
             "http://embed.test:9000",
             "",
@@ -168,6 +169,7 @@ def test_existing_endpoint_writes_probed_dimension(tmp_path: Path, monkeypatch) 
     config = project / ".simple-ci" / "config.yaml"
     assert config.is_file()
     document = _yaml(config)
+    assert document["vector_store"] == "qdrant"
     assert document["embedding"]["base_url"] == "http://embed.test:9000"
     assert document["embedding"]["model"] == "my-model"
     assert document["embedding"]["dim"] == DIM
@@ -178,6 +180,7 @@ def test_existing_endpoint_writes_probed_dimension(tmp_path: Path, monkeypatch) 
     monkeypatch.setenv("SIMPLE_CI_CONFIG", str(config))
     monkeypatch.setenv("WORKSPACE_ROOT", str(project))
     settings = load_settings()
+    assert settings.vector_store == "qdrant"
     assert settings.embed_dim == DIM
     assert settings.embed_base_url == "http://embed.test:9000"
     assert settings.config_source == config
@@ -205,7 +208,7 @@ def test_auto_download_writes_compose_and_services(tmp_path: Path, monkeypatch) 
     )
     prompts = ScriptedPrompter(
         yes=[False, False, True],
-        choices=[1],
+        choices=[1, 1],
         multis=[[]],
     )
     runner = FakeRunner(
@@ -225,6 +228,7 @@ def test_auto_download_writes_compose_and_services(tmp_path: Path, monkeypatch) 
     assert downloaded and downloaded[0][1].name == "Qwen3-Embedding-0.6B-Q8_0.gguf"
 
     document = _yaml(project / ".simple-ci" / "config.yaml")
+    assert document["vector_store"] == "qdrant"
     assert document["embedding"]["dim"] == DIM
     assert document["embedding"]["service"]["compose_service"] == "embed"
     assert document["qdrant"]["service"]["compose_service"] == "qdrant"
@@ -235,7 +239,7 @@ def test_existing_stopped_container_is_started(tmp_path: Path) -> None:
     prompts = ScriptedPrompter(
         yes=[True, True, True, False],
         texts=["my-embed-model", "http://localhost:6333"],
-        choices=[0],
+        choices=[0, 1],
         multis=[[]],
     )
     runner = FakeRunner(
@@ -365,6 +369,57 @@ def test_legacy_index_is_migrated(tmp_path: Path) -> None:
 
     assert (project / ".simple-ci" / "index.db").read_bytes() == b"old-index"
     assert not legacy.exists()
+
+
+def test_faiss_branch_writes_no_qdrant_config(tmp_path: Path, monkeypatch) -> None:
+    prompts = ScriptedPrompter(
+        yes=[True, False],
+        texts=["http://embed.test:9000", "", "my-model"],
+        multis=[[]],
+    )
+    runner = FakeRunner(which_map={"docker": "/usr/bin/docker", "uvx": "/usr/bin/uvx"})
+    wizard, project, _ = _wizard(tmp_path, prompts=prompts, runner=runner)
+
+    assert wizard.run() == 0
+
+    document = _yaml(project / ".simple-ci" / "config.yaml")
+    assert document["vector_store"] == "faiss"
+    assert "qdrant" not in document
+    assert not any(call[:1] == ["docker"] for call in runner.calls)
+
+    monkeypatch.setenv("SIMPLE_CI_CONFIG", str(project / ".simple-ci" / "config.yaml"))
+    monkeypatch.setenv("WORKSPACE_ROOT", str(project))
+    settings = load_settings()
+    assert settings.vector_store == "faiss"
+    assert settings.faiss_path is None
+
+
+def test_the_backend_default_follows_the_existing_config(tmp_path: Path) -> None:
+    project, home, repo = _workspace(tmp_path)
+    config = project / ".simple-ci" / "config.yaml"
+    config.parent.mkdir()
+    wizard = Wizard(
+        cwd=project,
+        home=home,
+        repo_root=repo,
+        prompts=ScriptedPrompter(),
+        runner=FakeRunner(),
+        config_path=config,
+    )
+
+    config.write_text("qdrant:\n  url: http://x:6333\n", encoding="utf-8")
+    assert wizard._existing_vector_store() == "qdrant"
+
+    config.write_text(
+        "vector_store: faiss\nqdrant:\n  url: http://x:6333\n", encoding="utf-8"
+    )
+    assert wizard._existing_vector_store() == "faiss"
+
+    config.write_text("vector_store: qdrant\n", encoding="utf-8")
+    assert wizard._existing_vector_store() == "qdrant"
+
+    config.write_text("vector_store: faiss\n", encoding="utf-8")
+    assert wizard._existing_vector_store() == "faiss"
 
 
 def _yaml(path: Path) -> Any:

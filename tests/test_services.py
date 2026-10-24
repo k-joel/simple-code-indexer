@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -103,12 +104,27 @@ def _settings(
         embed_api_key=api_key,
         embedding_service=embedding,
         qdrant_service=qdrant,
+        vector_store="qdrant",
     )
 
 
 def _install_docker(monkeypatch, docker: Docker) -> None:
     monkeypatch.setattr(services, "_which", lambda _name: "/usr/bin/docker")
     monkeypatch.setattr(services, "_run", docker)
+
+
+def test_the_qdrant_container_is_skipped_for_faiss(tmp_path: Path, monkeypatch) -> None:
+    docker = Docker({"simple-ci-qdrant": "running"}, info=True)
+    _install_docker(monkeypatch, docker)
+    settings = replace(
+        _settings(tmp_path, qdrant=ManagedService("simple-ci-qdrant")),
+        vector_store="faiss",
+    )
+
+    services.ensure_managed_services(settings)
+
+    assert services.LAST_STATE["qdrant"] == "not_managed"
+    assert docker.commands() == []
 
 
 def test_unmanaged_services_are_reported(tmp_path: Path, monkeypatch) -> None:

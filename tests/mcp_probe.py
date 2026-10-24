@@ -114,7 +114,9 @@ def main() -> None:
             "chunks_indexed",
             "watcher_alive",
             "workspace",
-            "collection",
+            "vector_store",
+            "vector_store_ok",
+            "vector_index",
             "index_db",
         ):
             if key not in payload:

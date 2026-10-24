@@ -64,10 +64,18 @@ CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
 END;
 
 CREATE TABLE IF NOT EXISTS embedding_state (
-  chunk_id        INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
-  qdrant_point_id TEXT NOT NULL,
-  status          TEXT NOT NULL,
-  updated_at      TEXT NOT NULL
+  chunk_id   INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+  vector_id  TEXT NOT NULL,
+  status     TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vector_labels (
+  label       INTEGER PRIMARY KEY,
+  path        TEXT NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  dirty       INTEGER NOT NULL DEFAULT 1,
+  UNIQUE(path, chunk_index)
 );
 
 CREATE TABLE IF NOT EXISTS meta (
@@ -112,7 +120,19 @@ def connect(db_path: Path, *, readonly: bool = False) -> Iterator[sqlite3.Connec
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
+    _migrate_embedding_state(conn)
     conn.commit()
+
+
+def _migrate_embedding_state(conn: sqlite3.Connection) -> None:
+    """Rename the Qdrant-specific column; PRAGMA guards against a re-run."""
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(embedding_state)")
+    }
+    if "qdrant_point_id" in columns and "vector_id" not in columns:
+        conn.execute(
+            "ALTER TABLE embedding_state RENAME COLUMN qdrant_point_id TO vector_id"
+        )
 
 
 def upsert_file(conn: sqlite3.Connection, record: FileRecord) -> int:
@@ -257,13 +277,13 @@ def chunk_ids_for_path(conn: sqlite3.Connection, path: str) -> list[tuple[int, i
 def record_embedding_state(
     conn: sqlite3.Connection, rows: list[tuple[int, str, str]]
 ) -> None:
-    """Upsert (chunk_id, qdrant_point_id, status) observability rows (TDD §7.5)."""
+    """Upsert (chunk_id, vector_id, status) observability rows (TDD §7.5)."""
     conn.executemany(
         """
-        INSERT INTO embedding_state (chunk_id, qdrant_point_id, status, updated_at)
+        INSERT INTO embedding_state (chunk_id, vector_id, status, updated_at)
         VALUES (?, ?, ?, datetime('now'))
         ON CONFLICT(chunk_id) DO UPDATE SET
-          qdrant_point_id=excluded.qdrant_point_id,
+          vector_id=excluded.vector_id,
           status=excluded.status,
           updated_at=excluded.updated_at
         """,
@@ -299,6 +319,17 @@ def chunks_needing_embedding(conn: sqlite3.Connection) -> list[tuple[str, Chunk]
 
 _COLLECTION_KEY = "qdrant_collection"
 _QDRANT_URL_KEY = "qdrant_url"
+_BACKEND_KEY = "vector_backend"
+_FAISS_PATH_KEY = "faiss_path"
+_FAISS_DIM_KEY = "faiss_dim"
+_LABEL_SEQ_KEY = "vector_label_seq"
+
+_IDENTITY_KEYS = {
+    "qdrant": (_QDRANT_URL_KEY, _COLLECTION_KEY),
+    "faiss": (_FAISS_PATH_KEY, _FAISS_DIM_KEY),
+}
+
+_SQL_BATCH = 500
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
@@ -317,26 +348,159 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def ensure_index_identity(
-    conn: sqlite3.Connection, *, qdrant_url: str, collection: str
+    conn: sqlite3.Connection, *, backend: str, identity: tuple[str, str]
 ) -> bool:
-    """Bind the index to one Qdrant endpoint + collection; drop stale rows.
+    """Bind the index to one vector store; drop rows whose vectors are gone.
 
-    Rows indexed elsewhere have no vectors where the next write lands, and the
-    hash/mtime short circuits would never re-embed them, so they must go. Rows
-    with no recorded identity are stale by the same argument.
-    Returns True when the index was invalidated — an earlier binding existed, or
-    rows were present.
+    `identity` is (url, collection) for Qdrant and (path, dim) for FAISS. Rows
+    indexed against another store have no vectors where the next write lands,
+    and the hash/mtime short circuits would never re-embed them, so they must
+    go. A DB written before `vector_backend` existed was Qdrant-bound when the
+    Qdrant keys are present, so an existing Qdrant install survives the upgrade.
+    Returns True when the index was invalidated — an earlier binding existed,
+    or rows were present.
     """
-    stored = (get_meta(conn, _QDRANT_URL_KEY), get_meta(conn, _COLLECTION_KEY))
-    if stored == (qdrant_url, collection):
+    keys = _IDENTITY_KEYS[backend]
+    requested = (str(identity[0]), str(identity[1]))
+    stored_backend = get_meta(conn, _BACKEND_KEY)
+    if stored_backend is None:
+        qdrant_stored = (
+            get_meta(conn, _QDRANT_URL_KEY),
+            get_meta(conn, _COLLECTION_KEY),
+        )
+        if qdrant_stored != (None, None):
+            stored_backend = "qdrant"
+    stored = (get_meta(conn, keys[0]), get_meta(conn, keys[1]))
+    if stored_backend == backend and stored == requested:
+        # Backfill the explicit binding for a legacy Qdrant DB.
+        set_meta(conn, _BACKEND_KEY, backend)
         return False
     has_rows = conn.execute("SELECT EXISTS(SELECT 1 FROM files)").fetchone()
-    invalidated = stored != (None, None) or bool(has_rows[0])
+    invalidated = stored_backend is not None or bool(has_rows[0])
     if invalidated:
         conn.execute("DELETE FROM files")  # cascades symbols/chunks/embedding_state
-    set_meta(conn, _QDRANT_URL_KEY, qdrant_url)
-    set_meta(conn, _COLLECTION_KEY, collection)
+        conn.execute("DELETE FROM vector_labels")
+    set_meta(conn, _BACKEND_KEY, backend)
+    set_meta(conn, keys[0], requested[0])
+    set_meta(conn, keys[1], requested[1])
     return invalidated
+
+
+def allocate_vector_label(conn: sqlite3.Connection, path: str, chunk_index: int) -> int:
+    """Stable FAISS id for one chunk; labels are never reused after deletion."""
+    row = conn.execute(
+        "SELECT label FROM vector_labels WHERE path = ? AND chunk_index = ?",
+        (path, chunk_index),
+    ).fetchone()
+    if row is not None:
+        return int(row["label"])
+    stored = get_meta(conn, _LABEL_SEQ_KEY)
+    highest = conn.execute("SELECT COALESCE(MAX(label), 0) FROM vector_labels")
+    label = max(int(stored or 0), int(highest.fetchone()[0])) + 1
+    conn.execute(
+        """
+        INSERT INTO vector_labels (label, path, chunk_index, dirty)
+        VALUES (?, ?, ?, 1)
+        """,
+        (label, path, chunk_index),
+    )
+    set_meta(conn, _LABEL_SEQ_KEY, str(label))
+    return label
+
+
+def vector_label_rows(conn: sqlite3.Connection, path: str) -> list[tuple[int, int]]:
+    """(label, chunk_index) pairs currently mapped to one path."""
+    rows = conn.execute(
+        "SELECT label, chunk_index FROM vector_labels WHERE path = ? ORDER BY label",
+        (path,),
+    ).fetchall()
+    return [(int(row["label"]), int(row["chunk_index"])) for row in rows]
+
+
+def vector_paths_for_labels(
+    conn: sqlite3.Connection, labels: list[int]
+) -> dict[int, tuple[str, int]]:
+    """Map FAISS ids back to (path, chunk_index); unknown ids are absent."""
+    mapping: dict[int, tuple[str, int]] = {}
+    values = [int(label) for label in labels]
+    for start in range(0, len(values), _SQL_BATCH):
+        batch = values[start : start + _SQL_BATCH]
+        placeholders = ", ".join("?" for _ in batch)
+        rows = conn.execute(
+            f"SELECT label, path, chunk_index FROM vector_labels "
+            f"WHERE label IN ({placeholders})",
+            batch,
+        ).fetchall()
+        for row in rows:
+            mapping[int(row["label"])] = (
+                str(row["path"]),
+                int(row["chunk_index"]),
+            )
+    return mapping
+
+
+def delete_vector_labels(
+    conn: sqlite3.Connection, path: str, chunk_indexes: list[int]
+) -> None:
+    """Drop mappings for chunks a file no longer has."""
+    conn.executemany(
+        "DELETE FROM vector_labels WHERE path = ? AND chunk_index = ?",
+        [(path, int(index)) for index in chunk_indexes],
+    )
+
+
+def mark_vectors_dirty(conn: sqlite3.Connection, labels: list[int]) -> None:
+    conn.executemany(
+        "UPDATE vector_labels SET dirty = 1 WHERE label = ?",
+        [(int(label),) for label in labels],
+    )
+
+
+def mark_all_vectors_dirty(conn: sqlite3.Connection) -> None:
+    conn.execute("UPDATE vector_labels SET dirty = 1")
+
+
+def clear_vector_dirty(conn: sqlite3.Connection) -> None:
+    conn.execute("UPDATE vector_labels SET dirty = 0 WHERE dirty != 0")
+
+
+def dirty_vector_chunks(conn: sqlite3.Connection) -> list[tuple[str, int]]:
+    """(path, chunk_index) for every label whose vector may not be persisted."""
+    rows = conn.execute(
+        "SELECT path, chunk_index FROM vector_labels WHERE dirty != 0"
+        " ORDER BY path, chunk_index"
+    ).fetchall()
+    return [(str(row["path"]), int(row["chunk_index"])) for row in rows]
+
+
+def flag_chunks_for_reembed(conn: sqlite3.Connection) -> int:
+    """Mark dirty-label chunks missing so `chunks_needing_embedding` retries.
+
+    Returns the number of chunks (not embedding_state rows) covered.
+    """
+    conn.execute(
+        """
+        UPDATE embedding_state SET status = 'missing', updated_at = datetime('now')
+        WHERE chunk_id IN (
+          SELECT c.id
+          FROM chunks c
+          JOIN files f ON f.id = c.file_id
+          JOIN vector_labels v ON v.path = f.path AND v.chunk_index = c.chunk_index
+          WHERE v.dirty != 0
+        )
+        """
+    )
+    row = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM chunks c
+        JOIN files f ON f.id = c.file_id
+        JOIN vector_labels v ON v.path = f.path AND v.chunk_index = c.chunk_index
+        WHERE v.dirty != 0
+        """
+    ).fetchone()
+    assert row is not None
+    return int(row[0])
 
 
 class ChunkSpan(NamedTuple):

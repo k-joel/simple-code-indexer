@@ -188,12 +188,23 @@ def _seed_rows(conn) -> None:
     )
 
 
-def _bind(conn, collection: str, url: str = "http://localhost:6333") -> bool:
-    return db.ensure_index_identity(conn, qdrant_url=url, collection=collection)
+def _bind(
+    conn,
+    collection: str,
+    url: str = "http://localhost:6333",
+    *,
+    backend: str = "qdrant",
+) -> bool:
+    return db.ensure_index_identity(conn, backend=backend, identity=(url, collection))
+
+
+def _bind_faiss(conn) -> bool:
+    return db.ensure_index_identity(conn, backend="faiss", identity=FAISS_IDENTITY)
 
 
 COLLECTION_A = "code_index_a_11111111_2560"
 COLLECTION_B = "code_index_b_22222222_2560"
+FAISS_IDENTITY = ("/ws/.simple-ci/vectors.faiss", "2560")
 
 
 def test_index_identity_leaves_an_empty_index_alone(tmp_path: Path) -> None:
@@ -249,3 +260,121 @@ def test_index_identity_wipes_rows_when_the_qdrant_endpoint_changes(
         assert _bind(conn, COLLECTION_A, other) is True
         assert db.stats(conn) == {"files": 0, "symbols": 0, "chunks": 0}
         assert _bind(conn, COLLECTION_A, other) is False
+
+
+def test_index_identity_defaults_to_faiss_on_a_fresh_db(tmp_path: Path) -> None:
+    with db.connect(db_path=tmp_path / "index.db") as conn:
+        db.ensure_schema(conn)
+        assert _bind_faiss(conn) is False
+        assert db.get_meta(conn, "vector_backend") == "faiss"
+        assert db.get_meta(conn, "faiss_path") == FAISS_IDENTITY[0]
+        assert db.get_meta(conn, "faiss_dim") == FAISS_IDENTITY[1]
+
+
+def test_legacy_qdrant_db_survives_the_upgrade(tmp_path: Path) -> None:
+    # A DB written before `vector_backend` existed has only the Qdrant keys;
+    # treating it as unknown would wipe an existing install on every restart.
+    with db.connect(db_path=tmp_path / "index.db") as conn:
+        db.ensure_schema(conn)
+        db.set_meta(conn, "qdrant_url", "http://localhost:6333")
+        db.set_meta(conn, "qdrant_collection", COLLECTION_A)
+        _seed_rows(conn)
+
+        assert _bind(conn, COLLECTION_A) is False
+        assert db.stats(conn) == {"files": 1, "symbols": 0, "chunks": 1}
+        assert db.get_meta(conn, "vector_backend") == "qdrant"
+
+
+def test_switching_a_legacy_qdrant_db_to_faiss_invalidates_it(
+    tmp_path: Path,
+) -> None:
+    with db.connect(db_path=tmp_path / "index.db") as conn:
+        db.ensure_schema(conn)
+        db.set_meta(conn, "qdrant_url", "http://localhost:6333")
+        db.set_meta(conn, "qdrant_collection", COLLECTION_A)
+        _seed_rows(conn)
+        db.allocate_vector_label(conn, "src/foo.cpp", 0)
+
+        assert _bind_faiss(conn) is True
+        assert db.stats(conn) == {"files": 0, "symbols": 0, "chunks": 0}
+        assert db.vector_label_rows(conn, "src/foo.cpp") == []
+        assert db.get_meta(conn, "vector_backend") == "faiss"
+        # The legacy Qdrant keys stay as they were.
+        assert db.get_meta(conn, "qdrant_collection") == COLLECTION_A
+
+
+def test_switching_back_to_qdrant_invalidates_faiss_rows(tmp_path: Path) -> None:
+    with db.connect(db_path=tmp_path / "index.db") as conn:
+        db.ensure_schema(conn)
+        _bind_faiss(conn)
+        _seed_rows(conn)
+
+        assert _bind(conn, COLLECTION_A) is True
+        assert db.stats(conn) == {"files": 0, "symbols": 0, "chunks": 0}
+        assert _bind(conn, COLLECTION_A) is False
+
+
+def test_vector_labels_are_stable_and_never_reused(tmp_path: Path) -> None:
+    with db.connect(db_path=tmp_path / "index.db") as conn:
+        db.ensure_schema(conn)
+        first = db.allocate_vector_label(conn, "src/a.cpp", 0)
+        assert db.allocate_vector_label(conn, "src/a.cpp", 0) == first
+        second = db.allocate_vector_label(conn, "src/a.cpp", 1)
+        assert second > first
+
+        # Deleting every row must not make a freed number allocatable again:
+        # a crash can leave the old vector in the FAISS file.
+        db.delete_vector_labels(conn, "src/a.cpp", [0, 1])
+        assert db.vector_label_rows(conn, "src/a.cpp") == []
+        third = db.allocate_vector_label(conn, "src/b.cpp", 0)
+        assert third > second
+
+
+def test_label_mapping_helpers(tmp_path: Path) -> None:
+    with db.connect(db_path=tmp_path / "index.db") as conn:
+        db.ensure_schema(conn)
+        label = db.allocate_vector_label(conn, "src/a.cpp", 2)
+        other = db.allocate_vector_label(conn, "src/b.cpp", 0)
+
+        assert db.vector_label_rows(conn, "src/a.cpp") == [(label, 2)]
+        mapping = db.vector_paths_for_labels(conn, [label, other, 999_999])
+        assert mapping == {
+            label: ("src/a.cpp", 2),
+            other: ("src/b.cpp", 0),
+        }
+
+        assert db.dirty_vector_chunks(conn) == [
+            ("src/a.cpp", 2),
+            ("src/b.cpp", 0),
+        ]
+        db.clear_vector_dirty(conn)
+        assert db.dirty_vector_chunks(conn) == []
+        db.mark_vectors_dirty(conn, [other])
+        assert db.dirty_vector_chunks(conn) == [("src/b.cpp", 0)]
+
+        db.delete_vector_labels(conn, "src/a.cpp", [2])
+        assert db.vector_label_rows(conn, "src/a.cpp") == []
+        assert db.vector_label_rows(conn, "src/b.cpp") == [(other, 0)]
+
+
+def test_flag_chunks_for_reembed_only_touches_dirty_labels(tmp_path: Path) -> None:
+    with db.connect(db_path=tmp_path / "index.db") as conn:
+        db.ensure_schema(conn)
+        _seed_rows(conn)
+        label = db.allocate_vector_label(conn, "src/foo.cpp", 0)
+
+        # A clean label means the vector is presumed persisted.
+        db.clear_vector_dirty(conn)
+        assert db.flag_chunks_for_reembed(conn) == 0
+        assert db.chunks_needing_embedding(conn) == []
+
+        db.mark_vectors_dirty(conn, [label])
+        assert db.flag_chunks_for_reembed(conn) == 1
+        statuses = [
+            str(row["status"])
+            for row in conn.execute("SELECT status FROM embedding_state")
+        ]
+        assert statuses == ["missing"]
+        assert [
+            chunk.chunk_index for _, chunk in db.chunks_needing_embedding(conn)
+        ] == [0]

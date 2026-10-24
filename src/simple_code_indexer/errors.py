@@ -13,7 +13,11 @@ class ParseError(IndexerError):
     """Source could not be decoded or parsed."""
 
 
-class QdrantUnavailable(IndexerError):
+class VectorStoreUnavailable(IndexerError):
+    """The configured vector store is unreachable, broken or misconfigured."""
+
+
+class QdrantUnavailable(VectorStoreUnavailable):
     """Qdrant is unreachable or rejected a request."""
 
 

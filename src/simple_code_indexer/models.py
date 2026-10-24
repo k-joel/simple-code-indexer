@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,3 +42,9 @@ class SearchHit:
     snippet: str
     score: float
     source: str = "lexical"
+
+
+class VectorHit(NamedTuple):
+    path: str
+    chunk_index: int
+    score: float

@@ -25,8 +25,23 @@ SQLite + FTS5 store over file records, symbols, and chunk text. Powers BM25/keyw
 _Avoid_: text index, full-text index, FTS index
 
 **Semantic index**:
-Qdrant vector store of chunk embeddings. Powers similarity search.
-_Avoid_: vector index, embedding index
+Vector store of chunk embeddings. Powers similarity search. Backed by a local FAISS file
+by default, or by a Qdrant collection when configured.
+_Avoid_: embedding index
+
+**Vector store**:
+The configured backend for the semantic index: `faiss` (default) or `qdrant`.
+_Avoid_: vector database, vector backend (in prose)
+
+**FAISS index**:
+The ID-mapped flat index persisted at `<index directory>/vectors.faiss`. Owns the vectors;
+SQLite owns the chunk metadata and the label mapping.
+_Avoid_: FAISS database, vector file
+
+**Vector label**:
+Monotonic FAISS id mapped to one `(path, chunk_index)` in `vector_labels`. Allocated from
+`meta.vector_label_seq`, never reused after a deletion.
+_Avoid_: FAISS id, vector id
 
 **Index** (the whole):
 The combined lexical index and semantic index for one workspace.
@@ -34,29 +49,33 @@ _Avoid_: database, catalog, store
 
 **Index directory**:
 The gitignored `.simple-ci/` directory in a workspace. Holds `index.db` (plus WAL and lock
-files) and, when the project uses a local config, `config.yaml`.
+files), `vectors.faiss` for the FAISS backend, and, when the project uses a local config,
+`config.yaml`.
 _Avoid_: data directory, cache folder, `.index` (the retired name)
 
 **Config file**:
 Optional `config.yaml` read at server startup: `<workspace>/.simple-ci/config.yaml` first,
-then `~/.simple-ci/config.yaml`. Environment variables override both. Records the embedding
-endpoint/model/dimension, the Qdrant URL, and any Docker services the server should start.
+then `~/.simple-ci/config.yaml`. Environment variables override both. Records the vector
+store backend, the embedding endpoint/model/dimension, either the FAISS path or the Qdrant
+URL, and any Docker services the server should start.
 _Avoid_: settings, preferences, env file
 
 **Managed service**:
-A Docker container named in `config.yaml` (`embedding.service` / `qdrant.service`) that the
-MCP server starts and waits for at boot. Fail-soft: an unavailable service degrades to
-lexical-only search instead of blocking the session.
+A Docker container named in `config.yaml` (`embedding.service`, or `qdrant.service` on the
+Qdrant backend) that the MCP server starts and waits for at boot. Fail-soft: an unavailable
+service degrades to lexical-only search instead of blocking the session.
 _Avoid_: sidecar, dependency, docker service (in prose)
 
 **Setup wizard**:
 The interactive flow started by `python setup.py`: installs `uv`, chooses an embedding
-endpoint (existing or downloaded), provisions Qdrant, probes the vector dimension, registers
-the server with detected harnesses, and writes `config.yaml`.
+endpoint (existing or downloaded), chooses FAISS or Qdrant, probes the vector dimension,
+registers the server with detected harnesses, and writes `config.yaml`.
 _Avoid_: installer, bootstrap, setup script (as a noun for the logic)
 
 **Collection name**:
-The Qdrant collection holding one workspace's vectors: `code_index_{folder_slug}_{sha256(path)[:8]}_{embed_dim}`, derived from the workspace so projects never share vectors. Overridable with `QDRANT_COLLECTION`.
+The Qdrant collection holding one workspace's vectors (Qdrant backend only):
+`code_index_{folder_slug}_{sha256(path)[:8]}_{embed_dim}`, derived from the workspace so
+projects never share vectors. Overridable with `QDRANT_COLLECTION`.
 _Avoid_: namespace, index name, vector store name
 
 **Index on save**:
@@ -72,7 +91,7 @@ One reconciliation sweep at process start covering changes made while the system
 _Avoid_: cold start index, bootstrap scan
 
 **Point ID**:
-Stable Qdrant point identifier derived from the indexed file path and chunk index so upserts are idempotent.
+Stable Qdrant point identifier derived from the indexed file path and chunk index so upserts are idempotent (Qdrant backend only).
 _Avoid_: vector ID, embedding ID
 
 **Harness**:
@@ -108,7 +127,7 @@ _Avoid_: vector hit, embedding match
 ## Process
 
 **Index writer**:
-The single process (or thread) allowed to write the SQLite index and Qdrant points.
+The single process (or thread) allowed to write the SQLite index and the vector store.
 _Avoid_: indexer process, writer, mutator
 
 **MCP server**:

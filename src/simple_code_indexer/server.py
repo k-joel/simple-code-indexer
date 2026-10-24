@@ -7,6 +7,7 @@ rejects them (ADR-0006). Logs go to stderr only; stdout is the MCP channel.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import logging
 import sys
@@ -23,13 +24,13 @@ from simple_code_indexer import (
     db,
     embed,
     indexer,
-    qdrant_store,
     services,
+    vector_store,
     watcher,
     workspace_lock,
 )
 from simple_code_indexer.config import Settings, load_settings
-from simple_code_indexer.errors import EmbedError, QdrantUnavailable
+from simple_code_indexer.errors import EmbedError, VectorStoreUnavailable
 from simple_code_indexer.registry import get_registry, start_prefetch_thread
 
 logger = logging.getLogger("simple_code_indexer")
@@ -89,12 +90,13 @@ def _status_payload(settings: Settings) -> dict[str, Any]:
         "chunks_indexed": counts["chunks"],
         "watcher_alive": watcher.is_alive(),
         "last_sweep": indexer.LAST_SWEEP,
-        "qdrant_ok": qdrant_store.LAST_OK is True,
+        "vector_store": vector_store.backend(settings),
+        "vector_store_ok": vector_store.last_ok(settings),
+        "vector_index": vector_store.describe(settings),
         "embed_ok": embed.LAST_OK is True,
         "plugins_loaded": len(registry),
         "grammars_ready": len(_parsers),
         "workspace": str(settings.workspace_root),
-        "collection": settings.qdrant_collection,
         "index_db": str(settings.index_db_path),
         "config_file": str(settings.config_source) if settings.config_source else None,
         "services": dict(services.LAST_STATE),
@@ -104,8 +106,8 @@ def _status_payload(settings: Settings) -> dict[str, Any]:
 def _semantic_hits(settings: Settings, query: str, limit: int) -> dict[str, Any]:
     try:
         vector = embed.embed_query(settings, query)
-        vector_hits = qdrant_store.search(settings, vector, limit)
-    except (EmbedError, QdrantUnavailable):
+        vector_hits = vector_store.search(settings, vector, limit)
+    except (EmbedError, VectorStoreUnavailable):
         logger.warning("semantic search failed", exc_info=True)
         return {"hits": [], "source": "semantic"}
     hits: list[dict[str, Any]] = []
@@ -219,11 +221,11 @@ def _periodic_sweep(settings: Settings, work_queue: indexer.WorkQueue) -> None:
 
 
 def _probe_services(settings: Settings) -> None:
-    """Warm collection + embed endpoint off the serve path; feeds status flags."""
+    """Warm vector store + embed endpoint off the serve path; feeds status flags."""
     try:
-        qdrant_store.ensure_collection(settings)
+        vector_store.ensure_ready(settings)
     except Exception:
-        logger.exception("qdrant probe failed")
+        logger.exception("vector store probe failed")
     try:
         embed.embed_texts(settings, ["service probe"])
     except Exception:
@@ -247,18 +249,32 @@ async def _run() -> None:
     lock = _acquire_workspace_lock(settings.index_db_path)
     services.ensure_managed_services(settings)
     start_prefetch_thread()
+    backend = vector_store.backend(settings)
     with db.connect(settings.index_db_path) as conn:
         db.ensure_schema(conn)
         with conn:
-            if db.ensure_index_identity(
+            invalidated = db.ensure_index_identity(
                 conn,
-                qdrant_url=settings.qdrant_url,
-                collection=settings.qdrant_collection,
-            ):
-                logger.warning(
-                    "collection changed to %s — index cleared for a full re-index",
-                    settings.qdrant_collection,
-                )
+                backend=backend,
+                identity=vector_store.identity(settings),
+            )
+    if invalidated:
+        logger.warning(
+            "vector store %s changed — index cleared for a full re-index",
+            vector_store.describe(settings),
+        )
+        try:
+            vector_store.reset(settings)
+        except VectorStoreUnavailable:
+            logger.warning("cannot reset the vector index", exc_info=True)
+    try:
+        vector_store.ensure_ready(settings)
+        flagged = vector_store.reconcile(settings)
+        if flagged:
+            logger.info("%d chunk(s) flagged for re-embedding", flagged)
+    except VectorStoreUnavailable:
+        logger.warning("vector store unavailable at startup", exc_info=True)
+    atexit.register(vector_store.flush, settings)
     threading.Thread(
         target=_probe_services, args=(settings,), name="service-probe", daemon=True
     ).start()

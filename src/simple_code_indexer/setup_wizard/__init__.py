@@ -15,6 +15,7 @@ from typing import Any
 
 from simple_code_indexer import configfile
 from simple_code_indexer.config import derive_collection_name
+from simple_code_indexer.errors import ConfigError
 from simple_code_indexer.harnesses import HarnessSpec, load_harnesses
 from simple_code_indexer.setup_wizard import catalog, probe, provision, write
 from simple_code_indexer.setup_wizard.prereqs import docker_install_hint
@@ -73,10 +74,11 @@ class Wizard:
             self._step_gitignore()
             self._step_migrate_index()
             embedding = self._step_embedding()
-            qdrant = self._step_qdrant()
-            config_path = self._write_config(embedding, qdrant)
+            backend = self._step_vector_store()
+            qdrant = self._step_qdrant() if backend == "qdrant" else None
+            config_path = self._write_config(embedding, backend, qdrant)
             self._step_harnesses()
-            self._summary(embedding, qdrant, config_path)
+            self._summary(embedding, backend, qdrant, config_path)
             return 0
         except SetupAborted as exc:
             self.prompts.say(f"\nSetup aborted: {exc}")
@@ -350,6 +352,39 @@ class Wizard:
             result["service"] = service
         return result
 
+    def _existing_vector_store(self) -> str:
+        """Follow the config the server would read, so a re-run keeps its backend."""
+        path = self.config_path or configfile.find_config_file(self.cwd, self.home)
+        if path is None or not path.is_file():
+            return "faiss"
+        try:
+            raw = configfile.load_config(path)
+        except ConfigError:
+            return "faiss"
+        configured = raw.get("vector_store")
+        if isinstance(configured, str) and configured.strip().lower() in {
+            "faiss",
+            "qdrant",
+        }:
+            return configured.strip().lower()
+        qdrant = raw.get("qdrant")
+        if isinstance(qdrant, dict) and qdrant:
+            return "qdrant"
+        return "faiss"
+
+    def _step_vector_store(self) -> str:
+        labels = [
+            "FAISS (recommended) — local file, no Docker",
+            "Qdrant — Docker container or existing server",
+        ]
+        default = 0 if self._existing_vector_store() == "faiss" else 1
+        choice = self._ask_choice(
+            "Which vector store should back semantic search?",
+            labels,
+            default=default,
+        )
+        return "qdrant" if choice == 1 else "faiss"
+
     def _step_qdrant(self) -> dict[str, Any]:
         if self._ask_yes_no("Do you already have Qdrant set up?", default=False):
             if self._ask_yes_no("Is it running in Docker?", default=False):
@@ -433,9 +468,15 @@ class Wizard:
                 return index
         return 0
 
-    def _write_config(self, embedding: dict[str, Any], qdrant: dict[str, Any]) -> Path:
+    def _write_config(
+        self,
+        embedding: dict[str, Any],
+        backend: str,
+        qdrant: dict[str, Any] | None,
+    ) -> Path:
         data: dict[str, Any] = {
             "version": configfile.CONFIG_VERSION,
+            "vector_store": backend,
             "embedding": {
                 "base_url": embedding["base_url"],
                 "model": embedding["model"],
@@ -443,14 +484,16 @@ class Wizard:
                 "api_key": embedding.get("api_key"),
                 "timeout_s": 15.0,
             },
-            "qdrant": {"url": qdrant["url"]},
             "sweep_seconds": 45,
             "debounce_ms": 400,
         }
         if embedding.get("service"):
             data["embedding"]["service"] = embedding["service"]
-        if qdrant.get("service"):
-            data["qdrant"]["service"] = qdrant["service"]
+        if backend == "qdrant":
+            assert qdrant is not None
+            data["qdrant"] = {"url": qdrant["url"]}
+            if qdrant.get("service"):
+                data["qdrant"]["service"] = qdrant["service"]
         target = self.config_path or self._choose_config_path()
         if self.dry_run:
             self.prompts.say(f"Would write {target}")
@@ -553,30 +596,44 @@ class Wizard:
     def _summary(
         self,
         embedding: dict[str, Any],
-        qdrant: dict[str, Any],
+        backend: str,
+        qdrant: dict[str, Any] | None,
         config_path: Path,
     ) -> None:
         dim = int(embedding["dim"])
         self.prompts.say()
         self.prompts.say("Setup complete.")
-        self.prompts.say(f"  config:      {config_path}")
+        self.prompts.say(f"  config:       {config_path}")
         self.prompts.say(
-            f"  index:       {self.cwd / configfile.LOCAL_DIRNAME / 'index.db'}"
+            f"  index:        {self.cwd / configfile.LOCAL_DIRNAME / 'index.db'}"
         )
         self.prompts.say(
-            f"  embedding:   {embedding['base_url']} "
+            f"  embedding:    {embedding['base_url']} "
             f"(model={embedding['model']}, dim={dim})"
         )
-        self.prompts.say(f"  qdrant:      {qdrant['url']}")
-        self.prompts.say(f"  collection:  {derive_collection_name(self.cwd, dim)}")
+        self.prompts.say(f"  vector store: {backend}")
+        if backend == "qdrant":
+            assert qdrant is not None
+            self.prompts.say(f"  qdrant:       {qdrant['url']}")
+            self.prompts.say(f"  collection:   {derive_collection_name(self.cwd, dim)}")
+        else:
+            self.prompts.say(
+                f"  vectors:      "
+                f"{self.cwd / configfile.LOCAL_DIRNAME / 'vectors.faiss'}"
+            )
         for spec, target in self._written_harnesses:
-            self.prompts.say(f"  harness:     {spec.label} -> {target}")
+            self.prompts.say(f"  harness:      {spec.label} -> {target}")
         self.prompts.say()
         self.prompts.say("Restart your harness to pick up the new server.")
-        self.prompts.say(
-            "Changing the embedding model later creates a new collection and "
-            "re-indexes the workspace."
-        )
+        if backend == "qdrant":
+            self.prompts.say(
+                "Changing the embedding model later creates a new collection and "
+                "re-indexes the workspace."
+            )
+        else:
+            self.prompts.say(
+                "Changing the embedding model later re-embeds the workspace."
+            )
 
 
 def run(argv: list[str] | None = None) -> int:

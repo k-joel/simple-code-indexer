@@ -1,15 +1,17 @@
 [project]
 name = "simple-code-indexer"
 version = "0.1.0"
-description = "Minimal code-index MCP server: file-watcher indexing into SQLite/FTS5 + Qdrant"
+description = "Minimal code-index MCP server: file-watcher indexing into SQLite/FTS5 + FAISS (Qdrant optional)"
 readme = "README.md"
 authors = [
     { name = "k-joel", email = "kjoel86@gmail.com" }
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "faiss-cpu>=1.15",
     "httpx>=0.28.1",
     "mcp>=2.3.0",
+    "numpy>=1.25",
     "pyyaml>=6.0",
     "qdrant-client>=1.19.1",
     "tree-sitter>=0.26.0",

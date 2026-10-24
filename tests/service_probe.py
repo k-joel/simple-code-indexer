@@ -3,7 +3,8 @@
 Usage: uv run python tests/service_probe.py
 
 Prints OK + vector dimension for the embedding endpoint, and the collections
-payload status for Qdrant. Debug nothing else until both pass.
+payload status for Qdrant. Qdrant is optional for the default FAISS backend;
+set VECTOR_STORE=qdrant to make it mandatory.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import urllib.request
 EMBED_BASE_URL = os.environ.get("EMBED_BASE_URL", "http://localhost:8080")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "Qwen3-Embedding-4B-Q6_K")
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
+VECTOR_STORE = os.environ.get("VECTOR_STORE", "faiss")
 
 
 def _post(url: str, payload: dict[str, object], timeout: float) -> dict:
@@ -43,8 +45,10 @@ def main() -> int:
             collections = json.load(resp)
         print(f"qdrant OK      status={collections['status']}")
     except (OSError, KeyError, ValueError) as exc:
-        print(f"qdrant FAIL {type(exc).__name__}: {exc}")
-        return 1
+        if VECTOR_STORE == "qdrant":
+            print(f"qdrant FAIL {type(exc).__name__}: {exc}")
+            return 1
+        print(f"qdrant unavailable (optional for vector_store={VECTOR_STORE})")
     print("PROBE OK")
     return 0
 

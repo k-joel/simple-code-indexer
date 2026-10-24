@@ -15,15 +15,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
 
-from simple_code_indexer import db, embed, parse, qdrant_store
+from simple_code_indexer import db, embed, parse, vector_store
 from simple_code_indexer.config import Settings, is_allowed, is_temp_name
-from simple_code_indexer.errors import EmbedError, QdrantUnavailable
+from simple_code_indexer.errors import EmbedError, VectorStoreUnavailable
 from simple_code_indexer.models import Chunk, FileRecord
 
 logger = logging.getLogger(__name__)
 
 # Last successful sweep completion (UTC ISO); read by get_status.
 LAST_SWEEP: str | None = None
+
+# Minimum idle spacing between drain-triggered vector flushes.
+FLUSH_DEBOUNCE_S = 30.0
 
 
 class IndexOutcome(NamedTuple):
@@ -144,26 +147,34 @@ def _embed_and_store(settings: Settings, rel: str, chunks: list[Chunk]) -> bool:
     """
     if not chunks:
         return True
-    points = {
-        c.chunk_index: str(qdrant_store.point_id(rel, c.chunk_index)) for c in chunks
-    }
     status = "ok"
+    vector_ids: dict[int, str] = {}
     try:
         vectors = embed.embed_texts(settings, [c.content for c in chunks])
+        if len(vectors) != len(chunks):
+            raise EmbedError(
+                f"embedding returned {len(vectors)} vectors for {len(chunks)} chunks"
+            )
         try:
-            qdrant_store.upsert_chunks(settings, rel, list(zip(chunks, vectors)))
-        except QdrantUnavailable:
+            ids = vector_store.upsert_chunks(settings, rel, list(zip(chunks, vectors)))
+            if len(ids) != len(chunks):
+                raise VectorStoreUnavailable(
+                    f"vector store returned {len(ids)} ids for {len(chunks)} chunks"
+                )
+            vector_ids = dict(zip((c.chunk_index for c in chunks), ids))
+        except VectorStoreUnavailable:
             status = "error"
-            logger.warning("qdrant upsert failed for %s", rel, exc_info=True)
+            logger.warning("vector upsert failed for %s", rel, exc_info=True)
     except EmbedError:
         status = "error"
         logger.warning("embedding failed for %s", rel, exc_info=True)
     try:
         with db.connect(settings.index_db_path) as conn, conn:
+            wanted = {c.chunk_index for c in chunks}
             rows = [
-                (chunk_id, points[chunk_index], status)
+                (chunk_id, vector_ids.get(chunk_index, ""), status)
                 for chunk_id, chunk_index in db.chunk_ids_for_path(conn, rel)
-                if chunk_index in points
+                if chunk_index in wanted
             ]
             db.record_embedding_state(conn, rows)
     except sqlite3.Error:
@@ -238,6 +249,10 @@ def sweep(settings: Settings) -> SweepStats:
             removed += 1
     for stale in stale_paths:
         _delete_vectors(settings, stale)
+    try:
+        vector_store.flush(settings)
+    except Exception:
+        logger.warning("vector store flush failed", exc_info=True)
 
     LAST_SWEEP = datetime.now(UTC).isoformat(timespec="seconds")
     return SweepStats(
@@ -251,10 +266,10 @@ def sweep(settings: Settings) -> SweepStats:
 
 def _delete_vectors(settings: Settings, rel: str) -> None:
     try:
-        qdrant_store.delete_by_path(settings, rel)
-    except QdrantUnavailable:
-        # Orphan points are harmless: semantic hits are re-checked against SQLite.
-        logger.warning("qdrant delete failed for %s", rel, exc_info=True)
+        vector_store.delete_by_path(settings, rel)
+    except VectorStoreUnavailable:
+        # Orphan vectors are harmless: semantic hits are re-checked against SQLite.
+        logger.warning("vector delete failed for %s", rel, exc_info=True)
 
 
 def remove_file(settings: Settings, path: Path) -> None:
@@ -268,7 +283,12 @@ def remove_file(settings: Settings, path: Path) -> None:
 
 
 def writer_loop(settings: Settings, work_queue: WorkQueue) -> None:
-    """Single index writer: consumes paths, tombstones and sweep requests."""
+    """Single index writer: consumes paths, tombstones and sweep requests.
+
+    When the queue drains, the in-memory FAISS index is persisted, at most once
+    per FLUSH_DEBOUNCE_S. A sweep already flushes at its end.
+    """
+    last_flush = 0.0
     while True:
         item = work_queue.get()
         try:
@@ -282,3 +302,11 @@ def writer_loop(settings: Settings, work_queue: WorkQueue) -> None:
             logger.exception("writer failed on %s", item)
         finally:
             work_queue.task_done()
+        if work_queue.empty():
+            now = time.monotonic()
+            if now - last_flush >= FLUSH_DEBOUNCE_S:
+                try:
+                    vector_store.flush(settings)
+                except Exception:
+                    logger.warning("vector store flush failed", exc_info=True)
+                last_flush = now

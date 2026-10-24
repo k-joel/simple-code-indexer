@@ -5,11 +5,11 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from typing import Any, NamedTuple
+from typing import Any
 
 from simple_code_indexer.config import Settings
 from simple_code_indexer.errors import QdrantUnavailable
-from simple_code_indexer.models import Chunk
+from simple_code_indexer.models import Chunk, VectorHit
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +25,6 @@ _ensure_lock = threading.Lock()
 
 def point_id(path: str, chunk_index: int) -> uuid.UUID:
     return uuid.uuid5(POINT_NAMESPACE, f"{path}:{chunk_index}")
-
-
-class VectorHit(NamedTuple):
-    path: str
-    chunk_index: int
-    score: float
 
 
 def _client(settings: Settings):
@@ -111,13 +105,13 @@ def ensure_collection(settings: Settings) -> None:
 
 def upsert_chunks(
     settings: Settings, path: str, items: list[tuple[Chunk, list[float]]]
-) -> None:
+) -> list[str]:
     """Idempotent upsert of chunk vectors (stable IDs replace on re-index)."""
     global LAST_OK
     from qdrant_client.models import PointStruct
 
     if not items:
-        return
+        return []
     try:
         ensure_collection(settings)
         points = [
@@ -135,6 +129,7 @@ def upsert_chunks(
     except Exception as exc:
         LAST_OK = False
         raise QdrantUnavailable(f"upsert failed for {path}: {exc}") from exc
+    return [str(point.id) for point in points]
 
 
 def delete_by_path(settings: Settings, path: str) -> None:

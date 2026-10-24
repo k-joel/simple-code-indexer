@@ -2,11 +2,15 @@ import hashlib
 import re
 from pathlib import Path
 
+import pytest
+
 from simple_code_indexer.config import (
     derive_collection_name,
+    faiss_index_path,
     load_settings,
     normalize_workspace_path,
 )
+from simple_code_indexer.errors import ConfigError
 
 # Qdrant rejects anything outside this charset (plan §2).
 COLLECTION_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
@@ -20,12 +24,17 @@ def test_defaults_come_from_the_process_cwd(monkeypatch) -> None:
         "QDRANT_URL",
         "EMBED_BASE_URL",
         "EMBED_DIM",
+        "VECTOR_STORE",
+        "FAISS_PATH",
     ):
         monkeypatch.delenv(name, raising=False)
     cwd = Path.cwd().resolve()
     settings = load_settings()
     assert settings.workspace_root == cwd
     assert settings.index_db_path == cwd / ".simple-ci" / "index.db"
+    assert settings.vector_store == "faiss"
+    assert settings.faiss_path is None
+    assert faiss_index_path(settings) == cwd / ".simple-ci" / "vectors.faiss"
     assert settings.qdrant_url == "http://localhost:6333"
     assert settings.embed_base_url == "http://localhost:8080"
     assert settings.embed_dim == 2560
@@ -121,3 +130,84 @@ def test_derived_names_are_qdrant_compliant(tmp_path: Path) -> None:
         name = derive_collection_name(directory, 2560)
         assert COLLECTION_RE.fullmatch(name), name
         assert len(name) <= 255
+
+
+def _config(tmp_path: Path, monkeypatch, text: str) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(text, encoding="utf-8")
+    monkeypatch.setenv("SIMPLE_CI_CONFIG", str(path))
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+
+
+def test_a_legacy_qdrant_section_selects_qdrant(tmp_path: Path, monkeypatch) -> None:
+    _config(
+        tmp_path,
+        monkeypatch,
+        "embedding:\n  dim: 8\nqdrant:\n  url: http://localhost:6333\n",
+    )
+    settings = load_settings()
+    assert settings.vector_store == "qdrant"
+    assert settings.qdrant_url == "http://localhost:6333"
+
+
+def test_an_empty_qdrant_section_is_not_legacy(tmp_path: Path, monkeypatch) -> None:
+    _config(tmp_path, monkeypatch, "qdrant:\n  {}\n")
+    assert load_settings().vector_store == "faiss"
+
+
+def test_explicit_faiss_beats_the_legacy_qdrant_section(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _config(
+        tmp_path,
+        monkeypatch,
+        "vector_store: faiss\nqdrant:\n  url: http://localhost:6333\n",
+    )
+    assert load_settings().vector_store == "faiss"
+
+
+def test_vector_store_env_overrides_the_file(tmp_path: Path, monkeypatch) -> None:
+    _config(tmp_path, monkeypatch, "vector_store: faiss\n")
+    monkeypatch.setenv("VECTOR_STORE", "qdrant")
+    assert load_settings().vector_store == "qdrant"
+
+
+def test_invalid_vector_store_values_raise(tmp_path: Path, monkeypatch) -> None:
+    _config(tmp_path, monkeypatch, "vector_store: pinecone\n")
+    with pytest.raises(ConfigError):
+        load_settings()
+
+    _config(tmp_path, monkeypatch, "vector_store: faiss\n")
+    monkeypatch.setenv("VECTOR_STORE", "chroma")
+    with pytest.raises(ConfigError):
+        load_settings()
+
+
+def test_vector_store_env_ignores_a_malformed_file_value(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _config(tmp_path, monkeypatch, "vector_store: [1, 2]\n")
+    monkeypatch.setenv("VECTOR_STORE", "faiss")
+    assert load_settings().vector_store == "faiss"
+
+
+def test_faiss_path_from_config_is_relative_to_the_workspace(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _config(tmp_path, monkeypatch, "faiss:\n  path: cache/vectors.faiss\n")
+    settings = load_settings()
+    assert settings.faiss_path == (tmp_path / "cache" / "vectors.faiss").resolve()
+    assert faiss_index_path(settings) == settings.faiss_path
+
+
+def test_faiss_path_env_overrides_the_file(tmp_path: Path, monkeypatch) -> None:
+    _config(tmp_path, monkeypatch, "faiss:\n  path: cache/vectors.faiss\n")
+    other = tmp_path / "elsewhere" / "index.faiss"
+    monkeypatch.setenv("FAISS_PATH", str(other))
+    assert load_settings().faiss_path == other.resolve()
+
+
+def test_absolute_faiss_path_is_kept(tmp_path: Path, monkeypatch) -> None:
+    other = (tmp_path / "elsewhere" / "index.faiss").resolve()
+    _config(tmp_path, monkeypatch, f"faiss:\n  path: {other}\n")
+    assert load_settings().faiss_path == other

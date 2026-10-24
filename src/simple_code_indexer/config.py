@@ -52,6 +52,16 @@ class Settings:
     embedding_service: ManagedService | None = None
     qdrant_service: ManagedService | None = None
     config_source: Path | None = None
+    vector_store: str = "faiss"
+    faiss_path: Path | None = None
+
+
+VECTOR_STORES: frozenset[str] = frozenset({"faiss", "qdrant"})
+
+
+def faiss_index_path(settings: Settings) -> Path:
+    """The FAISS file: explicit `faiss.path`, else next to the lexical index."""
+    return settings.faiss_path or settings.index_db_path.parent / "vectors.faiss"
 
 
 def is_allowed(settings: Settings, path: Path) -> bool:
@@ -144,6 +154,31 @@ def _managed_service(section: dict[str, Any], where: str) -> ManagedService | No
     )
 
 
+def _vector_store(
+    qdrant: dict[str, Any], file_value: str | None, env_value: str | None
+) -> str:
+    """VECTOR_STORE > `vector_store` > legacy `qdrant:` section > faiss."""
+    for name, value in (("VECTOR_STORE", env_value), ("vector_store", file_value)):
+        if value is None:
+            continue
+        normalized = value.strip().lower()
+        if normalized not in VECTOR_STORES:
+            raise ConfigError(
+                f"{name} must be one of {sorted(VECTOR_STORES)}, got {value!r}"
+            )
+        return normalized
+    return "qdrant" if qdrant else "faiss"
+
+
+def _faiss_path(raw_path: str | None, workspace_root: Path) -> Path | None:
+    if raw_path is None:
+        return None
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = workspace_root / candidate
+    return candidate.resolve()
+
+
 def load_settings() -> Settings:
     from simple_code_indexer import configfile
     from simple_code_indexer.registry import get_registry
@@ -154,6 +189,19 @@ def load_settings() -> Settings:
     raw = configfile.load_config(config_path) if config_path is not None else {}
     embedding = configfile.get_mapping(raw, "embedding")
     qdrant = configfile.get_mapping(raw, "qdrant")
+    faiss = configfile.get_mapping(raw, "faiss")
+    env_vector_store = os.environ.get("VECTOR_STORE")
+    file_vector_store = (
+        None
+        if env_vector_store is not None
+        else configfile.get_str(raw, "vector_store", where="config")
+    )
+    vector_store = _vector_store(qdrant, file_vector_store, env_vector_store)
+    faiss_path = _faiss_path(
+        os.environ.get("FAISS_PATH")
+        or configfile.get_str(faiss, "path", where="faiss"),
+        workspace_root,
+    )
 
     embed_dim = _pick_int(
         "EMBED_DIM", configfile.get_int(embedding, "dim", where="embedding"), 2560
@@ -209,4 +257,6 @@ def load_settings() -> Settings:
         embedding_service=_managed_service(embedding, "embedding"),
         qdrant_service=_managed_service(qdrant, "qdrant"),
         config_source=config_path,
+        vector_store=vector_store,
+        faiss_path=faiss_path,
     )

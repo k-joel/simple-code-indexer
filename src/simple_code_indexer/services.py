@@ -40,10 +40,12 @@ _sleep = time.sleep
 
 def ensure_managed_services(settings: Settings) -> None:
     """Ensure configured containers are up and answering, then record the state."""
-    services = (
-        ("embedding", settings.embedding_service),
-        ("qdrant", settings.qdrant_service),
-    )
+    services = [("embedding", settings.embedding_service)]
+    if settings.vector_store == "qdrant":
+        services.append(("qdrant", settings.qdrant_service))
+    else:
+        # FAISS needs no server; an old qdrant.service block must not start Docker.
+        LAST_STATE["qdrant"] = "not_managed"
     for kind, service in services:
         if service is None:
             LAST_STATE[kind] = "not_managed"
