@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from simple_code_indexer import model_prompts
+
 
 @dataclass(frozen=True, slots=True)
 class EmbeddingModel:
@@ -15,20 +17,28 @@ class EmbeddingModel:
     dim: int
     pooling: str
     approx_gb: float
+    ctx_size: int = 8192
+    query_prefix: str | None = None
+    document_prefix: str | None = None
 
 
 # The live probe always overrides `dim`; these values are the offline fallback.
+# `mmproj-*.gguf` is the vision/audio projector for EmbeddingGemma 2 and is
+# deliberately not part of the download: the text backbone embeds code on its own.
 CATALOG: tuple[EmbeddingModel, ...] = (
     EmbeddingModel(
         key="embeddinggemma2",
-        label="EmbeddingGemma 2 (271M text, 768-dim) — recommended",
-        url="https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main/"
-        "embeddinggemma-2-Q8_0.gguf",
-        filename="embeddinggemma-2-Q8_0.gguf",
+        label="EmbeddingGemma 2 (text, 768-dim) — recommended",
+        url="https://huggingface.co/unsloth/embeddinggemma-2-GGUF/resolve/main/"
+        "embeddinggemma-2-BF16.gguf",
+        filename="embeddinggemma-2-BF16.gguf",
         api_model="embeddinggemma-2",
         dim=768,
         pooling="mean",
-        approx_gb=0.4,
+        approx_gb=0.6,
+        ctx_size=8192,
+        query_prefix=model_prompts.GEMMA_CODE_QUERY,
+        document_prefix=model_prompts.GEMMA_CODE_DOCUMENT,
     ),
     EmbeddingModel(
         key="qwen3-embedding-0.6b",
@@ -40,6 +50,8 @@ CATALOG: tuple[EmbeddingModel, ...] = (
         dim=1024,
         pooling="last",
         approx_gb=0.7,
+        ctx_size=32768,
+        query_prefix=model_prompts.QWEN_CODE_QUERY,
     ),
     EmbeddingModel(
         key="nomic-embed-code",

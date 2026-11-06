@@ -275,7 +275,8 @@ src/simple_code_indexer/
   models.py            # FileRecord, Symbol, Chunk, SearchHit (dataclasses)
   db.py                # schema ensure, connection helpers, FTS queries
   parse.py             # tree-sitter symbol extraction + chunking
-  embed.py             # OpenAI-compatible embeddings client
+  embed.py             # OpenAI-compatible embeddings client (query/document prompts)
+  model_prompts.py     # documented code-retrieval prefixes for supported models
   qdrant_store.py      # ensure_collection, upsert, delete_by_path, search
   indexer.py           # index_one_file, sweep, startup reconcile
   watcher.py           # Observer + debounce queue → indexer
@@ -284,6 +285,8 @@ src/simple_code_indexer/
   builtin/             # language plugins
   harnesses/           # MCP-client plugins used by the setup wizard
   setup_wizard/        # interactive setup (prompts, probes, provisioning, writes)
+    gpu.py             # vendor detection → llama.cpp image tag
+    templates/         # docker-compose.yml + gpu_init.sh shipped in the wheel
 ```
 
 ### 7.2 `config.py`
@@ -315,14 +318,29 @@ class Settings:
     embedding_service: ManagedService | None = None
     qdrant_service: ManagedService | None = None
     config_source: Path | None = None
+    vector_store: str = "faiss"
+    faiss_path: Path | None = None
+    embed_query_prefix: str | None = None       # e.g. "task: code retrieval | query: {query}"
+    embed_document_prefix: str | None = None    # e.g. "title: {title} | text: {content}"
+    embed_fingerprint: str = ""                 # sha256(document_prefix)[:8], or ""
+    config_sources: tuple[Path, ...] = ()       # every layered file, lowest precedence first
 ```
 
 Load order: `SIMPLE_CI_CONFIG` (an explicit path; `none`/`off` disables discovery) →
-`<workspace>/.simple-ci/config.yaml` → `~/.simple-ci/config.yaml` → built-in defaults.
-Individual environment variables override whatever the file provided. **Never** hardcode
-secrets in code; `EMBED_API_KEY` / `embedding.api_key` is optional and sent as a bearer
-token. If a feature is unused, omit it from config entirely (no empty blocks that enable
-fallbacks).
+`~/.simple-ci/config.yaml` (global) → `<workspace>/.simple-ci/config.yaml` (local). Both
+files are deep-merged, with the local file winning individual keys; `find_config_file()`
+still returns the most specific path for compatibility. Each setting's own environment
+variable overrides the merged file value.
+
+Prompt resolution is env (`EMBED_QUERY_PREFIX`, `EMBED_DOCUMENT_PREFIX`) > explicit file
+value (empty disables) > `model_prompts.defaults_for_model(embed_model)`. Templates are
+validated at load time (`{query}` / `{title}` / `{content}`); bad placeholders raise
+`ConfigError`. `embed_fingerprint` hashes only the document prefix, because only that
+changes stored chunk vectors; it is appended to the FAISS identity and the derived Qdrant
+collection name.
+**Never** hardcode secrets in code; `EMBED_API_KEY` / `embedding.api_key` is optional and
+sent as a bearer token. If a feature is unused, omit it from config entirely (no empty
+blocks that enable fallbacks).
 
 Env names (minimum set):
 
@@ -336,8 +354,12 @@ Env names (minimum set):
 | `EMBED_BASE_URL` | `http://localhost:8080` |
 | `EMBED_MODEL` | `Qwen3-Embedding-4B-Q6_K` |
 | `EMBED_DIM` | `2560` |
+| `EMBED_QUERY_PREFIX` | model default (`task: code retrieval \| query: {query}` for EmbeddingGemma 2, `Instruct: …\nQuery: {query}` for Qwen3) |
+| `EMBED_DOCUMENT_PREFIX` | model default (`title: {title} \| text: {content}` for EmbeddingGemma 2; none for Qwen3) |
 | `EMBED_API_KEY` | unset |
 | `EMBED_TIMEOUT_S` | `15` |
+| `VECTOR_STORE` | `faiss` (`faiss` or `qdrant`) |
+| `FAISS_PATH` | `$WORKSPACE_ROOT/.simple-ci/vectors.faiss` |
 | `SWEEP_SECONDS` | `45` |
 | `DEBOUNCE_MS` | `400` |
 
@@ -364,10 +386,11 @@ v1 allowlist minimum: `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`, `.py`, `.ts`, `.js`. 
 
 ### 7.5 `embed.py`
 
-- `embed_texts(texts: Sequence[str]) -> list[list[float]]` — one POST `{base}/v1/embeddings` with `{"model": …, "input": texts}`.
+- `embed_texts(texts: Sequence[str]) -> list[list[float]]` — one POST `{base}/v1/embeddings` with `{"model": …, "input": texts}`. Raw: no prompt, used by service probes.
+- `embed_documents(texts, title=…)` — applies `embed_document_prefix` (EmbeddingGemma 2's `title: {title} | text: {content}`, `title: none` when absent) then calls `embed_texts`.
+- `embed_query(text)` — applies `embed_query_prefix` (EmbeddingGemma's `task: code retrieval | query: …`, Qwen3's `Instruct: …\nQuery: …`) then calls `embed_texts`.
 - Explicit `timeout=15`, **retries=0..2**, no default OpenAI client behavior toward the public internet.
-- Measure dim on first response; assert equals `Settings.embed_dim` (2560).
-- `embed_query(text) -> list[float]` = `embed_texts([text])[0]`.
+- Measure dim on first response; assert equals `Settings.embed_dim`.
 - Fail soft on index path: log, mark `embedding_state.status='error'`, continue lexical indexing.
 - Retry on the next sweep: `indexer.reembed_pending` re-embeds chunks whose
   `embedding_state.status != 'ok'` (or that lack a row), independent of the hash/mtime
@@ -384,6 +407,8 @@ v1 allowlist minimum: `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`, `.py`, `.ts`, `.js`. 
 ### 7.7 `indexer.py`
 
 - `index_one_file(path: Path) -> IndexOutcome` — the unit of work (hash short-circuit).
+  Chunks are embedded with `embed.embed_documents(..., title=relative_path)`, so the
+  document prompt and file title stay consistent between indexing and sweep retries.
 - `sweep() -> SweepStats` — retry pending embeddings, then mtime+size then hash candidates.
 - `startup_reconcile()`.
 - Bounded `queue.Queue` consumer; items are paths or tombstones.
@@ -508,7 +533,7 @@ Ambiguous: `found: true` with `matches[]` sorted by path.
 - The process inherits the harness cwd as its workspace (`WORKSPACE_ROOT` overrides); it writes `$WORKSPACE_ROOT/.simple-ci/index.db` and exits with the session.
 - Before serving, `services.ensure_managed_services` starts any containers named in
   `embedding.service` / `qdrant.service` and waits for their endpoints (fail-soft).
-- No image for the server itself: `Dockerfile` and `docker-compose.yml` were removed with the Docker topology ([ADR-0008](./adr/0008-host-spawned-cwd-per-repo-collections.md)); the wizard may generate a compose file under `~/.simple-ci/` for the backing services.
+- No image for the server itself: `Dockerfile` and `docker-compose.yml` were removed with the Docker topology ([ADR-0008](./adr/0008-host-spawned-cwd-per-repo-collections.md)); the wizard renders `~/.simple-ci/docker/docker-compose.yml` from the packaged template for the backing services, choosing the llama.cpp image for the detected GPU ([ADR-0011](./adr/0011-gpu-compose-global-config-model-prompts.md)).
 
 ### 9.2 Backing services
 

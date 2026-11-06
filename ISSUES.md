@@ -12,3 +12,14 @@ repo — by humans or by LLM sessions.
 - Keep entries short: symptom, where it was flagged, cause (`file:line`),
   suggested fix. Add new issues with the next free `ISS-n` id.
 
+## Open
+
+### ISS-1 — `test_watcher_indexes_file_on_save` flakes on "no such table: symbols"
+- **Symptom:** the full suite occasionally fails with
+  `sqlite3.OperationalError: no such table: symbols`; the test passes in isolation.
+- **Where flagged:** 2026-11-06, full `pytest` run while implementing the GPU compose work.
+- **Cause:** `tests/test_watcher.py:119` (`_symbol_in_index`) opens a read-only
+  connection before the writer thread has created the schema.
+- **Fix:** create the schema in the test fixture/`_settings` setup, or catch
+  `sqlite3.OperationalError` in the polling predicate and retry.
+

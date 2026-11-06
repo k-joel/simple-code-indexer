@@ -11,24 +11,94 @@ import time
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
+from string import Template
 from typing import Any
 
 import yaml
 
+from simple_code_indexer.setup_wizard import gpu
 from simple_code_indexer.setup_wizard.catalog import EmbeddingModel
 
 logger = logging.getLogger(__name__)
 
 HOME_DIRNAME = ".simple-ci"
+GLOBAL_DOCKER_DIRNAME = "docker"
+GLOBAL_MODEL_DIRNAME = "model"
 COMPOSE_FILENAME = "docker-compose.yml"
+COMPOSE_TEMPLATE = "docker-compose.yml"
+GPU_SCRIPT_FILENAME = "gpu_init.sh"
 EMBED_CONTAINER = "simple-ci-embed"
 QDRANT_CONTAINER = "simple-ci-qdrant"
 
 _DOCKER_TIMEOUT_S = 15.0
-_COMPOSE_TIMEOUT_S = 300.0
+_COMPOSE_TIMEOUT_S = 900.0
+_GPU_SCRIPT_TIMEOUT_S = 900.0
 _CHUNK_BYTES = 4 * 1024 * 1024
 _REPORT_BYTES = 64 * 1024 * 1024
+
+_GPU_LAYERS_LINE = "      - LLAMA_ARG_N_GPU_LAYERS=auto\n"
+_GPU_BLOCKS: dict[str, str] = {
+    "nvidia": (
+        "    deploy:\n"
+        "      resources:\n"
+        "        reservations:\n"
+        "          devices:\n"
+        "            - driver: nvidia\n"
+        "              count: all\n"
+        "              capabilities: [gpu]\n"
+    ),
+    "amd": (
+        "    devices:\n"
+        "      - /dev/kfd\n"
+        "      - /dev/dri\n"
+        "    group_add:\n"
+        "      - video\n"
+        "      - render\n"
+        "    security_opt:\n"
+        "      - seccomp:unconfined\n"
+    ),
+    "intel": (
+        "    devices:\n"
+        "      - /dev/dri\n"
+        "    group_add:\n"
+        "      - video\n"
+        "      - render\n"
+    ),
+    "cpu": "",
+}
+
+
+def global_dir(home: Path) -> Path:
+    return home / HOME_DIRNAME
+
+
+def compose_path(home: Path) -> Path:
+    return global_dir(home) / GLOBAL_DOCKER_DIRNAME / COMPOSE_FILENAME
+
+
+def model_dir(home: Path) -> Path:
+    return global_dir(home) / GLOBAL_MODEL_DIRNAME
+
+
+def template_text(name: str) -> str:
+    resource = resources.files("simple_code_indexer.setup_wizard").joinpath(
+        "templates", name
+    )
+    return resource.read_text(encoding="utf-8")
+
+
+def install_gpu_script(home: Path) -> Path:
+    """Copy the packaged NVIDIA container-toolkit script next to the compose file."""
+    target = compose_path(home).parent / GPU_SCRIPT_FILENAME
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        template_text(GPU_SCRIPT_FILENAME), encoding="utf-8", newline="\n"
+    )
+    if os.name == "posix":
+        target.chmod(0o755)
+    return target
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,7 +121,7 @@ class Container:
 
 
 class Runner:
-    """subprocess wrapper; tests inject a fake with the same two methods."""
+    """subprocess wrapper; tests inject a fake with the same methods."""
 
     def which(self, name: str) -> str | None:
         return shutil.which(name)
@@ -72,6 +142,16 @@ class Runner:
         return CommandResult(
             completed.returncode, completed.stdout or "", completed.stderr or ""
         )
+
+    def run_console(
+        self, argv: list[str], *, timeout: float = _GPU_SCRIPT_TIMEOUT_S
+    ) -> int:
+        """Run with inherited stdio so sudo/WSL prompts stay interactive."""
+        try:
+            return subprocess.run(argv, timeout=timeout, check=False).returncode
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("console command %s could not run: %s", argv, exc)
+            return 127
 
 
 def docker_available(runner: Runner) -> bool:
@@ -170,29 +250,48 @@ def write_compose(path: Path, services: dict[str, Any]) -> None:
     )
 
 
-def embed_service(model: EmbeddingModel, port: int, filename: str) -> dict[str, Any]:
-    return {
-        "image": "ghcr.io/ggml-org/llama.cpp:server",
-        "container_name": EMBED_CONTAINER,
-        "ports": [f"127.0.0.1:{port}:8080"],
-        "volumes": ["./models:/models:ro"],
-        "command": [
-            "-m",
-            f"/models/{filename}",
-            "--embedding",
-            "--pooling",
-            model.pooling,
-            "-b",
-            "2048",
-            "-ub",
-            "2048",
-            "--host",
-            "0.0.0.0",
-            "--port",
-            "8080",
-        ],
-        "restart": "unless-stopped",
-    }
+def render_embed_services(
+    model: EmbeddingModel,
+    port: int,
+    filename: str,
+    *,
+    image: str,
+    gpu_vendor: str,
+) -> dict[str, Any]:
+    """Render the packaged compose template for one embedding model."""
+    rendered = Template(template_text(COMPOSE_TEMPLATE)).substitute(
+        IMAGE=image,
+        CONTAINER=EMBED_CONTAINER,
+        MODEL_FILE=filename,
+        API_MODEL=model.api_model,
+        CTX_SIZE=str(model.ctx_size),
+        POOLING=model.pooling,
+        PORT=str(port),
+        GPU_LAYERS=_GPU_LAYERS_LINE if gpu_vendor != "cpu" else "",
+        GPU_BLOCK=_GPU_BLOCKS.get(gpu_vendor, ""),
+    )
+    document = yaml.safe_load(rendered)
+    if not isinstance(document, dict) or not isinstance(document.get("services"), dict):
+        raise TypeError("docker-compose template did not render a services mapping")
+    return document["services"]
+
+
+def embed_service(
+    model: EmbeddingModel,
+    port: int,
+    filename: str,
+    *,
+    image: str | None = None,
+    gpu_vendor: str = "cpu",
+) -> dict[str, Any]:
+    services = render_embed_services(
+        model,
+        port,
+        filename,
+        image=image or gpu.CPU_IMAGE,
+        gpu_vendor=gpu_vendor,
+    )
+    return services["embed"]
 
 
 def qdrant_service(port: int) -> dict[str, Any]:
@@ -200,7 +299,7 @@ def qdrant_service(port: int) -> dict[str, Any]:
         "image": "qdrant/qdrant:latest",
         "container_name": QDRANT_CONTAINER,
         "ports": [f"127.0.0.1:{port}:6333"],
-        "volumes": ["./qdrant_storage:/qdrant/storage"],
+        "volumes": ["../qdrant_storage:/qdrant/storage"],
         "restart": "unless-stopped",
     }
 

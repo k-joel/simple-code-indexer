@@ -1,5 +1,6 @@
 import urllib.error
 import urllib.request
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -54,6 +55,65 @@ def test_unreachable_endpoint_raises_and_marks_not_ok() -> None:
 
 def test_empty_input_returns_empty() -> None:
     assert embed.embed_texts(_settings("http://localhost:1"), []) == []
+
+
+def _capture(monkeypatch) -> dict[str, list[str]]:
+    captured: dict[str, list[str]] = {}
+
+    def fake_post(settings: Settings, texts: list[str]) -> list[list[float]]:
+        captured["texts"] = texts
+        return [[0.0] * settings.embed_dim for _ in texts]
+
+    monkeypatch.setattr(embed, "_post_embeddings", fake_post)
+    return captured
+
+
+def test_embed_query_applies_the_query_prefix(monkeypatch) -> None:
+    captured = _capture(monkeypatch)
+    settings = replace(
+        _settings("http://unused"),
+        embed_query_prefix="task: code retrieval | query: {query}",
+    )
+
+    embed.embed_query(settings, "parse a file")
+
+    assert captured["texts"] == ["task: code retrieval | query: parse a file"]
+
+
+def test_embed_documents_applies_the_document_prefix(monkeypatch) -> None:
+    captured = _capture(monkeypatch)
+    settings = replace(
+        _settings("http://unused"),
+        embed_document_prefix="title: {title} | text: {content}",
+    )
+
+    vectors = embed.embed_documents(settings, ["alpha", "beta"], title="src/a.py")
+
+    assert len(vectors) == 2
+    assert captured["texts"] == [
+        "title: src/a.py | text: alpha",
+        "title: src/a.py | text: beta",
+    ]
+
+
+def test_embed_documents_uses_none_without_a_title(monkeypatch) -> None:
+    captured = _capture(monkeypatch)
+    settings = replace(
+        _settings("http://unused"),
+        embed_document_prefix="title: {title} | text: {content}",
+    )
+
+    embed.embed_documents(settings, ["alpha"])
+
+    assert captured["texts"] == ["title: none | text: alpha"]
+
+
+def test_no_prompt_leaves_texts_unchanged(monkeypatch) -> None:
+    captured = _capture(monkeypatch)
+
+    embed.embed_documents(_settings("http://unused"), ["alpha"], title="src/a.py")
+
+    assert captured["texts"] == ["alpha"]
 
 
 def test_split_for_limit_prefers_lines_and_covers_text() -> None:

@@ -9,8 +9,12 @@ The harness spawns the server **on the host, inside the project you have open**:
 
 - **Workspace** = the process working directory (`Path.cwd().resolve()`), overridable with `WORKSPACE_ROOT`.
 - **Index** = `$WORKSPACE_ROOT/.simple-ci/index.db` — gitignore `.simple-ci/` in every indexed project.
-- **Config** = `<workspace>/.simple-ci/config.yaml` (local) or `~/.simple-ci/config.yaml`
-  (global); environment variables override both. See [ADR-0009](docs/adr/0009-setup-wizard-managed-services-config.md).
+- **Config** = `~/.simple-ci/config.yaml` (global: embedding endpoint/model/prompts/service)
+  and `<workspace>/.simple-ci/config.yaml` (local: vector store and project tuning). Both are
+  loaded and deep-merged with the local file winning key by key; environment variables override
+  both. `SIMPLE_CI_CONFIG` replaces discovery with one explicit file. See
+  [ADR-0009](docs/adr/0009-setup-wizard-managed-services-config.md) and
+  [ADR-0011](docs/adr/0011-gpu-compose-global-config-model-prompts.md).
 - **Vector store** = FAISS by default, persisted at `$WORKSPACE_ROOT/.simple-ci/vectors.faiss`
   (override with `faiss.path` or `FAISS_PATH`). Vectors are L2-normalised, so scores are
   cosine similarity. Qdrant stays available with `vector_store: qdrant`; its per-workspace
@@ -20,6 +24,11 @@ The harness spawns the server **on the host, inside the project you have open**:
   Qdrant backend is selected. They can be long-lived host services, or Docker containers the
   server starts on demand when `config.yaml` names them. See
   [ADR-0008](docs/adr/0008-host-spawned-cwd-per-repo-collections.md).
+- **Models and containers** = downloaded into `~/.simple-ci/model/` and described by
+  `~/.simple-ci/docker/docker-compose.yml`, generated from a packaged template. The wizard
+  picks the llama.cpp image for the detected GPU (NVIDIA `server-cuda`, AMD `server-rocm`,
+  Intel `server-intel`, otherwise `server`). See
+  [ADR-0011](docs/adr/0011-gpu-compose-global-config-model-prompts.md).
 
 ## How to use
 
@@ -29,6 +38,10 @@ The harness spawns the server **on the host, inside the project you have open**:
 - **Docker Desktop** only if you want the wizard to download an embedding model or run
   Qdrant for you. The default FAISS backend needs no Docker at all, and existing services
   elsewhere work too.
+- **GPU (optional)** — the wizard detects NVIDIA/AMD/Intel and uses the matching llama.cpp
+  image. On NVIDIA, Docker must expose the container toolkit; the wizard copies
+  `~/.simple-ci/docker/gpu_init.sh` and offers to run it when the runtime is missing, and
+  falls back to the CPU image if that fails. `--gpu cpu` forces CPU.
 - `uv` is installed by `setup.py` when missing.
 
 ### Quick start
@@ -42,35 +55,63 @@ python setup.py
 `setup.py` installs `uv` if needed, runs `uv sync`, and launches the interactive wizard.
 Run `python setup.py --dry-run` first to see every action without writing files or starting
 containers, or `python setup.py --yes` to accept the recommended answer everywhere.
+For a reproducible install, pick the model and GPU path explicitly:
+
+```bash
+python setup.py --yes --model embeddinggemma2 --gpu auto
+python setup.py --yes --model qwen3-embedding-0.6b   # switch model; re-embeds on next start
+```
 
 ### What the wizard asks
 
 | Step | Choices |
 |---|---|
+| Existing setup | If `~/.simple-ci/` already has config + compose + a GGUF, offer to reuse it and skip the download |
 | Embedding server | Use an existing OpenAI-compatible endpoint (type the URL, optional API key, model name), pick an existing Docker container (started for you), or auto-download a model |
-| Auto-download model | EmbeddingGemma 2 (recommended, 768-dim), Qwen3-Embedding-0.6B (1024-dim), Nomic Embed Code (3584-dim), or cancel |
+| Auto-download model | EmbeddingGemma 2 BF16 (recommended, 768-dim), Qwen3-Embedding-0.6B Q8_0 (1024-dim), Nomic Embed Code (3584-dim), or cancel. `--model KEY` picks one without asking |
+| GPU | Detected automatically (`nvidia`, `amd`, `intel`, `cpu`); `--gpu` overrides. NVIDIA without the Docker runtime prompts to run `gpu_init.sh` |
 | Embedding dimension | Always probed from a real `/v1/embeddings` call; catalog values are only an offline fallback |
 | Vector store | **FAISS** (recommended — a local file, no Docker) or **Qdrant** (existing server or Docker container) |
 | Qdrant | Only when Qdrant is selected: use an existing URL/container, provision `qdrant/qdrant` with Docker, or abort |
 | Harnesses | Detected from your home folder; choose any subset and global vs project-local scope |
-| Config location | Global `~/.simple-ci/config.yaml` or local `<project>/.simple-ci/config.yaml` |
 
-The wizard also appends `.simple-ci/` to the project `.gitignore` and offers to migrate a
-legacy `.index/` directory.
+By default the wizard writes **both** config files: the global one gets the embedding
+endpoint, model, prompts, and managed-service blocks; the local one gets the project's
+vector store and tuning. `--scope global|local` writes only one file, and `--config PATH`
+writes a single combined file. The wizard also appends `.simple-ci/` to the project
+`.gitignore` and offers to migrate a legacy `.index/` directory.
+
+### Model prompt instructions
+
+The wizard records each model's documented code-retrieval prompts, and the server applies
+them automatically when the model name matches (`embedding.query_prefix` and
+`embedding.document_prefix` in `config.yaml` override them):
+
+| Model | Query | Document (chunk) |
+|---|---|---|
+| EmbeddingGemma 2 | `task: code retrieval \| query: …` | `title: <relative path> \| text: …` |
+| Qwen3-Embedding | `Instruct: Given a code search query, …\nQuery: …` | none |
+
+`embed_texts` (service probes) stays raw. The document prefix is part of the vector-store
+identity, so changing it re-embeds the workspace; changing only the query prefix does not.
 
 ### Where files land
 
 | Path | Contents |
 |---|---|
-| `~/.simple-ci/config.yaml` | Global config (used when the project has no local config) |
-| `<project>/.simple-ci/config.yaml` | Per-project config; wins over the global file |
+| `~/.simple-ci/config.yaml` | Global config: embedding endpoint/model/prompts/service, Qdrant |
+| `~/.simple-ci/docker/docker-compose.yml` | Generated services (`embed`, and `qdrant` only for the Qdrant backend) |
+| `~/.simple-ci/docker/gpu_init.sh` | NVIDIA container-toolkit bootstrap copied by the wizard |
+| `~/.simple-ci/model/` | Downloaded GGUF files (`embeddinggemma-2-BF16.gguf`, `Qwen3-Embedding-0.6B-Q8_0.gguf`, …) |
+| `~/.simple-ci/qdrant_storage/` | Qdrant data when that backend is selected |
+| `<project>/.simple-ci/config.yaml` | Per-project overrides: vector store, sweep/debounce |
 | `<project>/.simple-ci/index.db` | SQLite index (+ WAL files and the single-writer lock) |
 | `<project>/.simple-ci/vectors.faiss` | FAISS vectors (default backend; override with `faiss.path`) |
-| `~/.simple-ci/docker-compose.yml` | Services the wizard generated (`embed`, and `qdrant` only for the Qdrant backend) |
-| `~/.simple-ci/models/` | Downloaded GGUF files |
 
 Local config lives inside the gitignored `.simple-ci/` directory because it may hold an
-API key. Config precedence is **environment variable > local YAML > global YAML > default**.
+API key. Config precedence is **environment variable > local YAML > global YAML > default**;
+the two YAML files are deep-merged, so a local file only needs its overrides. The compose
+model mount is the relative `../model:/models:ro`, so `~/.simple-ci/` stays portable.
 
 ### Supported harnesses
 
@@ -108,9 +149,11 @@ embedding:
   dim: 768                 # must match the endpoint; the wizard probes it
   api_key: null
   timeout_s: 15
+  query_prefix: "task: code retrieval | query: {query}"
+  document_prefix: "title: {title} | text: {content}"
   service:                 # optional: server starts this container at boot
     container: simple-ci-embed
-    compose_file: /home/you/.simple-ci/docker-compose.yml
+    compose_file: /home/you/.simple-ci/docker/docker-compose.yml
     compose_service: embed
     startup_timeout_s: 60
 faiss:
@@ -128,6 +171,8 @@ embedding:
   base_url: http://localhost:8080
   model: embeddinggemma-2
   dim: 768
+  query_prefix: "task: code retrieval | query: {query}"
+  document_prefix: "title: {title} | text: {content}"
 qdrant:
   url: http://localhost:6333
   collection: code_index_my-app_1a2b3c4d_768   # optional; derived when absent
@@ -140,9 +185,11 @@ sweep_seconds: 45
 debounce_ms: 400
 ```
 
-A relative `faiss.path` resolves against the workspace. A config with **no**
-`vector_store` key but a non-empty `qdrant:` section is treated as Qdrant, so existing
-installations keep their backend until they explicitly switch.
+These blocks work in either config file; the wizard puts `embedding` (+ `service`/`qdrant`)
+in the global file and `vector_store`/tuning in the local one. A relative `faiss.path`
+resolves against the workspace. A config with **no** `vector_store` key but a non-empty
+`qdrant:` section is treated as Qdrant, so existing installations keep their backend until
+they explicitly switch.
 
 When a `service` block is present the server verifies the container is running (starting it
 if needed) and waits for the endpoint before serving. It never refuses to start: if Docker
@@ -158,8 +205,10 @@ uv run python tests/mcp_probe.py
 ```
 
 `get_status` reports the resolved `workspace`, `vector_store`, `vector_store_ok`,
-`vector_index` (the FAISS file path or the Qdrant collection), `config_file`, and
-`services` (`running`, `started`, `unavailable`, or `not_managed`).
+`vector_index` (the FAISS file path or the Qdrant collection), `config_file` (the most
+specific file), `config_files` (every layered file), and `services` (`running`, `started`,
+`unavailable`, or `not_managed`). `tests/service_probe.py` now resolves the same settings,
+so it probes the configured endpoint and model automatically.
 
 ### Troubleshooting
 
@@ -167,6 +216,9 @@ uv run python tests/mcp_probe.py
 |---|---|
 | Wizard says Docker is unavailable | Start Docker Desktop, or choose the URL/container-less branches |
 | Port already in use | The wizard picks the next free port (8080→8081, 6333→6334) and writes it to config |
+| GPU container exits immediately | `--gpu cpu`, or run `~/.simple-ci/docker/gpu_init.sh` in the WSL2/Linux distro that runs dockerd, then re-run setup. On Windows: `wsl --update` first |
+| Container image is `server` despite an NVIDIA card | Docker does not expose the NVIDIA runtime; run the generated `gpu_init.sh` (or `--gpu nvidia` after fixing it) |
+| Wizard offers to skip the model download | It found `~/.simple-ci/config.yaml` + `docker/docker-compose.yml` + a GGUF; answer `n` or pass `--model KEY` to reconfigure |
 | `get_status.services` shows `unavailable` | `docker ps -a`, inspect the container logs, then re-run `python setup.py` |
 | Changed the embedding model | The dimension changes, so the vector-store identity changes and the index re-embeds |
 | Config changes ignored | The server reads config at startup — restart the harness session |
@@ -286,6 +338,11 @@ by hand when convenient. The old `.index/` directory is migrated by the wizard a
 ignored for backwards compatibility. Switching a workspace from Qdrant to FAISS (or back)
 also leaves the previous store's vectors orphaned; the Qdrant collection can be deleted by
 hand, and the FAISS file is replaced on the next identity reset.
+
+The pre-ADR-0011 global layout (`~/.simple-ci/docker-compose.yml`, `~/.simple-ci/models/`)
+is replaced by `~/.simple-ci/docker/docker-compose.yml` and `~/.simple-ci/model/`. The
+wizard offers to rename the model directory and re-renders the compose file on the next
+run; an old compose file is simply ignored.
 
 ## Harness plugins
 

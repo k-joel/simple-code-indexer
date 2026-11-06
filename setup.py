@@ -25,13 +25,16 @@ MIN_PYTHON = (3, 9)
 
 USAGE = """\
 Usage: python setup.py [--dry-run] [--yes] [--scope global|local]
-                       [--config PATH] [--model-url URL]
+                       [--config PATH] [--model KEY] [--model-url URL]
+                       [--gpu auto|nvidia|amd|intel|cpu]
 
   --dry-run     show every action without writing files or starting containers
   --yes         accept the recommended default for every prompt
-  --scope       where the wizard should save config.yaml
-  --config      explicit config.yaml path
-  --model-url   override the download URL of the recommended model
+  --scope       write only the global or only the local config.yaml
+  --config      write one combined config.yaml at this path
+  --model       download this embedding model without asking
+  --model-url   override the chosen model's download URL
+  --gpu         override GPU detection for the container image
 """
 
 

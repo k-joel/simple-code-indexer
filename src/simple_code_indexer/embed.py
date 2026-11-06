@@ -1,6 +1,10 @@
 """OpenAI-compatible embeddings client (local llama.cpp or a hosted endpoint).
 
 An optional bearer token is sent when `embedding.api_key` / `EMBED_API_KEY` is set.
+Queries and documents get the configured model prompts (`embedding.query_prefix`
+and `embedding.document_prefix`), so EmbeddingGemma 2 sees its
+``task: code retrieval``/``title: ... | text: ...`` prefixes and Qwen3 sees its
+query-side ``Instruct: ...`` line. `embed_texts` stays raw for service probes.
 
 
 Environment fact: this llama.cpp instance has physical batch size 512, so any
@@ -119,6 +123,28 @@ def _post_embeddings(settings: Settings, texts: list[str]) -> list[list[float]]:
     raise EmbedError(f"embedding failed after {_ATTEMPTS} attempts: {url}") from error
 
 
+def embed_documents(
+    settings: Settings, texts: list[str], *, title: str | None = None
+) -> list[list[float]]:
+    """Embed indexed chunks, applying the model's document prompt when set.
+
+    `title` is used by EmbeddingGemma 2's ``title: {title} | text: {content}``
+    format; pass the file's relative path. Callers that already formatted the
+    text can use `embed_texts` instead.
+    """
+    prefix = settings.embed_document_prefix
+    if not prefix:
+        return embed_texts(settings, texts)
+    title_value = title or "none"
+    return embed_texts(
+        settings,
+        [prefix.format(title=title_value, content=text) for text in texts],
+    )
+
+
 def embed_query(settings: Settings, text: str) -> list[float]:
-    """Embed a search query with the same endpoint used for chunks."""
+    """Embed a search query with the model's code-retrieval instruction."""
+    prefix = settings.embed_query_prefix
+    if prefix:
+        text = prefix.format(query=text)
     return embed_texts(settings, [text])[0]

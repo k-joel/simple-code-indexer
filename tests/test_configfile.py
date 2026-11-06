@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from simple_code_indexer import configfile
+from simple_code_indexer import configfile, model_prompts
 from simple_code_indexer.config import load_settings
 from simple_code_indexer.errors import ConfigError
 
@@ -34,6 +34,149 @@ def test_global_config_is_the_fallback(tmp_path: Path, monkeypatch) -> None:
     global_config.write_text("embedding:\n  dim: 768\n", encoding="utf-8")
 
     assert configfile.find_config_file(workspace, home=home) == global_config
+
+
+def test_config_paths_orders_global_before_local(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("SIMPLE_CI_CONFIG", raising=False)
+    workspace = tmp_path / "workspace"
+    home = tmp_path / "home"
+    local = workspace / ".simple-ci" / "config.yaml"
+    global_config = home / ".simple-ci" / "config.yaml"
+    local.parent.mkdir(parents=True)
+    global_config.parent.mkdir(parents=True)
+    local.write_text("vector_store: faiss\n", encoding="utf-8")
+    global_config.write_text("embedding:\n  dim: 768\n", encoding="utf-8")
+
+    assert configfile.config_paths(workspace, home=home) == (global_config, local)
+
+
+def test_layered_config_deep_merges_and_local_wins(tmp_path: Path) -> None:
+    global_path = tmp_path / "global.yaml"
+    local_path = tmp_path / "local.yaml"
+    configfile.write_config(
+        {
+            "embedding": {
+                "base_url": "http://global:8080",
+                "model": "embeddinggemma-2",
+                "dim": 768,
+                "service": {"container": "simple-ci-embed"},
+            },
+            "vector_store": "qdrant",
+            "sweep_seconds": 10,
+        },
+        global_path,
+    )
+    configfile.write_config(
+        {"embedding": {"dim": 1024}, "vector_store": "faiss"}, local_path
+    )
+
+    merged = configfile.load_layered_config((global_path, local_path))
+
+    assert merged["embedding"]["base_url"] == "http://global:8080"
+    assert merged["embedding"]["model"] == "embeddinggemma-2"
+    assert merged["embedding"]["dim"] == 1024
+    assert merged["embedding"]["service"] == {"container": "simple-ci-embed"}
+    assert merged["vector_store"] == "faiss"
+    assert merged["sweep_seconds"] == 10
+
+
+def test_local_null_clears_a_global_value(tmp_path: Path) -> None:
+    global_path = tmp_path / "global.yaml"
+    local_path = tmp_path / "local.yaml"
+    configfile.write_config({"embedding": {"api_key": "secret"}}, global_path)
+    configfile.write_config({"embedding": {"api_key": None}}, local_path)
+
+    merged = configfile.load_layered_config((global_path, local_path))
+
+    assert merged["embedding"]["api_key"] is None
+
+
+def test_model_defaults_supply_code_prompts(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "config.yaml"
+    configfile.write_config(
+        {"embedding": {"model": "embeddinggemma-2", "dim": 768}}, path
+    )
+    monkeypatch.setenv("SIMPLE_CI_CONFIG", str(path))
+    for name in (
+        "EMBED_MODEL",
+        "EMBED_DIM",
+        "EMBED_QUERY_PREFIX",
+        "EMBED_DOCUMENT_PREFIX",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = load_settings()
+
+    assert settings.embed_query_prefix == model_prompts.GEMMA_CODE_QUERY
+    assert settings.embed_document_prefix == model_prompts.GEMMA_CODE_DOCUMENT
+    assert settings.embed_fingerprint
+
+
+def test_qwen_gets_a_query_only_instruction(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "config.yaml"
+    configfile.write_config(
+        {"embedding": {"model": "Qwen3-Embedding-0.6B", "dim": 1024}}, path
+    )
+    monkeypatch.setenv("SIMPLE_CI_CONFIG", str(path))
+    for name in (
+        "EMBED_MODEL",
+        "EMBED_DIM",
+        "EMBED_QUERY_PREFIX",
+        "EMBED_DOCUMENT_PREFIX",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = load_settings()
+
+    assert settings.embed_query_prefix == model_prompts.QWEN_CODE_QUERY
+    assert settings.embed_document_prefix is None
+    assert settings.embed_fingerprint == ""
+
+
+def test_explicit_empty_prompt_disables_defaults(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "config.yaml"
+    configfile.write_config(
+        {
+            "embedding": {
+                "model": "embeddinggemma-2",
+                "query_prefix": "",
+                "document_prefix": "",
+            }
+        },
+        path,
+    )
+    monkeypatch.setenv("SIMPLE_CI_CONFIG", str(path))
+    for name in (
+        "EMBED_MODEL",
+        "EMBED_QUERY_PREFIX",
+        "EMBED_DOCUMENT_PREFIX",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = load_settings()
+
+    assert settings.embed_query_prefix is None
+    assert settings.embed_document_prefix is None
+    assert settings.embed_fingerprint == ""
+
+
+def test_bad_prompt_placeholders_raise(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "config.yaml"
+    configfile.write_config(
+        {
+            "embedding": {
+                "model": "embeddinggemma-2",
+                "document_prefix": "title: {filename}",
+            }
+        },
+        path,
+    )
+    monkeypatch.setenv("SIMPLE_CI_CONFIG", str(path))
+    for name in ("EMBED_DOCUMENT_PREFIX",):
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(ConfigError, match="document_prefix"):
+        load_settings()
 
 
 def test_missing_config_returns_none(tmp_path: Path, monkeypatch) -> None:

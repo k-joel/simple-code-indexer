@@ -2,21 +2,17 @@
 
 Usage: uv run python tests/service_probe.py
 
-Prints OK + vector dimension for the embedding endpoint, and the collections
-payload status for Qdrant. Qdrant is optional for the default FAISS backend;
-set VECTOR_STORE=qdrant to make it mandatory.
+Uses the workspace's resolved config (environment variables still win), so it
+probes exactly what the MCP server would use. Qdrant is optional for the default
+FAISS backend; `vector_store: qdrant` makes it mandatory.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import urllib.request
 
-EMBED_BASE_URL = os.environ.get("EMBED_BASE_URL", "http://localhost:8080")
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "Qwen3-Embedding-4B-Q6_K")
-QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
-VECTOR_STORE = os.environ.get("VECTOR_STORE", "faiss")
+from simple_code_indexer.config import load_settings
 
 
 def _post(url: str, payload: dict[str, object], timeout: float) -> dict:
@@ -30,25 +26,34 @@ def _post(url: str, payload: dict[str, object], timeout: float) -> dict:
 
 
 def main() -> int:
+    settings = load_settings()
     try:
         body = _post(
-            f"{EMBED_BASE_URL}/v1/embeddings",
-            {"model": EMBED_MODEL, "input": "probe"},
+            f"{settings.embed_base_url.rstrip('/')}/v1/embeddings",
+            {"model": settings.embed_model, "input": "probe"},
             timeout=20,
         )
-        print(f"embeddings OK  dim={len(body['data'][0]['embedding'])}")
+        dim = len(body["data"][0]["embedding"])
+        print(f"embeddings OK  dim={dim}  model={settings.embed_model}")
+        if dim != settings.embed_dim:
+            print(
+                f"embeddings WARN  configured dim={settings.embed_dim}, "
+                f"endpoint returned {dim}"
+            )
     except (OSError, KeyError, IndexError, ValueError) as exc:
         print(f"embeddings FAIL {type(exc).__name__}: {exc}")
         return 1
     try:
-        with urllib.request.urlopen(f"{QDRANT_URL}/collections", timeout=5) as resp:
+        with urllib.request.urlopen(
+            f"{settings.qdrant_url.rstrip('/')}/collections", timeout=5
+        ) as resp:
             collections = json.load(resp)
         print(f"qdrant OK      status={collections['status']}")
     except (OSError, KeyError, ValueError) as exc:
-        if VECTOR_STORE == "qdrant":
+        if settings.vector_store == "qdrant":
             print(f"qdrant FAIL {type(exc).__name__}: {exc}")
             return 1
-        print(f"qdrant unavailable (optional for vector_store={VECTOR_STORE})")
+        print(f"qdrant unavailable (optional for vector_store={settings.vector_store})")
     print("PROBE OK")
     return 0
 

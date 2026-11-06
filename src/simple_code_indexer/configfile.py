@@ -3,12 +3,17 @@
 Precedence (highest first): `SIMPLE_CI_CONFIG` env var, `<workspace>/.simple-ci/
 config.yaml`, `~/.simple-ci/config.yaml`, built-in defaults. Individual settings
 are still overridable by their own environment variables in `config.py`.
+
+Both files participate: `load_layered_config` deep-merges the global file first
+and lets the local file override individual keys. `SIMPLE_CI_CONFIG` replaces
+discovery entirely with one explicit file.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -25,24 +30,51 @@ CONFIG_VERSION = 1
 _DISABLED_VALUES = {"none", "off"}
 
 
-def find_config_file(workspace_root: Path, home: Path | None = None) -> Path | None:
-    """Resolve the config file for a workspace; `SIMPLE_CI_CONFIG` wins."""
+def config_paths(workspace_root: Path, home: Path | None = None) -> tuple[Path, ...]:
+    """Config files to layer, lowest precedence first (global, then local)."""
     explicit = os.environ.get("SIMPLE_CI_CONFIG")
     if explicit is not None:
         if explicit.strip().lower() in _DISABLED_VALUES:
-            return None
+            return ()
         path = Path(explicit).expanduser()
         if path.is_file():
-            return path
+            return (path,)
         logger.warning("SIMPLE_CI_CONFIG points at a missing file: %s", path)
-        return None
-    local = workspace_root / LOCAL_DIRNAME / CONFIG_FILENAME
-    if local.is_file():
-        return local
+        return ()
+    paths: list[Path] = []
     global_config = (home or Path.home()) / LOCAL_DIRNAME / CONFIG_FILENAME
     if global_config.is_file():
-        return global_config
-    return None
+        paths.append(global_config)
+    local = workspace_root / LOCAL_DIRNAME / CONFIG_FILENAME
+    if local.is_file():
+        paths.append(local)
+    return tuple(paths)
+
+
+def find_config_file(workspace_root: Path, home: Path | None = None) -> Path | None:
+    """The highest-precedence config file; `SIMPLE_CI_CONFIG` wins."""
+    paths = config_paths(workspace_root, home)
+    return paths[-1] if paths else None
+
+
+def load_layered_config(paths: Iterable[Path]) -> dict[str, Any]:
+    """Deep-merge config files in order: later mappings override earlier keys."""
+    merged: dict[str, Any] = {}
+    for path in paths:
+        merged = _deep_merge(merged, load_config(path))
+    return merged
+
+
+def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Mappings merge recursively; scalars, lists and explicit nulls replace."""
+    merged = dict(base)
+    for key, value in overlay.items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(current, value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def load_config(path: Path) -> dict[str, Any]:

@@ -150,7 +150,9 @@ def _embed_and_store(settings: Settings, rel: str, chunks: list[Chunk]) -> bool:
     status = "ok"
     vector_ids: dict[int, str] = {}
     try:
-        vectors = embed.embed_texts(settings, [c.content for c in chunks])
+        vectors = embed.embed_documents(
+            settings, [c.content for c in chunks], title=rel
+        )
         if len(vectors) != len(chunks):
             raise EmbedError(
                 f"embedding returned {len(vectors)} vectors for {len(chunks)} chunks"

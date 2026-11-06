@@ -67,6 +67,7 @@ def main() -> None:
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
+        errors="replace",
     )
     assert proc.stdin is not None and proc.stdout is not None
 
@@ -203,11 +204,12 @@ def main() -> None:
         print("PROBE OK")
     finally:
         proc.kill()
-        proc.wait()
-        if proc.stderr is not None:
-            stderr_text = proc.stderr.read()
-            if stderr_text:
-                print(stderr_text, file=sys.stderr)
+        try:
+            _, stderr_text = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            stderr_text = ""
+        if stderr_text:
+            print(stderr_text, file=sys.stderr)
 
 
 if __name__ == "__main__":

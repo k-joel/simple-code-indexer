@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from simple_code_indexer import model_prompts
 from simple_code_indexer.errors import ConfigError
 
 IGNORE_DIRS: frozenset[str] = frozenset(
@@ -54,6 +55,10 @@ class Settings:
     config_source: Path | None = None
     vector_store: str = "faiss"
     faiss_path: Path | None = None
+    embed_query_prefix: str | None = None
+    embed_document_prefix: str | None = None
+    embed_fingerprint: str = ""
+    config_sources: tuple[Path, ...] = ()
 
 
 VECTOR_STORES: frozenset[str] = frozenset({"faiss", "qdrant"})
@@ -81,13 +86,57 @@ def normalize_workspace_path(workspace_root: Path) -> str:
     return str(workspace_root.resolve()).lower().replace("\\", "/")
 
 
-def derive_collection_name(workspace_root: Path, embed_dim: int) -> str:
-    """Per-workspace Qdrant collection: readable slug + path hash + vector dim."""
+def derive_collection_name(
+    workspace_root: Path, embed_dim: int, fingerprint: str = ""
+) -> str:
+    """Per-workspace Qdrant collection: readable slug + path hash + vector dim.
+
+    `fingerprint` pins a document-prompt variant; it is omitted when chunks are
+    embedded raw so existing collection names stay stable.
+    """
     digest = hashlib.sha256(
         normalize_workspace_path(workspace_root).encode("utf-8")
     ).hexdigest()[:8]
     slug = re.sub(r"[^a-z0-9]+", "-", workspace_root.resolve().name.lower())
-    return f"code_index_{slug.strip('-')[:32] or 'root'}_{digest}_{embed_dim}"
+    suffix = f"_{fingerprint}" if fingerprint else ""
+    return f"code_index_{slug.strip('-')[:32] or 'root'}_{digest}_{embed_dim}{suffix}"
+
+
+def embedding_fingerprint(document_prefix: str | None) -> str:
+    """Short hash of the document prefix; empty when chunks are embedded raw."""
+    if not document_prefix:
+        return ""
+    return hashlib.sha256(document_prefix.encode("utf-8")).hexdigest()[:8]
+
+
+def _prompt(
+    section: dict[str, Any],
+    key: str,
+    env_name: str,
+    default: str | None,
+    placeholders: tuple[str, ...],
+) -> str | None:
+    """Env > explicit file value > model default; empty disables the prompt."""
+    env_value = os.environ.get(env_name)
+    if env_value is not None:
+        value: str | None = env_value
+    elif key in section:
+        raw = section[key]
+        if raw is not None and not isinstance(raw, str):
+            raise ConfigError(f"'embedding.{key}' must be a string")
+        value = raw
+    else:
+        value = default
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        value.format(**{name: "" for name in placeholders})
+    except (KeyError, IndexError, ValueError) as exc:
+        raise ConfigError(f"'embedding.{key}' has invalid placeholders: {exc}") from exc
+    return value
 
 
 def workspace_root_from_env() -> Path:
@@ -185,8 +234,8 @@ def load_settings() -> Settings:
 
     registry = get_registry()
     workspace_root = workspace_root_from_env()
-    config_path = configfile.find_config_file(workspace_root)
-    raw = configfile.load_config(config_path) if config_path is not None else {}
+    config_paths = configfile.config_paths(workspace_root)
+    raw = configfile.load_layered_config(config_paths) if config_paths else {}
     embedding = configfile.get_mapping(raw, "embedding")
     qdrant = configfile.get_mapping(raw, "qdrant")
     faiss = configfile.get_mapping(raw, "faiss")
@@ -206,6 +255,23 @@ def load_settings() -> Settings:
     embed_dim = _pick_int(
         "EMBED_DIM", configfile.get_int(embedding, "dim", where="embedding"), 2560
     )
+    embed_model = _pick_str(
+        "EMBED_MODEL",
+        configfile.get_str(embedding, "model", where="embedding"),
+        "Qwen3-Embedding-4B-Q6_K",
+    )
+    default_query, default_document = model_prompts.defaults_for_model(embed_model)
+    query_prefix = _prompt(
+        embedding, "query_prefix", "EMBED_QUERY_PREFIX", default_query, ("query",)
+    )
+    document_prefix = _prompt(
+        embedding,
+        "document_prefix",
+        "EMBED_DOCUMENT_PREFIX",
+        default_document,
+        ("title", "content"),
+    )
+    fingerprint = embedding_fingerprint(document_prefix)
     index_db = Path(
         os.environ.get(
             "INDEX_DB",
@@ -225,17 +291,13 @@ def load_settings() -> Settings:
         ),
         qdrant_collection=os.environ.get("QDRANT_COLLECTION")
         or configfile.get_str(qdrant, "collection", where="qdrant")
-        or derive_collection_name(workspace_root, embed_dim),
+        or derive_collection_name(workspace_root, embed_dim, fingerprint),
         embed_base_url=_pick_str(
             "EMBED_BASE_URL",
             configfile.get_str(embedding, "base_url", where="embedding"),
             "http://localhost:8080",
         ),
-        embed_model=_pick_str(
-            "EMBED_MODEL",
-            configfile.get_str(embedding, "model", where="embedding"),
-            "Qwen3-Embedding-4B-Q6_K",
-        ),
+        embed_model=embed_model,
         embed_dim=embed_dim,
         embed_timeout_s=_pick_float(
             "EMBED_TIMEOUT_S",
@@ -256,7 +318,11 @@ def load_settings() -> Settings:
         embed_api_key=api_key or None,
         embedding_service=_managed_service(embedding, "embedding"),
         qdrant_service=_managed_service(qdrant, "qdrant"),
-        config_source=config_path,
+        config_source=config_paths[-1] if config_paths else None,
         vector_store=vector_store,
         faiss_path=faiss_path,
+        embed_query_prefix=query_prefix,
+        embed_document_prefix=document_prefix,
+        embed_fingerprint=fingerprint,
+        config_sources=config_paths,
     )

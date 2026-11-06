@@ -99,6 +99,7 @@ def _status_payload(settings: Settings) -> dict[str, Any]:
         "workspace": str(settings.workspace_root),
         "index_db": str(settings.index_db_path),
         "config_file": str(settings.config_source) if settings.config_source else None,
+        "config_files": [str(path) for path in settings.config_sources],
         "services": dict(services.LAST_STATE),
     }
 

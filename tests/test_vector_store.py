@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -62,6 +63,22 @@ def test_faiss_backend_describes_the_file(tmp_path: Path) -> None:
     assert vector_store.describe(settings) == str(path)
     assert vector_store.identity(settings) == (str(path), str(DIM))
     assert faiss_index_path(settings) == path
+
+
+def test_a_document_prompt_changes_the_faiss_identity(tmp_path: Path) -> None:
+    settings = replace(_settings(tmp_path), embed_fingerprint="abcd1234")
+    path = tmp_path / ".simple-ci" / "vectors.faiss"
+
+    assert vector_store.identity(settings) == (str(path), f"{DIM}:abcd1234")
+
+
+def test_a_query_prompt_leaves_the_faiss_identity_alone(tmp_path: Path) -> None:
+    settings = replace(
+        _settings(tmp_path), embed_query_prefix="Instruct: search\nQuery: {query}"
+    )
+    path = tmp_path / ".simple-ci" / "vectors.faiss"
+
+    assert vector_store.identity(settings) == (str(path), str(DIM))
 
 
 def test_qdrant_backend_describes_the_collection(tmp_path: Path) -> None:
