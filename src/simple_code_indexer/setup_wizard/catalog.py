@@ -65,3 +65,17 @@ CATALOG: tuple[EmbeddingModel, ...] = (
         approx_gb=4.5,
     ),
 )
+
+
+def for_key(key: str) -> EmbeddingModel | None:
+    for model in CATALOG:
+        if model.key == key:
+            return model
+    return None
+
+
+def for_filename(filename: str) -> EmbeddingModel | None:
+    for model in CATALOG:
+        if model.filename == filename:
+            return model
+    return None

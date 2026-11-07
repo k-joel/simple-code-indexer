@@ -21,20 +21,33 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-MIN_PYTHON = (3, 9)
+MIN_PYTHON = (3, 12)
 
 USAGE = """\
-Usage: python setup.py [--dry-run] [--yes] [--scope global|local]
-                       [--config PATH] [--model KEY] [--model-url URL]
+Usage: python setup.py [--dry-run] [--yes] [--model KEY] [--model-url URL]
+                       [--vector-store faiss|qdrant] [--container NAME]
+                       [--embedding-url URL] [--embedding-model NAME]
+                       [--config-mode use|reconfigure]
+                       [--harnesses all|none|name,name]
+                       [--install-dir PATH] [--no-install] [--config PATH]
                        [--gpu auto|nvidia|amd|intel|cpu]
 
-  --dry-run     show every action without writing files or starting containers
-  --yes         accept the recommended default for every prompt
-  --scope       write only the global or only the local config.yaml
-  --config      write one combined config.yaml at this path
-  --model       download this embedding model without asking
-  --model-url   override the chosen model's download URL
-  --gpu         override GPU detection for the container image
+  --dry-run        show every action without writing files or starting containers
+  --yes            accept the recommended default for every prompt
+  --model          download this embedding model without asking
+  --model-url      override the chosen model's download URL
+  --vector-store   force the semantic backend
+  --container      use this existing Docker container for embeddings
+  --embedding-url  use an existing embedding server URL
+  --embedding-model override the served embedding model name
+  --config-mode    answer the existing-global-config prompt
+  --harnesses      'all', 'none', or a comma-separated list
+  --install-dir    override the per-user install directory
+  --no-install     point harness entries at this checkout
+  --config         write one explicit config file (advanced/testing)
+  --gpu            override GPU detection for the container image
+
+Configuration is always global: ~/.simple-ci/config.yaml.
 """
 
 

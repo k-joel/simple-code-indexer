@@ -7,7 +7,7 @@ from simple_code_indexer.config import load_settings
 from simple_code_indexer.errors import ConfigError
 
 
-def test_local_config_wins_over_global(tmp_path: Path, monkeypatch) -> None:
+def test_local_config_is_ignored(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("SIMPLE_CI_CONFIG", raising=False)
     workspace = tmp_path / "workspace"
     home = tmp_path / "home"
@@ -15,16 +15,15 @@ def test_local_config_wins_over_global(tmp_path: Path, monkeypatch) -> None:
     (home / ".simple-ci").mkdir(parents=True)
     local = workspace / ".simple-ci" / "config.yaml"
     local.write_text("embedding:\n  dim: 1024\n", encoding="utf-8")
-    (home / ".simple-ci" / "config.yaml").write_text(
-        "embedding:\n  dim: 768\n", encoding="utf-8"
-    )
+    global_config = home / ".simple-ci" / "config.yaml"
+    global_config.write_text("embedding:\n  dim: 768\n", encoding="utf-8")
 
     found = configfile.find_config_file(workspace, home=home)
 
-    assert found == local
+    assert found == global_config
 
 
-def test_global_config_is_the_fallback(tmp_path: Path, monkeypatch) -> None:
+def test_global_config_is_the_only_source(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("SIMPLE_CI_CONFIG", raising=False)
     workspace = tmp_path / "workspace"
     home = tmp_path / "home"
@@ -34,20 +33,18 @@ def test_global_config_is_the_fallback(tmp_path: Path, monkeypatch) -> None:
     global_config.write_text("embedding:\n  dim: 768\n", encoding="utf-8")
 
     assert configfile.find_config_file(workspace, home=home) == global_config
+    assert configfile.config_paths(workspace, home=home) == (global_config,)
 
 
-def test_config_paths_orders_global_before_local(tmp_path: Path, monkeypatch) -> None:
+def test_config_paths_never_returns_a_local_file(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("SIMPLE_CI_CONFIG", raising=False)
     workspace = tmp_path / "workspace"
     home = tmp_path / "home"
     local = workspace / ".simple-ci" / "config.yaml"
-    global_config = home / ".simple-ci" / "config.yaml"
     local.parent.mkdir(parents=True)
-    global_config.parent.mkdir(parents=True)
-    local.write_text("vector_store: faiss\n", encoding="utf-8")
-    global_config.write_text("embedding:\n  dim: 768\n", encoding="utf-8")
+    local.write_text("vector_store: qdrant\n", encoding="utf-8")
 
-    assert configfile.config_paths(workspace, home=home) == (global_config, local)
+    assert configfile.config_paths(workspace, home=home) == ()
 
 
 def test_layered_config_deep_merges_and_local_wins(tmp_path: Path) -> None:

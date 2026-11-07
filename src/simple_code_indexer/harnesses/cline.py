@@ -1,20 +1,24 @@
-"""Builtin Cline harness plugin (VS Code globalStorage, global config only)."""
+"""Builtin Cline harness plugin (Cline keeps its settings under `~/.cline`)."""
+
+from __future__ import annotations
+
+from typing import Any
 
 NAME = "cline"
 LABEL = "Cline"
-HOME_DIRS = [
-    "%APPDATA%/Code/User/globalStorage/saoudrizwan.claude-dev",
-    "~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev",
-    "~/.config/Code/User/globalStorage/saoudrizwan.claude-dev",
-]
-BINARIES = ["code"]
-GLOBAL_CONFIGS = [
-    "%APPDATA%/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
-    "~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
-    "~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
-    "%APPDATA%/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
-    "~/Library/Application Support/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
-    "~/.config/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
-]
+HOME_DIRS = [".cline"]
+BINARIES = ["cline", "code"]
+GLOBAL_CONFIGS = ["~/.cline/data/settings/cline_mcp_settings.json"]
 LOCAL_CONFIGS: list[str] = []
 ROOT_KEY = "mcpServers"
+
+
+def entry(command: list[str], env: dict[str, str]) -> dict[str, Any]:
+    value: dict[str, Any] = {"command": command[0]}
+    if len(command) > 1:
+        value["args"] = command[1:]
+    if env:
+        value["env"] = env
+    value["disabled"] = False
+    value["autoApprove"] = []
+    return value

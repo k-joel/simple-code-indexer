@@ -115,6 +115,19 @@ def test_json_upsert_preserves_unrelated_content() -> None:
     )
 
 
+def test_json_upsert_supports_a_dotted_root_key() -> None:
+    updated = _json.upsert(
+        '{"mcp": {"servers": {"other": {"type": "local"}}}}',
+        root_key="mcp.servers",
+        name=NAME,
+        entry={"type": "local"},
+    )
+
+    document = json.loads(updated)
+    assert document["mcp"]["servers"]["other"] == {"type": "local"}
+    assert document["mcp"]["servers"][NAME] == {"type": "local"}
+
+
 def test_jsonc_comments_and_trailing_commas_are_tolerated() -> None:
     existing = '{\n  // a comment\n  "mcp": {},\n  /* block */\n}\n'
     updated = _json.upsert(existing, root_key="mcp", name=NAME, entry={"enabled": True})
@@ -140,6 +153,7 @@ def test_toml_block_is_idempotent_and_valid() -> None:
     assert parsed["mcp_servers"][NAME]["command"] == "uvx"
     assert parsed["mcp_servers"][NAME]["args"] == ["--from", "/repo", NAME]
     assert parsed["mcp_servers"][NAME]["env"] == {"A": "b"}
+    assert parsed["mcp_servers"][NAME]["startup_timeout_sec"] == 120
 
 
 def test_vscode_entry_shape() -> None:
@@ -157,11 +171,47 @@ def test_opencode_entry_shape() -> None:
     spec = _spec("opencode")
     rendered = spec.render("", name=NAME, command=COMMAND, env={"K": "V"})
 
-    entry = json.loads(rendered)["mcp"][NAME]
+    entry = json.loads(rendered)["mcp"]["servers"][NAME]
     assert entry["type"] == "local"
     assert entry["command"] == COMMAND
     assert entry["environment"] == {"K": "V"}
-    assert entry["enabled"] is True
+    assert "enabled" not in entry
+
+
+def test_cline_uses_the_dot_cline_settings_file() -> None:
+    spec = _spec("cline")
+    rendered = spec.render("", name=NAME, command=COMMAND, env={})
+
+    assert spec.global_configs == ("~/.cline/data/settings/cline_mcp_settings.json",)
+    entry = json.loads(rendered)["mcpServers"][NAME]
+    assert entry["command"] == "uvx"
+    assert entry["args"] == ["--from", "/repo", NAME]
+    assert entry["disabled"] is False
+    assert entry["autoApprove"] == []
+
+
+def test_mimo_global_paths_cover_xdg_and_appdata(tmp_path: Path) -> None:
+    mimo = _spec("mimo")
+    home = tmp_path / "home"
+
+    assert mimo.candidates("global", tmp_path, home=home)[0] == (
+        home / ".config" / "mimocode" / "mimocode.json"
+    )
+    assert mimo.candidates("local", tmp_path) == [
+        tmp_path / ".mimocode" / "mimocode.json"
+    ]
+
+
+def test_windsurf_uses_the_devin_local_config(tmp_path: Path) -> None:
+    windsurf = _spec("windsurf")
+    home = tmp_path / "home"
+
+    candidates = windsurf.candidates("global", tmp_path, home=home)
+    assert candidates[0] == home / ".config" / "devin" / "mcp_config.json"
+    assert candidates[-1] == home / ".codeium" / "windsurf" / "mcp_config.json"
+    assert windsurf.candidates("local", tmp_path) == [
+        tmp_path / ".devin" / "mcp_config.json"
+    ]
 
 
 def test_zed_uses_context_servers_without_a_type() -> None:

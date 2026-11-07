@@ -10,6 +10,7 @@ import json
 
 _BEGIN = "# >>> simple-code-indexer >>>"
 _END = "# <<< simple-code-indexer <<<"
+STARTUP_TIMEOUT_SEC = 120
 
 
 def upsert(existing: str, *, name: str, command: list[str], env: dict[str, str]) -> str:
@@ -28,6 +29,7 @@ def _render(name: str, command: list[str], env: dict[str, str]) -> str:
         _BEGIN,
         f"[mcp_servers.{json.dumps(name)}]",
         f"command = {json.dumps(command[0])}",
+        f"startup_timeout_sec = {STARTUP_TIMEOUT_SEC}",
     ]
     if len(command) > 1:
         lines.append(f"args = {json.dumps(command[1:])}")

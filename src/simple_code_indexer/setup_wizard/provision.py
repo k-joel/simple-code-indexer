@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
 import socket
 import subprocess
+import sys
 import time
 import urllib.request
 from collections.abc import Callable
@@ -32,7 +34,18 @@ GPU_SCRIPT_FILENAME = "gpu_init.sh"
 EMBED_CONTAINER = "simple-ci-embed"
 QDRANT_CONTAINER = "simple-ci-qdrant"
 
-_DOCKER_TIMEOUT_S = 15.0
+EMBED_PORTS = (8080, 8000, 11434, 3000, 1234)
+_EMBED_NEEDLES = (
+    "llama",
+    "ollama",
+    "embed",
+    "tei",
+    "vllm",
+    "infinity",
+    "text-embeddings",
+)
+
+_DOCKER_TIMEOUT_S = 30.0
 _COMPOSE_TIMEOUT_S = 900.0
 _GPU_SCRIPT_TIMEOUT_S = 900.0
 _CHUNK_BYTES = 4 * 1024 * 1024
@@ -120,6 +133,20 @@ class Container:
         return self.status.lower().startswith("up")
 
 
+@dataclass(frozen=True, slots=True)
+class EmbeddingContainer:
+    name: str
+    image: str
+    status: str
+    url: str | None
+    models: tuple[str, ...] = ()
+    dim: int | None = None
+
+    @property
+    def running(self) -> bool:
+        return self.status.lower().startswith("up")
+
+
 class Runner:
     """subprocess wrapper; tests inject a fake with the same methods."""
 
@@ -160,6 +187,27 @@ def docker_available(runner: Runner) -> bool:
     return runner.run(["docker", "info"]).returncode == 0
 
 
+def start_docker_daemon(runner: Runner, *, platform: str = sys.platform) -> bool:
+    """Launch Docker Desktop / the Docker service; False when no launcher exists."""
+    command: list[str] = []
+    if platform == "win32":
+        program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        candidate = program_files / "Docker" / "Docker" / "Docker Desktop.exe"
+        if candidate.is_file():
+            command = [str(candidate)]
+    elif platform == "darwin":
+        command = ["open", "-a", "Docker"]
+    else:
+        command = ["systemctl", "--user", "start", "docker"]
+    if not command:
+        return False
+    try:
+        subprocess.Popen(command)
+    except OSError:
+        return False
+    return True
+
+
 def list_containers(runner: Runner) -> list[Container]:
     result = runner.run(
         [
@@ -189,21 +237,52 @@ def list_containers(runner: Runner) -> list[Container]:
 
 
 def container_status(runner: Runner, name: str) -> str | None:
-    result = runner.run(["docker", "inspect", "-f", "{{.State.Status}}", name])
+    for attempt in range(2):
+        result = runner.run(
+            ["docker", "inspect", "-f", "{{.State.Status}}", name],
+            timeout=_DOCKER_TIMEOUT_S,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+        if attempt == 0:
+            time.sleep(0.5)
+    return None
+
+
+def container_env(runner: Runner, name: str) -> dict[str, str]:
+    """Parse `docker inspect` Config.Env into a mapping (empty on failure)."""
+    result = runner.run(
+        ["docker", "inspect", "-f", "{{json .Config.Env}}", name],
+        timeout=_DOCKER_TIMEOUT_S,
+    )
     if result.returncode != 0:
-        return None
-    return result.stdout.strip() or None
+        return {}
+    try:
+        values = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(values, list):
+        return {}
+    env: dict[str, str] = {}
+    for item in values:
+        if isinstance(item, str) and "=" in item:
+            key, _, value = item.partition("=")
+            env[key] = value
+    return env
 
 
 def start_container(runner: Runner, name: str) -> bool:
     status = container_status(runner, name)
     if status == "running":
         return True
-    if status == "paused":
-        return runner.run(["docker", "unpause", name]).returncode == 0
     if status is None:
         return False
-    return runner.run(["docker", "start", name]).returncode == 0
+    command = ["docker", "unpause" if status == "paused" else "start", name]
+    if runner.run(command, timeout=60.0).returncode == 0:
+        return True
+    # A slow Docker Desktop can exceed the command timeout while the container
+    # still starts; trust the state over the exit code.
+    return container_status(runner, name) == "running"
 
 
 def container_url(
@@ -220,6 +299,92 @@ def container_url(
             _, _, host_port = line.strip().rpartition(":")
             if host_port.isdigit():
                 return f"http://localhost:{host_port}"
+    return None
+
+
+def list_embedding_containers(
+    runner: Runner,
+    http: Any,
+    *,
+    ports: tuple[int, ...] = EMBED_PORTS,
+) -> list[EmbeddingContainer]:
+    """Existing Docker containers that look like an embedding server."""
+    from simple_code_indexer.setup_wizard import probe
+
+    found: list[EmbeddingContainer] = []
+    for container in list_containers(runner):
+        haystack = f"{container.name} {container.image}".lower()
+        if not any(needle in haystack for needle in _EMBED_NEEDLES):
+            continue
+        url = container_url(runner, container.name, ports)
+        models: tuple[str, ...] = ()
+        if url is not None and container.running:
+            models = tuple(probe.list_models(http, url))
+        found.append(
+            EmbeddingContainer(
+                name=container.name,
+                image=container.image,
+                status=container.status,
+                url=url,
+                models=models,
+            )
+        )
+    return found
+
+
+def find_qdrant_containers(runner: Runner) -> list[Container]:
+    return [
+        container
+        for container in list_containers(runner)
+        if "qdrant" in f"{container.name} {container.image}".lower()
+    ]
+
+
+def downloaded_models(home: Path) -> list[Path]:
+    directory = model_dir(home)
+    if not directory.is_dir():
+        return []
+    return sorted(
+        path
+        for path in directory.glob("*.gguf")
+        if path.is_file() and path.stat().st_size
+    )
+
+
+def existing_service(
+    container: str,
+    *,
+    compose_file: Path | None = None,
+    compose_service: str | None = None,
+    startup_timeout_s: float = 120.0,
+) -> dict[str, Any]:
+    """The `service` block for a container the wizard did not create itself."""
+    service: dict[str, Any] = {
+        "container": container,
+        "startup_timeout_s": startup_timeout_s,
+    }
+    if compose_file is not None and compose_file.is_file():
+        service["compose_file"] = str(compose_file)
+        if compose_service:
+            service["compose_service"] = compose_service
+    return service
+
+
+def compose_services(compose_file: Path) -> dict[str, Any]:
+    if not compose_file.is_file():
+        return {}
+    loaded = yaml.safe_load(compose_file.read_text(encoding="utf-8"))
+    services = loaded.get("services") if isinstance(loaded, dict) else None
+    return services if isinstance(services, dict) else {}
+
+
+def compose_service_for_container(compose_file: Path, container: str) -> str | None:
+    for name, definition in compose_services(compose_file).items():
+        if (
+            isinstance(definition, dict)
+            and definition.get("container_name") == container
+        ):
+            return name
     return None
 
 

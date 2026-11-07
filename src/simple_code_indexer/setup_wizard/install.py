@@ -1,0 +1,114 @@
+"""Install the repo into a stable per-user directory.
+
+Harness entries point at the installed copy (its virtualenv Python plus
+``run_server.py``), so they survive deleting the original checkout and can
+self-update with ``git pull`` on every launch.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+
+from simple_code_indexer.setup_wizard.provision import Runner
+
+APP_DIRNAME = "simple-code-indexer"
+LAUNCHER_FILENAME = "run_server.py"
+
+_IGNORED: tuple[str, ...] = (
+    ".venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".simple-ci",
+    ".index",
+    "artifacts",
+    ".mimocode",
+    ".commandcode",
+    ".kilo",
+    "build",
+    "dist",
+    "*.egg-info",
+    "*.pyc",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class InstallResult:
+    root: Path
+    python: Path
+    launcher: Path
+
+    @property
+    def server_command(self) -> list[str]:
+        return [str(self.python), str(self.launcher)]
+
+
+def install_root(
+    *,
+    home: Path | None = None,
+    platform: str = sys.platform,
+    env: Mapping[str, str] | None = None,
+) -> Path:
+    """Per-platform per-user application directory."""
+    environ = os.environ if env is None else env
+    home = home or Path.home()
+    if platform == "win32":
+        appdata = environ.get("APPDATA")
+        base = Path(appdata) if appdata else home / "AppData" / "Roaming"
+        return base / APP_DIRNAME
+    if platform == "darwin":
+        return home / "Library" / "Application Support" / APP_DIRNAME
+    data_home = environ.get("XDG_DATA_HOME")
+    base = Path(data_home) if data_home else home / ".local" / "share"
+    return base / APP_DIRNAME
+
+
+def venv_python(root: Path, *, platform: str = sys.platform) -> Path:
+    if platform == "win32":
+        return root / ".venv" / "Scripts" / "python.exe"
+    return root / ".venv" / "bin" / "python"
+
+
+def copy_repo(source: Path, target: Path) -> None:
+    """Copy the working tree (including `.git` on the first install)."""
+    ignore = list(_IGNORED)
+    if (target / ".git").exists():
+        ignore.append(".git")
+    target.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(
+        source,
+        target,
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns(*ignore),
+    )
+
+
+def sync_env(
+    runner: Runner,
+    target: Path,
+    output,
+) -> bool:
+    """Run `uv sync` for the installed copy; False on failure."""
+    uv = runner.which("uv") or "uv"
+    output(f"Syncing the installed environment in {target} ...")
+    result = runner.run(
+        [uv, "sync", "--project", str(target)],
+        timeout=600,
+    )
+    if result.returncode != 0:
+        if result.stdout.strip():
+            output(result.stdout.strip())
+        if result.stderr.strip():
+            output(result.stderr.strip())
+        return False
+    return True
+
+
+def existing_python(root: Path, *, platform: str, fallback: Path) -> Path:
+    candidate = venv_python(root, platform=platform)
+    return candidate if candidate.is_file() else fallback

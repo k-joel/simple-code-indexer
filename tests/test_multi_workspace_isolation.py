@@ -47,13 +47,24 @@ def _child_env() -> dict[str, str]:
 
 
 def _reachable(url: str) -> bool:
+    request = urllib.request.Request(
+        url.rstrip("/") + "/v1/embeddings",
+        data=b'{"model":"Qwen3-Embedding-4B-Q6_K","input":"ping"}',
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
     try:
-        urllib.request.urlopen(url, timeout=1)
-    except urllib.error.HTTPError:
-        return True  # answered, just not 200 (llama.cpp 404s on /)
-    except (urllib.error.URLError, ValueError):
+        with urllib.request.urlopen(request, timeout=8) as response:
+            if response.status != 200:
+                return False
+            body = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
         return False
-    return True
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, list) or not data:
+        return False
+    vector = data[0].get("embedding") if isinstance(data[0], dict) else None
+    return isinstance(vector, list) and len(vector) == 2560
 
 
 pytestmark = pytest.mark.skipif(

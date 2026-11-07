@@ -1,9 +1,13 @@
-"""Builtin Windsurf harness plugin (global config only)."""
+"""Builtin Windsurf / Devin Local harness plugin."""
 
 NAME = "windsurf"
-LABEL = "Windsurf"
-HOME_DIRS = ["~/.codeium/windsurf"]
-BINARIES = ["windsurf"]
-GLOBAL_CONFIGS = ["~/.codeium/windsurf/mcp_config.json"]
-LOCAL_CONFIGS: list[str] = []
+LABEL = "Windsurf / Devin Local"
+HOME_DIRS = ["~/.config/devin", "~/.codeium/windsurf", "%APPDATA%/devin"]
+BINARIES = ["windsurf", "devin"]
+GLOBAL_CONFIGS = [
+    "~/.config/devin/mcp_config.json",
+    "%APPDATA%/devin/mcp_config.json",
+    "~/.codeium/windsurf/mcp_config.json",
+]
+LOCAL_CONFIGS = [".devin/mcp_config.json"]
 ROOT_KEY = "mcpServers"

@@ -1,3 +1,4 @@
+import json
 import urllib.error
 import urllib.request
 from dataclasses import replace
@@ -41,9 +42,16 @@ def _embeddings_reachable() -> bool:
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=8) as response:
-            return response.status == 200
-    except (urllib.error.URLError, TimeoutError, OSError):
+            if response.status != 200:
+                return False
+            body = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
         return False
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, list) or not data:
+        return False
+    vector = data[0].get("embedding") if isinstance(data[0], dict) else None
+    return isinstance(vector, list) and len(vector) == 2560
 
 
 def test_unreachable_endpoint_raises_and_marks_not_ok() -> None:

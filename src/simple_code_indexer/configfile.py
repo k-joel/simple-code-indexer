@@ -1,12 +1,12 @@
-"""Layered `config.yaml` discovery and parsing.
+"""Global `config.yaml` discovery and parsing.
 
-Precedence (highest first): `SIMPLE_CI_CONFIG` env var, `<workspace>/.simple-ci/
-config.yaml`, `~/.simple-ci/config.yaml`, built-in defaults. Individual settings
-are still overridable by their own environment variables in `config.py`.
+There is exactly one config file: `~/.simple-ci/config.yaml`. Project-local
+`<workspace>/.simple-ci/config.yaml` files are legacy — the wizard migrates them
+into the global file and the server never reads them. Individual settings are
+still overridable by their own environment variables in `config.py`.
 
-Both files participate: `load_layered_config` deep-merges the global file first
-and lets the local file override individual keys. `SIMPLE_CI_CONFIG` replaces
-discovery entirely with one explicit file.
+`SIMPLE_CI_CONFIG` replaces discovery entirely with one explicit file (`none`/
+`off` disables discovery, which is what the test suite uses).
 """
 
 from __future__ import annotations
@@ -30,8 +30,18 @@ CONFIG_VERSION = 1
 _DISABLED_VALUES = {"none", "off"}
 
 
+def global_config_path(home: Path | None = None) -> Path:
+    """The single supported config location."""
+    return (home or Path.home()) / LOCAL_DIRNAME / CONFIG_FILENAME
+
+
 def config_paths(workspace_root: Path, home: Path | None = None) -> tuple[Path, ...]:
-    """Config files to layer, lowest precedence first (global, then local)."""
+    """Config files to read: the global file, or `SIMPLE_CI_CONFIG`.
+
+    `workspace_root` is accepted for call-site compatibility; local configs are
+    deliberately no longer part of discovery.
+    """
+    del workspace_root
     explicit = os.environ.get("SIMPLE_CI_CONFIG")
     if explicit is not None:
         if explicit.strip().lower() in _DISABLED_VALUES:
@@ -41,18 +51,12 @@ def config_paths(workspace_root: Path, home: Path | None = None) -> tuple[Path, 
             return (path,)
         logger.warning("SIMPLE_CI_CONFIG points at a missing file: %s", path)
         return ()
-    paths: list[Path] = []
-    global_config = (home or Path.home()) / LOCAL_DIRNAME / CONFIG_FILENAME
-    if global_config.is_file():
-        paths.append(global_config)
-    local = workspace_root / LOCAL_DIRNAME / CONFIG_FILENAME
-    if local.is_file():
-        paths.append(local)
-    return tuple(paths)
+    global_config = global_config_path(home)
+    return (global_config,) if global_config.is_file() else ()
 
 
 def find_config_file(workspace_root: Path, home: Path | None = None) -> Path | None:
-    """The highest-precedence config file; `SIMPLE_CI_CONFIG` wins."""
+    """The active config file; `SIMPLE_CI_CONFIG` wins."""
     paths = config_paths(workspace_root, home)
     return paths[-1] if paths else None
 
@@ -63,6 +67,11 @@ def load_layered_config(paths: Iterable[Path]) -> dict[str, Any]:
     for path in paths:
         merged = _deep_merge(merged, load_config(path))
     return merged
+
+
+def merge_configs(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Public wrapper used when migrating a legacy local config."""
+    return _deep_merge(base, overlay)
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:

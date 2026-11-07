@@ -1,3 +1,4 @@
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -115,12 +116,19 @@ def test_ignored_and_temp_events_are_dropped(tmp_path: Path) -> None:
 def _symbol_in_index(settings: Settings, name: str) -> bool:
     if not settings.index_db_path.exists():
         return False
-    with db.connect(settings.index_db_path, readonly=True) as conn:
-        return bool(db.symbol_lookup(conn, name))
+    try:
+        with db.connect(settings.index_db_path, readonly=True) as conn:
+            return bool(db.symbol_lookup(conn, name))
+    except sqlite3.OperationalError:
+        # The writer thread may not have created the schema yet; retry.
+        return False
 
 
 def _chunk_contains(settings: Settings, needle: str) -> bool:
     if not settings.index_db_path.exists():
         return False
-    with db.connect(settings.index_db_path, readonly=True) as conn:
-        return bool(db.fts_search(conn, needle, limit=5))
+    try:
+        with db.connect(settings.index_db_path, readonly=True) as conn:
+            return bool(db.fts_search(conn, needle, limit=5))
+    except sqlite3.OperationalError:
+        return False

@@ -57,6 +57,9 @@ def ensure_managed_services(settings: Settings) -> None:
                 continue
             if _wait_ready(kind, settings, service.startup_timeout_s):
                 LAST_STATE[kind] = state
+                logger.info(
+                    "managed %s service %s is %s", kind, service.container, state
+                )
             else:
                 logger.error(
                     "managed %s service %s did not become ready",
@@ -197,6 +200,7 @@ def _wait_container(container: str, timeout: float = _CONTAINER_WAIT_S) -> bool:
 
 
 def _wait_ready(kind: str, settings: Settings, timeout_s: float) -> bool:
+    logger.info("waiting up to %.0fs for the managed %s service", timeout_s, kind)
     deadline = _clock() + timeout_s
     while _clock() < deadline:
         if _probe(kind, settings):

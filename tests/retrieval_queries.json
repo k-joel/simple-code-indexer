@@ -1,0 +1,245 @@
+{
+  "version": 1,
+  "queries": [
+    {
+      "id": "q01-lock",
+      "query": "where is the per-workspace file lock acquired before the server starts serving",
+      "expected_files": ["src/simple_code_indexer/server.py", "src/simple_code_indexer/workspace_lock.py"],
+      "tags": ["server", "locking"]
+    },
+    {
+      "id": "q02-second-server",
+      "query": "what happens when a second server starts for the same workspace",
+      "expected_files": ["src/simple_code_indexer/server.py", "src/simple_code_indexer/workspace_lock.py"],
+      "tags": ["server", "locking"]
+    },
+    {
+      "id": "q03-hash-shortcut",
+      "query": "how does the indexer skip files whose content hash has not changed",
+      "expected_files": ["src/simple_code_indexer/indexer.py", "src/simple_code_indexer/db.py"],
+      "tags": ["indexer"]
+    },
+    {
+      "id": "q04-faiss-labels",
+      "query": "how are stable FAISS label ids allocated and persisted",
+      "expected_files": ["src/simple_code_indexer/faiss_store.py", "src/simple_code_indexer/db.py"],
+      "tags": ["faiss", "db"]
+    },
+    {
+      "id": "q05-qdrant-dim",
+      "query": "what happens when a Qdrant collection has the wrong vector size",
+      "expected_files": ["src/simple_code_indexer/qdrant_store.py"],
+      "tags": ["qdrant"]
+    },
+    {
+      "id": "q06-split-embed",
+      "query": "how are oversized embedding inputs split into pieces and mean pooled back together",
+      "expected_files": ["src/simple_code_indexer/embed.py"],
+      "tags": ["embedding"]
+    },
+    {
+      "id": "q07-gemma-prompts",
+      "query": "which prompt prefixes are used for EmbeddingGemma code retrieval",
+      "expected_files": ["src/simple_code_indexer/model_prompts.py", "src/simple_code_indexer/setup_wizard/catalog.py"],
+      "tags": ["embedding", "prompts"]
+    },
+    {
+      "id": "q08-watcher-debounce",
+      "query": "how does the watcher debounce rapid file saves",
+      "expected_files": ["src/simple_code_indexer/watcher.py"],
+      "tags": ["watcher"]
+    },
+    {
+      "id": "q09-cpp-symbols",
+      "query": "how is a C++ function symbol extracted with tree-sitter",
+      "expected_files": ["src/simple_code_indexer/parse.py", "src/simple_code_indexer/builtin/cpp.py"],
+      "tags": ["parsing"]
+    },
+    {
+      "id": "q10-plugin-override",
+      "query": "how do user language plugins override builtin extensions",
+      "expected_files": ["src/simple_code_indexer/registry.py"],
+      "tags": ["plugins"]
+    },
+    {
+      "id": "q11-cline-path",
+      "query": "where is the Cline MCP settings file written",
+      "expected_files": ["src/simple_code_indexer/harnesses/cline.py", "src/simple_code_indexer/setup_wizard/write.py"],
+      "tags": ["harnesses", "setup"]
+    },
+    {
+      "id": "q12-nvidia-compose",
+      "query": "how does the compose template inject the NVIDIA container runtime",
+      "expected_files": ["src/simple_code_indexer/setup_wizard/provision.py", "src/simple_code_indexer/setup_wizard/gpu.py"],
+      "tags": ["setup", "docker"]
+    },
+    {
+      "id": "q13-reuse-config",
+      "query": "how does the setup wizard reuse an existing global config",
+      "expected_files": ["src/simple_code_indexer/setup_wizard/__init__.py"],
+      "tags": ["setup"]
+    },
+    {
+      "id": "q14-mcp-tools",
+      "query": "what MCP tools does the server expose and what arguments do they take",
+      "expected_files": ["src/simple_code_indexer/server.py"],
+      "tags": ["mcp", "server"]
+    },
+    {
+      "id": "q15-windows-lock",
+      "query": "how does the workspace lock behave on Windows",
+      "expected_files": ["src/simple_code_indexer/workspace_lock.py"],
+      "tags": ["locking", "windows"]
+    },
+    {
+      "id": "q16-harness-backup",
+      "query": "how are harness configs backed up before writing",
+      "expected_files": ["src/simple_code_indexer/setup_wizard/write.py"],
+      "tags": ["harnesses", "setup"]
+    },
+    {
+      "id": "q17-fts-sync",
+      "query": "how is the SQLite FTS5 table kept in sync with chunks",
+      "expected_files": ["src/simple_code_indexer/db.py"],
+      "tags": ["db", "fts"]
+    },
+    {
+      "id": "q18-embedding-state",
+      "query": "how are embedding state rows recorded after a vector upsert",
+      "expected_files": ["src/simple_code_indexer/indexer.py", "src/simple_code_indexer/db.py"],
+      "tags": ["indexer", "embedding"]
+    },
+    {
+      "id": "q19-status-counts",
+      "query": "how does the server report file symbol and chunk counts in get_status",
+      "expected_files": ["src/simple_code_indexer/server.py", "src/simple_code_indexer/db.py"],
+      "tags": ["server", "db"]
+    },
+    {
+      "id": "q20-symbol-prefix",
+      "query": "how are symbol lookup prefix matches ordered",
+      "expected_files": ["src/simple_code_indexer/db.py"],
+      "tags": ["db", "symbols"]
+    },
+    {
+      "id": "q21-collection-name",
+      "query": "how is the Qdrant collection name derived from the workspace path",
+      "expected_files": ["src/simple_code_indexer/config.py"],
+      "tags": ["config", "qdrant"]
+    },
+    {
+      "id": "q22-faiss-corrupt",
+      "query": "how does the FAISS index recover from a corrupt or wrong-dimension file",
+      "expected_files": ["src/simple_code_indexer/faiss_store.py"],
+      "tags": ["faiss"]
+    },
+    {
+      "id": "q23-dirty-labels",
+      "query": "how are vector labels marked dirty and flushed to disk",
+      "expected_files": ["src/simple_code_indexer/faiss_store.py", "src/simple_code_indexer/db.py"],
+      "tags": ["faiss", "db"]
+    },
+    {
+      "id": "q24-nonrecursive-watch",
+      "query": "how does the watcher register non-recursive directory watches",
+      "expected_files": ["src/simple_code_indexer/watcher.py"],
+      "tags": ["watcher"]
+    },
+    {
+      "id": "q25-temp-filter",
+      "query": "how are temporary editor files filtered out of the index",
+      "expected_files": ["src/simple_code_indexer/config.py", "src/simple_code_indexer/indexer.py"],
+      "tags": ["indexer", "config"]
+    },
+    {
+      "id": "q26-managed-service",
+      "query": "how does a managed Docker service start a stopped container",
+      "expected_files": ["src/simple_code_indexer/services.py"],
+      "tags": ["docker", "services"]
+    },
+    {
+      "id": "q27-startup-probe",
+      "query": "how does the server probe the embedding endpoint at startup",
+      "expected_files": ["src/simple_code_indexer/server.py", "src/simple_code_indexer/services.py"],
+      "tags": ["server", "services"]
+    },
+    {
+      "id": "q28-gpu-windows",
+      "query": "how does the setup wizard detect an NVIDIA GPU on Windows",
+      "expected_files": ["src/simple_code_indexer/setup_wizard/gpu.py"],
+      "tags": ["setup", "gpu"]
+    },
+    {
+      "id": "q29-catalog-pooling",
+      "query": "how does the model catalog define pooling and context size",
+      "expected_files": ["src/simple_code_indexer/setup_wizard/catalog.py"],
+      "tags": ["setup", "models"]
+    },
+    {
+      "id": "q30-opencode-nested",
+      "query": "how are OpenCode MCP servers nested under mcp.servers",
+      "expected_files": ["src/simple_code_indexer/harnesses/opencode.py", "src/simple_code_indexer/harnesses/_json.py"],
+      "tags": ["harnesses"]
+    },
+    {
+      "id": "q31-toml-marker",
+      "query": "how does the Codex TOML marker block merge work",
+      "expected_files": ["src/simple_code_indexer/harnesses/_toml.py"],
+      "tags": ["harnesses", "codex"]
+    },
+    {
+      "id": "q32-install-copy",
+      "query": "how does the installer copy the repo and sync the virtualenv",
+      "expected_files": ["src/simple_code_indexer/setup_wizard/install.py"],
+      "tags": ["setup", "install"]
+    },
+    {
+      "id": "q33-launcher-pull",
+      "query": "how does the MCP launcher run git pull before starting the server",
+      "expected_files": ["run_server.py"],
+      "tags": ["install", "launcher"]
+    },
+    {
+      "id": "q34-workspace-cwd",
+      "query": "how does the workspace root default to the process working directory",
+      "expected_files": ["src/simple_code_indexer/config.py"],
+      "tags": ["config", "workspace"]
+    },
+    {
+      "id": "q35-point-ids",
+      "query": "how are Qdrant point ids derived from the path and chunk index",
+      "expected_files": ["src/simple_code_indexer/qdrant_store.py"],
+      "tags": ["qdrant"]
+    },
+    {
+      "id": "q36-degrade",
+      "query": "how does semantic search degrade when the embedding endpoint is down",
+      "expected_files": ["src/simple_code_indexer/server.py", "src/simple_code_indexer/embed.py"],
+      "tags": ["server", "embedding"]
+    },
+    {
+      "id": "q37-chunking",
+      "query": "how are chunks split by line window and character budget",
+      "expected_files": ["src/simple_code_indexer/parse.py"],
+      "tags": ["parsing"]
+    },
+    {
+      "id": "q38-prefetch",
+      "query": "how does the plugin registry prefetch tree-sitter grammars in the background",
+      "expected_files": ["src/simple_code_indexer/registry.py"],
+      "tags": ["plugins", "parsing"]
+    },
+    {
+      "id": "q39-identity",
+      "query": "how does changing the document prompt invalidate stored vectors",
+      "expected_files": ["src/simple_code_indexer/config.py", "src/simple_code_indexer/vector_store.py", "src/simple_code_indexer/db.py"],
+      "tags": ["config", "embedding"]
+    },
+    {
+      "id": "q40-atomic-write",
+      "query": "how is the global config written atomically with restricted permissions",
+      "expected_files": ["src/simple_code_indexer/configfile.py", "src/simple_code_indexer/setup_wizard/__init__.py"],
+      "tags": ["config", "setup"]
+    }
+  ]
+}

@@ -9,12 +9,13 @@ The harness spawns the server **on the host, inside the project you have open**:
 
 - **Workspace** = the process working directory (`Path.cwd().resolve()`), overridable with `WORKSPACE_ROOT`.
 - **Index** = `$WORKSPACE_ROOT/.simple-ci/index.db` — gitignore `.simple-ci/` in every indexed project.
-- **Config** = `~/.simple-ci/config.yaml` (global: embedding endpoint/model/prompts/service)
-  and `<workspace>/.simple-ci/config.yaml` (local: vector store and project tuning). Both are
-  loaded and deep-merged with the local file winning key by key; environment variables override
-  both. `SIMPLE_CI_CONFIG` replaces discovery with one explicit file. See
-  [ADR-0009](docs/adr/0009-setup-wizard-managed-services-config.md) and
-  [ADR-0011](docs/adr/0011-gpu-compose-global-config-model-prompts.md).
+- **Config** = one global file, `~/.simple-ci/config.yaml`. Project-local
+  `<workspace>/.simple-ci/config.yaml` files are legacy: the wizard migrates their keys into
+  the global file and removes them, and the server never reads them. Environment variables
+  override the file; `SIMPLE_CI_CONFIG` replaces discovery with one explicit file. See
+  [ADR-0009](docs/adr/0009-setup-wizard-managed-services-config.md),
+  [ADR-0011](docs/adr/0011-gpu-compose-global-config-model-prompts.md), and
+  [ADR-0012](docs/adr/0012-global-config-appdata-install.md).
 - **Vector store** = FAISS by default, persisted at `$WORKSPACE_ROOT/.simple-ci/vectors.faiss`
   (override with `faiss.path` or `FAISS_PATH`). Vectors are L2-normalised, so scores are
   cosine similarity. Qdrant stays available with `vector_store: qdrant`; its per-workspace
@@ -52,34 +53,46 @@ cd simple-code-indexer
 python setup.py
 ```
 
-`setup.py` installs `uv` if needed, runs `uv sync`, and launches the interactive wizard.
-Run `python setup.py --dry-run` first to see every action without writing files or starting
-containers, or `python setup.py --yes` to accept the recommended answer everywhere.
-For a reproducible install, pick the model and GPU path explicitly:
+`setup.py` installs `uv` if needed, runs `uv sync`, and launches the interactive wizard
+(questionary menus on every platform). Run `python setup.py --dry-run` first to see every
+action without writing files or starting containers, or `python setup.py --yes` to accept the
+recommended answer everywhere. For a reproducible install, pick the model and backend
+explicitly:
 
 ```bash
 python setup.py --yes --model embeddinggemma2 --gpu auto
-python setup.py --yes --model qwen3-embedding-0.6b   # switch model; re-embeds on next start
+python setup.py --yes --model qwen3-embedding-0.6b --vector-store faiss
+python setup.py --yes --container llamacpp-qwen3-embedding-4b-q6_k --vector-store qdrant
 ```
+
+The wizard copies the repo (including `.git`) to the per-user app directory and points every
+selected harness at that copy:
+
+| Platform | Install directory |
+|---|---|
+| Windows | `%APPDATA%\simple-code-indexer` |
+| macOS | `~/Library/Application Support/simple-code-indexer` |
+| Linux | `$XDG_DATA_HOME/simple-code-indexer` or `~/.local/share/simple-code-indexer` |
+
+Harness entries run `<install>/.venv/.../python.exe <install>/run_server.py`. The launcher
+runs `git pull --ff-only --autostash` first, runs `uv sync` only when `HEAD` moved, and then
+starts the server **in the harness's working directory**, so workspace inference is preserved.
 
 ### What the wizard asks
 
 | Step | Choices |
 |---|---|
-| Existing setup | If `~/.simple-ci/` already has config + compose + a GGUF, offer to reuse it and skip the download |
-| Embedding server | Use an existing OpenAI-compatible endpoint (type the URL, optional API key, model name), pick an existing Docker container (started for you), or auto-download a model |
-| Auto-download model | EmbeddingGemma 2 BF16 (recommended, 768-dim), Qwen3-Embedding-0.6B Q8_0 (1024-dim), Nomic Embed Code (3584-dim), or cancel. `--model KEY` picks one without asking |
-| GPU | Detected automatically (`nvidia`, `amd`, `intel`, `cpu`); `--gpu` overrides. NVIDIA without the Docker runtime prompts to run `gpu_init.sh` |
+| Docker | Detected; if missing, offers to install it (`winget` on Windows, `brew` on macOS, the get.docker.com script on Linux) and waits for the daemon |
+| Existing config | If `~/.simple-ci/config.yaml` exists, shows it and offers **use / reconfigure / show file / cancel** (`--config-mode use\|reconfigure` answers non-interactively) |
+| Embedding source | A running server on `localhost:8080`, an existing Docker container (started for you; `--container NAME` forces one), an already-downloaded GGUF in `~/.simple-ci/model/`, a catalog download, or an existing URL |
 | Embedding dimension | Always probed from a real `/v1/embeddings` call; catalog values are only an offline fallback |
-| Vector store | **FAISS** (recommended — a local file, no Docker) or **Qdrant** (existing server or Docker container) |
-| Qdrant | Only when Qdrant is selected: use an existing URL/container, provision `qdrant/qdrant` with Docker, or abort |
-| Harnesses | Detected from your home folder; choose any subset and global vs project-local scope |
+| Vector store | **FAISS** (recommended — a local file, no Docker) or **Qdrant** (existing container/URL, or Docker compose) |
+| Harnesses | Multi-select from detected harnesses; selected harnesses are always installed at their **global** scope (`--harnesses all\|none\|name,name` is non-interactive) |
+| Install | Copies the repo to the per-user app directory and runs `uv sync` there (`--install-dir`, `--no-install`) |
 
-By default the wizard writes **both** config files: the global one gets the embedding
-endpoint, model, prompts, and managed-service blocks; the local one gets the project's
-vector store and tuning. `--scope global|local` writes only one file, and `--config PATH`
-writes a single combined file. The wizard also appends `.simple-ci/` to the project
-`.gitignore` and offers to migrate a legacy `.index/` directory.
+The wizard also appends `.simple-ci/` to the project `.gitignore` and offers to migrate a
+legacy `.index/` directory. `--config PATH` writes one explicit config file for tests/advanced
+use. `--scope` was removed: configuration is always global.
 
 ### Model prompt instructions
 
@@ -99,42 +112,47 @@ identity, so changing it re-embeds the workspace; changing only the query prefix
 
 | Path | Contents |
 |---|---|
-| `~/.simple-ci/config.yaml` | Global config: embedding endpoint/model/prompts/service, Qdrant |
+| `~/.simple-ci/config.yaml` | The only config file: embedding endpoint/model/prompts/service, vector store, Qdrant |
 | `~/.simple-ci/docker/docker-compose.yml` | Generated services (`embed`, and `qdrant` only for the Qdrant backend) |
 | `~/.simple-ci/docker/gpu_init.sh` | NVIDIA container-toolkit bootstrap copied by the wizard |
 | `~/.simple-ci/model/` | Downloaded GGUF files (`embeddinggemma-2-BF16.gguf`, `Qwen3-Embedding-0.6B-Q8_0.gguf`, …) |
 | `~/.simple-ci/qdrant_storage/` | Qdrant data when that backend is selected |
-| `<project>/.simple-ci/config.yaml` | Per-project overrides: vector store, sweep/debounce |
+| `%APPDATA%/simple-code-indexer/` | Installed copy (`.git`, source, `.venv`, `run_server.py`) that harnesses launch |
 | `<project>/.simple-ci/index.db` | SQLite index (+ WAL files and the single-writer lock) |
 | `<project>/.simple-ci/vectors.faiss` | FAISS vectors (default backend; override with `faiss.path`) |
 
-Local config lives inside the gitignored `.simple-ci/` directory because it may hold an
-API key. Config precedence is **environment variable > local YAML > global YAML > default**;
-the two YAML files are deep-merged, so a local file only needs its overrides. The compose
-model mount is the relative `../model:/models:ro`, so `~/.simple-ci/` stays portable.
+The FAISS index and SQLite database stay **per workspace**; only the configuration is global.
+`vector_store` and an optional `faiss.path` live in the global file, so every project uses the
+same backend choice. A relative `faiss.path` resolves against the workspace; an absolute path
+shares one index file (opt-in). Config precedence is **environment variable > global YAML >
+default**.
+
 
 ### Supported harnesses
 
 Builtin plugins write the server entry into each client's own file:
 
-| Harness | Global config | Project config |
-|---|---|---|
-| Claude Code | `~/.claude.json` | `.mcp.json` |
-| Claude Desktop | `%APPDATA%/Claude/claude_desktop_config.json` (and macOS/Linux equivalents) | — |
-| Codex CLI | `~/.codex/config.toml` | `.codex/config.toml` |
-| Gemini CLI | `~/.gemini/settings.json` | `.gemini/settings.json` |
-| OpenCode | `~/.config/opencode/opencode.json(c)` | `opencode.json(c)` |
-| Cursor | `~/.cursor/mcp.json` | `.cursor/mcp.json` |
-| Windsurf | `~/.codeium/windsurf/mcp_config.json` | — |
-| VS Code | `%APPDATA%/Code/User/mcp.json` (and macOS/Linux equivalents) | `.vscode/mcp.json` |
-| Zed | `~/.config/zed/settings.json` | `.zed/settings.json` |
-| Cline | VS Code globalStorage `cline_mcp_settings.json` | — |
-| Command Code | `~/.commandcode/mcp.json` | `.mcp.json` |
-| MiMoCode | `~/.mimocode/mimocode.json` | `.mimocode/mimocode.json` |
+| Harness | Global config (the wizard writes here) |
+|---|---|
+| Claude Code | `~/.claude.json` |
+| Claude Desktop | `%APPDATA%/Claude/claude_desktop_config.json` (and macOS/Linux equivalents) |
+| Codex CLI | `~/.codex/config.toml` (`[mcp_servers.<name>]`, `startup_timeout_sec = 120`) |
+| Gemini CLI | `~/.gemini/settings.json` |
+| OpenCode | `~/.config/opencode/opencode.json(c)` (`mcp.servers.<name>`) |
+| Cursor | `~/.cursor/mcp.json` |
+| Windsurf / Devin Local | `~/.config/devin/mcp_config.json` (legacy `~/.codeium/windsurf/mcp_config.json`) |
+| VS Code | `%APPDATA%/Code/User/mcp.json` (and macOS/Linux equivalents) |
+| Zed | `~/.config/zed/settings.json` |
+| Cline | `~/.cline/data/settings/cline_mcp_settings.json` |
+| Command Code | `~/.commandcode/mcp.json` |
+| MiMoCode | `~/.config/mimocode/mimocode.json`, `~/.config/mimocode/config.json`, legacy `~/.mimocode/mimocode.json` |
 
-The entry is `uvx --from <this clone> simple-code-indexer`. Restart the harness after it is
-written; the file is read at session start. If the managed services are Docker-based, raise
-the harness `timeout` to `120000` — the server waits for the containers before serving.
+The wizard does **not** ask where to save each harness: selected harnesses are installed at
+their global scope. The entry is
+`<install>/.venv/.../python <install>/run_server.py`. Restart the harness after it is written;
+the file is read at session start. Codex/MiMo/OpenCode get a 120 s startup timeout because the
+launcher may sync dependencies and the server waits for Docker services before serving.
+
 
 ### Manual config
 
@@ -185,11 +203,11 @@ sweep_seconds: 45
 debounce_ms: 400
 ```
 
-These blocks work in either config file; the wizard puts `embedding` (+ `service`/`qdrant`)
-in the global file and `vector_store`/tuning in the local one. A relative `faiss.path`
-resolves against the workspace. A config with **no** `vector_store` key but a non-empty
-`qdrant:` section is treated as Qdrant, so existing installations keep their backend until
-they explicitly switch.
+These blocks live in the single global `~/.simple-ci/config.yaml`. The wizard writes
+`embedding`, `vector_store`, `qdrant`, and the service blocks there; the index and vector
+files stay per workspace. A config with **no** `vector_store` key but a non-empty `qdrant:`
+section is treated as Qdrant, so existing installations keep their backend until they
+explicitly switch.
 
 When a `service` block is present the server verifies the container is running (starting it
 if needed) and waits for the endpoint before serving. It never refuses to start: if Docker
@@ -205,10 +223,34 @@ uv run python tests/mcp_probe.py
 ```
 
 `get_status` reports the resolved `workspace`, `vector_store`, `vector_store_ok`,
-`vector_index` (the FAISS file path or the Qdrant collection), `config_file` (the most
-specific file), `config_files` (every layered file), and `services` (`running`, `started`,
-`unavailable`, or `not_managed`). `tests/service_probe.py` now resolves the same settings,
-so it probes the configured endpoint and model automatically.
+`vector_index` (the FAISS file path or the Qdrant collection), `config_file` (the global
+file, or `null`), `config_files` (0 or 1 entry), and `services` (`running`, `started`,
+`unavailable`, or `not_managed`). `tests/service_probe.py` resolves the same settings, so it
+probes the configured endpoint and model automatically.
+
+### Retrieval benchmark
+
+`tests/retrieval_bench.py` indexes the workspace with one model/backend and scores the
+40-query golden set in `tests/retrieval_queries.json` (Recall@1/5/10, MRR@10, nDCG@10, plus
+a lexical FTS baseline):
+
+```bash
+uv run python tests/retrieval_bench.py --workspace . --model embeddinggemma-2 \
+  --base-url http://localhost:8080 --vector-store faiss --reset \
+  --out artifacts/bench/gemma-faiss.json
+```
+
+`tests/bench_matrix.py` runs every model/backend combination, starts the containers
+(including the downloadable catalog models), deletes the index/collection between runs, and
+writes `artifacts/retrieval-quality-*.{md,json}`:
+
+```bash
+uv run python tests/bench_matrix.py --workspace . --vector-stores faiss,qdrant
+```
+
+The existing Qwen3-4B container was originally created with `LLAMA_ARG_POOLING=mean`; after
+recreating it with `last`, its nDCG@10 rose from 0.317 to 0.719. The wizard warns when it
+detects a Qwen3 model in a mean-pooling container.
 
 ### Troubleshooting
 
@@ -218,7 +260,8 @@ so it probes the configured endpoint and model automatically.
 | Port already in use | The wizard picks the next free port (8080→8081, 6333→6334) and writes it to config |
 | GPU container exits immediately | `--gpu cpu`, or run `~/.simple-ci/docker/gpu_init.sh` in the WSL2/Linux distro that runs dockerd, then re-run setup. On Windows: `wsl --update` first |
 | Container image is `server` despite an NVIDIA card | Docker does not expose the NVIDIA runtime; run the generated `gpu_init.sh` (or `--gpu nvidia` after fixing it) |
-| Wizard offers to skip the model download | It found `~/.simple-ci/config.yaml` + `docker/docker-compose.yml` + a GGUF; answer `n` or pass `--model KEY` to reconfigure |
+| Wizard offers to reuse the setup | It found `~/.simple-ci/config.yaml`; choose “reconfigure” or pass `--config-mode reconfigure`, or `--model KEY` to force a model |
+| Qwen3 embeddings look poor | The container is probably using mean pooling. Qwen3-Embedding is trained for last-token pooling: recreate it with `LLAMA_ARG_POOLING=last` (the wizard warns when it detects this) |
 | `get_status.services` shows `unavailable` | `docker ps -a`, inspect the container logs, then re-run `python setup.py` |
 | Changed the embedding model | The dimension changes, so the vector-store identity changes and the index re-embeds |
 | Config changes ignored | The server reads config at startup — restart the harness session |
@@ -266,22 +309,24 @@ uv run python tests/service_probe.py    # expect: embeddings OK dim=<your config
 ```json
 {
   "mcp": {
-    "code-index": {
+    "simple-code-indexer": {
       "type": "local",
-      "command": ["uvx", "--from", "d:/Projects/Python/simple-code-indexer", "simple-code-indexer"],
+      "command": [
+        "C:\\Users\\you\\AppData\\Roaming\\simple-code-indexer\\.venv\\Scripts\\python.exe",
+        "C:\\Users\\you\\AppData\\Roaming\\simple-code-indexer\\run_server.py"
+      ],
       "enabled": true,
-      "timeout": 120000,
-      "sampling": "deny"
+      "timeout": 120000
     }
   }
 }
 ```
 
 - **Restart the harness session after changing that file** (config is read at session start).
-- Slower to start than a container attach: the first `uvx` launch builds and installs in a
-  cached environment (~5 s), every later launch is ~0.3 s. `uv tool install --from <repo>`
-  once, then `"command": ["simple-code-indexer"]`, avoids even that.
-- Gate: `mimo mcp list` must show `✓ code-index connected`.
+- The launcher runs `git pull --ff-only --autostash` in the installed copy, re-runs `uv sync`
+  when `HEAD` moved, then starts the server in the harness's cwd. Set `SIMPLE_CI_GIT_PULL=0`
+  to skip the pull (offline use or local development).
+- Gate: `mimo mcp list` must show `✓ simple-code-indexer connected`.
 - Tools exposed: `search_code` (lexical; `semantic=true` uses the vector store), `symbol_lookup`, `get_status`.
 
 ### Probes (no harness needed)
@@ -327,7 +372,7 @@ Remove-Item -Recurse -Force .simple-ci   # or: rm -rf .simple-ci
 | Server exits with `already owns …index.db` | Two sessions share one workspace; the second refuses to start (single writer, ADR-0004). Close the other session. |
 | Save not picked up within 5 s | Reconciliation sweep (45 s) is the backstop; then check `last_sweep` in `get_status`. |
 | Semantic hits empty but lexical works | The vector-store identity changed without a rebuild (restart the session), or vectors failed earlier — the next sweep retries chunks whose `embedding_state` is not `ok`; if the log reports a vector width/collection-size mismatch, align `EMBED_DIM` (and for Qdrant delete the mismatched collection). |
-| `config_file: null` in `get_status` | Neither `<workspace>/.simple-ci/config.yaml` nor `~/.simple-ci/config.yaml` exists; run `python setup.py` or create one. |
+| `config_file: null` in `get_status` | `~/.simple-ci/config.yaml` does not exist; run `python setup.py` or create one. Project-local configs are ignored |
 | Logs | stderr of the spawned server (harness); never files in the workspace root. |
 
 ### Retired state

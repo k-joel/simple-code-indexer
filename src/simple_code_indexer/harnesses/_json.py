@@ -29,13 +29,25 @@ def parse(text: str) -> dict[str, Any]:
 
 
 def upsert(existing: str, *, root_key: str, name: str, entry: dict[str, Any]) -> str:
-    """Set `root_key[name] = entry` and re-serialize the whole document."""
+    """Set `root_key[name] = entry` and re-serialize the whole document.
+
+    `root_key` may be a dotted path (OpenCode stores servers under
+    `mcp.servers.<name>`).
+    """
     document = parse(existing)
-    servers = document.setdefault(root_key, {})
-    if not isinstance(servers, dict):
-        raise ParseError(f"'{root_key}' must be an object")
+    servers = _resolve_root(document, root_key)
     servers[name] = entry
     return json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+
+
+def _resolve_root(document: dict[str, Any], root_key: str) -> dict[str, Any]:
+    node = document
+    for part in root_key.split("."):
+        value = node.setdefault(part, {})
+        if not isinstance(value, dict):
+            raise ParseError(f"'{root_key}' must be an object")
+        node = value
+    return node
 
 
 def _strip_jsonc(text: str) -> str:
