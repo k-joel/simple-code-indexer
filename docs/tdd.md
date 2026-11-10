@@ -96,7 +96,7 @@ uvx --from <repo> simple-code-indexer      # host process; cwd inherited
     │     debounce queue → index_one_file → SQLite + Qdrant
     │
     └─ Watcher (watchdog Observer, background thread)
-          workspace root (cwd), one watch per interesting directory → events → queue
+          workspace root (cwd), one recursive watch → events → queue
 ```
 
 **Sidecar (post-MVP, config change only):** compose runs `watcher+indexer` as PID 1; MCP is a read-only query process. Queue/worker interface is identical.
@@ -110,7 +110,7 @@ host file save
   → per-path DEBOUNCE (300–500 ms)                [collapse temp+rename bursts]
   → bounded work queue (never index in the callback)
   → index_one_file(path):
-       skip if ext not in allowlist or path matches ignore rules
+       skip if ext not in allowlist, temp name, IGNORE_DIRS, or .gitignore match
        skip if sha256(content) == stored hash
        parse symbols (tree-sitter) → UPSERT symbols
        chunk → DELETE chunks/chunks_fts by file → INSERT
@@ -139,7 +139,7 @@ Design rules:
    - Semantic: embed query with the same endpoint → Qdrant search → map point IDs to chunks.
    - Hybrid (optional later): fuse ranks; v1 may return semantic hits only when `semantic=true`.
 2. `symbol_lookup(symbol)`: exact then prefix match on `symbols.name`; return kind, file, line, signature.
-3. `get_status()`: counts, `watcher_alive`, `last_sweep`, `qdrant_ok`, `embed_ok`.
+3. `get_status()`: counts, `watcher_alive`, `last_sweep`, `ignored_dirs`/`ignored_files` (last sweep), `vector_store_ok`, `embed_ok`.
 
 ---
 
@@ -250,12 +250,16 @@ re-embed them, so the reconcile must re-index from scratch.
 <workspace>/                 # the project the harness opened (process cwd)
   .simple-ci/
     index.db                 # SQLite WAL (gitignore this whole directory)
+    vectors.faiss            # FAISS index (default vector store)
+    log/sci.log              # runtime diagnostics (rotated, gitignored)
     config.yaml              # optional per-project config (may hold an API key)
   …user files…
 <repo>/src/simple_code_indexer/…   # the server itself (uvx-built env; no image)
 ```
 
-Never write logs into the workspace root (gitignore `.simple-ci/`; logs go to stderr or a gitignored path).
+Never write logs into the workspace root (gitignore `.simple-ci/`). The only log file is
+`<workspace>/.simple-ci/log/sci.log`: DEBUG in the file, INFO on stderr, and never stdout
+(the MCP channel).
 
 ---
 
@@ -278,9 +282,11 @@ src/simple_code_indexer/
   embed.py             # OpenAI-compatible embeddings client (query/document prompts)
   model_prompts.py     # documented code-retrieval prefixes for supported models
   qdrant_store.py      # ensure_collection, upsert, delete_by_path, search
+  ignore.py            # IgnoreRules: workspace .gitignore (root + nested) matching
   indexer.py           # index_one_file, sweep, startup reconcile
-  watcher.py           # Observer + debounce queue → indexer
+  watcher.py           # recursive root Observer + debounce queue → indexer
   services.py          # start managed containers, wait for readiness (fail-soft)
+  logging_setup.py     # stderr INFO + per-workspace rotating debug log
   server.py            # MCP stdio: initialize, tools/list, tools/call
   builtin/             # language plugins
   harnesses/           # MCP-client plugins used by the setup wizard
@@ -324,6 +330,9 @@ class Settings:
     embed_document_prefix: str | None = None    # e.g. "title: {title} | text: {content}"
     embed_fingerprint: str = ""                 # sha256(document_prefix)[:8], or ""
     config_sources: tuple[Path, ...] = ()       # every layered file, lowest precedence first
+    log_level: str = "debug"                    # file verbosity; stderr stays at info
+    log_max_bytes: int = 5_000_000              # rotation threshold
+    log_backups: int = 3                        # sci.log.1 … sci.log.3
 ```
 
 Load order: `SIMPLE_CI_CONFIG` (an explicit path; `none`/`off` disables discovery) →
@@ -346,7 +355,7 @@ Env names (minimum set):
 
 | Variable | Default |
 |---|---|
-| `WORKSPACE_ROOT` | the process cwd |
+| `WORKSPACE_ROOT` | the process cwd (an inferred user home directory is refused) |
 | `SIMPLE_CI_CONFIG` | discovery (`none` disables; tests set this) |
 | `INDEX_DB` | `$WORKSPACE_ROOT/.simple-ci/index.db` |
 | `QDRANT_URL` | `http://localhost:6333` |
@@ -362,6 +371,9 @@ Env names (minimum set):
 | `FAISS_PATH` | `$WORKSPACE_ROOT/.simple-ci/vectors.faiss` |
 | `SWEEP_SECONDS` | `45` |
 | `DEBOUNCE_MS` | `400` |
+| `LOG_LEVEL` | `debug` (`debug` \| `info` \| `warning` \| `error` \| `critical`; file only) |
+| `LOG_MAX_BYTES` | `5000000` |
+| `LOG_BACKUPS` | `3` |
 
 ### 7.3 `db.py`
 
@@ -406,22 +418,26 @@ v1 allowlist minimum: `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`, `.py`, `.ts`, `.js`. 
 
 ### 7.7 `indexer.py`
 
-- `index_one_file(path: Path) -> IndexOutcome` — the unit of work (hash short-circuit).
-  Chunks are embedded with `embed.embed_documents(..., title=relative_path)`, so the
-  document prompt and file title stay consistent between indexing and sweep retries.
-- `sweep() -> SweepStats` — retry pending embeddings, then mtime+size then hash candidates.
+- `relative_path(settings, path) -> str | None` — workspace-relative POSIX path.
+- `index_one_file(path: Path, rules: IgnoreRules | None = None) -> IndexOutcome` — the unit
+  of work (hash short-circuit); applies `IGNORE_DIRS` and `.gitignore` before reading bytes.
+- `sweep(rules: IgnoreRules | None = None) -> SweepStats` — retry pending embeddings, then
+  mtime+size then hash candidates; `ignored_dirs`/`ignored_files` count `.gitignore` pruning
+  and land in `LAST_SWEEP_STATS` (read by `get_status`).
+- `iter_workspace_files(settings, rules, stats)` — `os.walk` with `dirnames[:]` pruning.
 - `startup_reconcile()`.
-- Bounded `queue.Queue` consumer; items are paths or tombstones.
+- Bounded `queue.Queue` consumer; items are paths or tombstones; one matcher per writer.
 
 `IndexOutcome` (NamedTuple): `path`, `status` (`indexed|skipped_unchanged|skipped_filtered|error`), `duration_ms`.
 
 ### 7.8 `watcher.py`
 
-- One non-recursive `Observer.schedule(handler, directory, recursive=False)` per interesting directory — a recursive watch over `.venv` blocks registration for seconds; new directories are picked up from directory-created events.
-- `observer.start()` **on a daemon thread** (registration blocks).
+- **One recursive** `Observer.schedule(handler, workspace_root, recursive=True)` — watchdog maps this to a single `ReadDirectoryChangesW(bWatchSubtree=TRUE)` and one emitter thread on Windows. Never go back to one watch per directory: that produced one thread per directory (ISS-7).
+- `observer.schedule()` + `observer.start()` **on a daemon thread**; if the watch fails, log and let the sweep act as the backstop (`watcher_alive=false`).
 - Debounce per path 300–500 ms; on fire enqueue; never index in the callback.
-- Handle `on_created` / `on_modified` / `on_moved` / `on_deleted`.
-- Ignore: `.git`, `.index` (legacy), `.simple-ci`, `__pycache__`, `.venv`, `node_modules`, temp editor names (`*~`, `*.tmp`, `.#*`).
+- Handle `on_created` / `on_modified` / `on_moved` / `on_deleted`; directory events need no extra scheduling (the recursive watch covers new subtrees).
+- Ignore at event time: temp editor names (`*~`, `*.tmp`, `.#*`), `IGNORE_DIRS` components (`.git`, `.index`, `.simple-ci`, `__pycache__`, `.venv`, `node_modules`), and workspace `.gitignore` matches (`ignore.IgnoreRules`).
+- A `.gitignore` created/modified/moved/deleted outside `IGNORE_DIRS` enqueues `SWEEP_REQUEST`, so newly ignored rows are purged and unignored files indexed immediately.
 
 ### 7.9 `server.py` (MCP)
 
@@ -503,19 +519,30 @@ Ambiguous: `found: true` with `matches[]` sorted by path.
   "chunks_indexed": 240,
   "watcher_alive": true,
   "last_sweep": "2026-10-17T20:01:02Z",
-  "qdrant_ok": true,
+  "ignored_dirs": 3,
+  "ignored_files": 12,
+  "vector_store": "faiss",
+  "vector_store_ok": true,
+  "vector_index": "d:/projects/my-app/.simple-ci/vectors.faiss",
   "embed_ok": true,
+  "plugins_loaded": 36,
+  "grammars_ready": 36,
   "workspace": "d:/projects/my-app",
-  "collection": "code_index_my-app_a1b2c3d4_2560",
   "index_db": "d:/projects/my-app/.simple-ci/index.db",
   "config_file": "C:/Users/me/.simple-ci/config.yaml",
-  "services": {"embedding": "running", "qdrant": "started"}
+  "config_files": ["C:/Users/me/.simple-ci/config.yaml"],
+  "log_file": "d:/projects/my-app/.simple-ci/log/sci.log",
+  "log_level": "debug",
+  "services": {"embedding": "running", "qdrant": "not_managed"}
 }
 ```
 
-`workspace` and `collection` are how a live harness's workspace inference is verified.
-`config_file` is `null` when neither config file exists. `services` values are `running`,
-`started`, `unavailable`, or `not_managed`.
+`workspace` is how a live harness's workspace inference is verified (`vector_index` names
+the FAISS file or the derived Qdrant collection). `ignored_dirs`/`ignored_files` are what
+the last sweep pruned via `.gitignore` (0 before the first sweep completes or when none
+match). `config_file` is `null` when no config file exists. `log_file` is `null` when the
+log could not be opened. `services` values are `running`, `started`, `unavailable`, or
+`not_managed`.
 
 ### 8.4 `reindex` (optional, phase 5+)
 
@@ -530,7 +557,7 @@ Ambiguous: `found: true` with `matches[]` sorted by path.
 - Run `uvx --from <repo> simple-code-indexer`; the harness does this for you. `python setup.py`
   writes that entry into each selected harness config. `uv tool install --from <repo>
   simple-code-indexer` once, then the bare command, skips the ~5 s first build.
-- The process inherits the harness cwd as its workspace (`WORKSPACE_ROOT` overrides); it writes `$WORKSPACE_ROOT/.simple-ci/index.db` and exits with the session.
+- The process inherits the harness cwd as its workspace (`WORKSPACE_ROOT` overrides); it writes `$WORKSPACE_ROOT/.simple-ci/index.db` and exits with the session. An inferred workspace that is the user's home directory is refused instead of indexed.
 - Before serving, `services.ensure_managed_services` starts any containers named in
   `embedding.service` / `qdrant.service` and waits for their endpoints (fail-soft).
 - No image for the server itself: `Dockerfile` and `docker-compose.yml` were removed with the Docker topology ([ADR-0008](./adr/0008-host-spawned-cwd-per-repo-collections.md)); the wizard renders `~/.simple-ci/docker/docker-compose.yml` from the packaged template for the backing services, choosing the llama.cpp image for the detected GPU ([ADR-0011](./adr/0011-gpu-compose-global-config-model-prompts.md)).
@@ -589,11 +616,11 @@ configured for that workspace and an OK collections payload. Debug nothing else 
 | Harness cwd ≠ project | `get_status.workspace` reports the resolved workspace; set `WORKSPACE_ROOT` when a harness spawns servers from elsewhere |
 | Cold `uvx` build on first launch | ~5 s once per source change, cached afterwards; `uv tool install` removes even that |
 | Collection switch without re-embed | `ensure_index_identity` wipes the index so the reconcile re-embeds; a manual `.simple-ci/` delete does the same |
-| Observer.start() blocking | Start on daemon thread; keep watched tree small |
+| Observer thread explosion | One recursive root watch (one emitter); never schedule per directory (ISS-7) |
 | Dropped inotify events | Sweep + startup reconcile always on |
 | Multi-writer races | One writer; design out, don't lock harder |
 | Slow network in write path | Local-first; embeddings short timeout + fail soft |
-| Logs in workspace | stderr or gitignored path only |
+| Logs in workspace | stderr + gitignored `<workspace>/.simple-ci/log/sci.log` only |
 
 Exceptions: define a small hierarchy (`IndexerError` → `EmbedError`, `ParseError`, `QdrantUnavailable`) and catch at process boundaries — never bare `except:`.
 

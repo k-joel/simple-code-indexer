@@ -44,7 +44,6 @@ def test_builtin_harnesses_load() -> None:
         "windsurf",
         "vscode",
         "zed",
-        "cline",
         "commandcode",
         "mimo",
     } <= names
@@ -140,6 +139,66 @@ def test_unparseable_json_raises() -> None:
         _json.upsert("{not json", root_key="mcpServers", name=NAME, entry={})
 
 
+def test_json_remove_keeps_unrelated_content_and_prunes_the_root() -> None:
+    existing = (
+        '{"mcpServers": {"other": {"command": "x"}, '
+        '"simple-code-indexer": {"command": "y"}}, "theme": "dark"}'
+    )
+
+    updated = _json.remove(existing, root_key="mcpServers", name=NAME)
+
+    assert updated is not None
+    document = json.loads(updated)
+    assert document == {"mcpServers": {"other": {"command": "x"}}, "theme": "dark"}
+    assert _json.remove(updated, root_key="mcpServers", name=NAME) is None
+
+
+def test_json_remove_prunes_an_emptied_dotted_root() -> None:
+    updated = _json.remove(
+        '{"mcp": {"servers": {"simple-code-indexer": {}}}, "x": 1}',
+        root_key="mcp.servers",
+        name=NAME,
+    )
+
+    assert updated is not None
+    assert json.loads(updated) == {"x": 1}
+
+
+def test_json_remove_of_the_only_entry_is_empty() -> None:
+    assert (
+        _json.remove(
+            '{"mcpServers": {"simple-code-indexer": {}}}',
+            root_key="mcpServers",
+            name=NAME,
+        )
+        == ""
+    )
+
+
+def test_toml_remove_strips_only_the_marker_block() -> None:
+    existing = 'model = "gpt-5"\n\n[other]\nkey = "value"\n'
+    installed = _toml.upsert(existing, name=NAME, command=COMMAND, env={})
+
+    removed = _toml.remove(installed, name=NAME)
+
+    assert removed == existing
+    assert _toml.remove(removed, name=NAME) is None
+
+
+def test_spec_remove_round_trips_upsert() -> None:
+    cursor = _spec("cursor")
+    installed = cursor.render('{"theme": "dark"}', name=NAME, command=COMMAND, env={})
+    removed = cursor.remove(installed, name=NAME)
+    assert removed is not None
+    assert json.loads(removed) == {"theme": "dark"}
+
+    codex = _spec("codex")
+    installed = codex.render('model = "gpt-5"\n', name=NAME, command=COMMAND, env={})
+    removed = codex.remove(installed, name=NAME)
+    assert removed is not None
+    assert tomllib.loads(removed) == {"model": "gpt-5"}
+
+
 def test_toml_block_is_idempotent_and_valid() -> None:
     existing = 'model = "gpt-5"\n\n[other]\nkey = "value"\n'
     once = _toml.upsert(existing, name=NAME, command=COMMAND, env={"A": "b"})
@@ -176,18 +235,6 @@ def test_opencode_entry_shape() -> None:
     assert entry["command"] == COMMAND
     assert entry["environment"] == {"K": "V"}
     assert "enabled" not in entry
-
-
-def test_cline_uses_the_dot_cline_settings_file() -> None:
-    spec = _spec("cline")
-    rendered = spec.render("", name=NAME, command=COMMAND, env={})
-
-    assert spec.global_configs == ("~/.cline/data/settings/cline_mcp_settings.json",)
-    entry = json.loads(rendered)["mcpServers"][NAME]
-    assert entry["command"] == "uvx"
-    assert entry["args"] == ["--from", "/repo", NAME]
-    assert entry["disabled"] is False
-    assert entry["autoApprove"] == []
 
 
 def test_mimo_global_paths_cover_xdg_and_appdata(tmp_path: Path) -> None:

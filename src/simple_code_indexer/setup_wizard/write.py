@@ -1,44 +1,17 @@
-"""Filesystem writes: .gitignore, harness configs, rendered snippets."""
+"""Filesystem writes: harness configs and rendered snippets."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import tomllib
 from pathlib import Path
 
 from simple_code_indexer.harnesses import HarnessSpec
-from simple_code_indexer.setup_wizard.provision import Runner
 
-GITIGNORE_ENTRY = ".simple-ci/"
-
-
-def git_root(cwd: Path, runner: Runner) -> Path | None:
-    result = runner.run(["git", "rev-parse", "--show-toplevel"])
-    if result.returncode == 0 and result.stdout.strip():
-        candidate = Path(result.stdout.strip())
-        if candidate.is_dir():
-            return candidate
-    for parent in (cwd, *cwd.parents):
-        if (parent / ".git").exists():
-            return parent
-    return None
-
-
-def append_gitignore(path: Path, entry: str = GITIGNORE_ENTRY) -> bool:
-    """Append the entry once; False when it is already present."""
-    existing = path.read_text(encoding="utf-8") if path.is_file() else ""
-    if any(line.strip() == entry for line in existing.splitlines()):
-        return False
-    body = existing
-    if body and not body.endswith("\n"):
-        body += "\n"
-    if body:
-        body += "\n"
-    body += f"# simple-code-indexer\n{entry}\n"
-    path.write_text(body, encoding="utf-8", newline="\n")
-    return True
+_BACKUP_STAMP = re.compile(r"\.bak\.\d{8}-\d{6}$")
 
 
 def choose_target(
@@ -82,6 +55,40 @@ def install(
         backup_path = target.with_name(f"{target.name}.bak.{suffix}")
         backup_path.write_text(existing, encoding="utf-8", newline="\n")
     _atomic_write(target, rendered)
+
+
+def remove(spec: HarnessSpec, target: Path, server_name: str) -> bool:
+    """Strip the server entry from `target`; False when it was not there.
+
+    A file left with nothing in it is deleted (the wizard created it).
+    """
+    if not target.is_file():
+        return False
+    existing = target.read_text(encoding="utf-8")
+    rendered = spec.remove(existing, name=server_name)
+    if rendered is None or rendered == existing:
+        return False
+    if not rendered.strip():
+        target.unlink()
+        return True
+    _validate(spec.format, rendered)
+    _atomic_write(target, rendered)
+    return True
+
+
+def remove_backups(target: Path) -> list[Path]:
+    """Delete the `<name>.bak.<YYYYmmdd-HHMMSS>` files `install` created."""
+    removed: list[Path] = []
+    if not target.parent.is_dir():
+        return removed
+    for path in target.parent.glob(target.name + ".bak.*"):
+        if path.is_file() and _BACKUP_STAMP.search(path.name):
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            removed.append(path)
+    return removed
 
 
 def _validate(fmt: str, text: str) -> None:

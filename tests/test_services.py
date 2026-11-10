@@ -42,14 +42,19 @@ class Docker:
             if self.missing:
                 return Result(1, stderr="no such object")
             name = args[-1]
-            return Result(0, stdout=self.statuses.get(name, "running") + "\n")
+            status = self.statuses.get(name)
+            if status is None:
+                return Result(1, stderr="no such object")
+            return Result(0, stdout=status + "\n")
         if args[0] in {"start", "unpause"}:
             self.missing = False
             self.statuses[args[1]] = "running"
         if args[0] == "compose":
+            name = f"simple-ci-{args[-1]}-1"
+            if "ps" in args:
+                return Result(0, stdout=f"{name}\n" if name in self.statuses else "")
             self.missing = False
-            self.statuses["simple-ci-embed"] = "running"
-            self.statuses["simple-ci-qdrant"] = "running"
+            self.statuses[name] = "running"
         return Result(0)
 
     def commands(self) -> list[tuple[str, ...]]:
@@ -196,6 +201,35 @@ def test_missing_container_is_created_with_compose(tmp_path: Path, monkeypatch) 
 
     assert ("compose", "-f", str(compose), "up", "-d", "embed") in docker.commands()
     assert services.LAST_STATE["embedding"] == "started"
+
+
+def test_compose_wait_follows_the_container_compose_created(
+    tmp_path: Path, monkeypatch
+) -> None:
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text("services: {}\n", encoding="utf-8")
+    docker = Docker(info=True)
+    _install_docker(monkeypatch, docker)
+    monkeypatch.setattr(services, "_http_post", lambda *args: True)
+
+    services.ensure_managed_services(
+        _settings(
+            tmp_path,
+            embedding=ManagedService(
+                "stale-embed",
+                compose_file=compose,
+                compose_service="embed",
+            ),
+        )
+    )
+
+    assert services.LAST_STATE["embedding"] == "started"
+    assert (
+        "inspect",
+        "-f",
+        "{{.State.Status}}",
+        "simple-ci-embed-1",
+    ) in docker.commands()
 
 
 def test_missing_container_without_compose_is_unavailable(

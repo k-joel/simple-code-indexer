@@ -46,15 +46,12 @@ def test_install_root_falls_back_to_appdata_under_home(tmp_path: Path) -> None:
     )
 
 
-def test_venv_python_per_platform(tmp_path: Path) -> None:
-    assert (
-        install.venv_python(tmp_path, platform="win32")
-        == tmp_path / ".venv" / "Scripts" / "python.exe"
-    )
-    assert (
-        install.venv_python(tmp_path, platform="linux")
-        == tmp_path / ".venv" / "bin" / "python"
-    )
+def test_target_root_prefers_an_explicit_install_dir(tmp_path: Path) -> None:
+    explicit = tmp_path / "explicit"
+
+    assert install.target_root(
+        home=tmp_path, install_dir=explicit, platform="win32"
+    ) == (explicit.resolve())
 
 
 def test_copy_repo_includes_git_and_excludes_build_state(tmp_path: Path) -> None:
@@ -95,29 +92,19 @@ def test_sync_env_runs_uv_sync_for_the_target(tmp_path: Path) -> None:
     assert install.sync_env(runner, tmp_path, messages.append) is False
 
 
-def test_existing_python_prefers_the_venv(tmp_path: Path) -> None:
-    fallback = tmp_path / "fallback-python"
-    assert (
-        install.existing_python(tmp_path, platform="win32", fallback=fallback)
-        == fallback
-    )
-
-    python = tmp_path / ".venv" / "Scripts" / "python.exe"
-    python.parent.mkdir(parents=True)
-    python.write_text("", encoding="utf-8")
-    assert (
-        install.existing_python(tmp_path, platform="win32", fallback=fallback) == python
-    )
-
-
-def test_server_command_points_at_the_launcher() -> None:
+def test_server_command_launches_through_uv() -> None:
     result = install.InstallResult(
         root=Path("C:/install"),
-        python=Path("C:/install/.venv/Scripts/python.exe"),
         launcher=Path("C:/install/run_server.py"),
+        uv="/uv",
     )
 
     assert result.server_command == [
-        str(Path("C:/install/.venv/Scripts/python.exe")),
+        "/uv",
+        "run",
+        "--project",
+        str(Path("C:/install")),
+        "--no-sync",
+        "python",
         str(Path("C:/install/run_server.py")),
     ]

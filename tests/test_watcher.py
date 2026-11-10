@@ -60,6 +60,9 @@ def test_watcher_indexes_file_on_save(tmp_path: Path) -> None:
     observer = watcher.start_watcher(settings, work_queue)
     try:
         assert watcher.wait_until_ready(timeout=5.0)
+        # ISS-7 regression guard: one watch => one emitter thread, not one per dir.
+        assert len(observer.emitters) == 1
+        assert next(iter(observer.emitters)).watch.is_recursive
         fresh = tmp_path / "fresh_symbol.cpp"
         fresh.write_text("int fresh_symbol_xyzzy() { return 1; }\n", encoding="utf-8")
         found = _wait_for(
@@ -86,7 +89,7 @@ def test_watcher_indexes_file_on_save(tmp_path: Path) -> None:
 def test_debounce_collapses_event_burst(tmp_path: Path) -> None:
     settings = _settings(tmp_path, debounce_ms=150)
     work_queue: indexer.WorkQueue = indexer.new_work_queue()
-    handler = watcher.build_handler(settings, work_queue, lambda _path: None)
+    handler = watcher.build_handler(settings, work_queue)
     path = str(tmp_path / "burst.cpp")
     from watchdog.events import FileModifiedEvent
 
@@ -102,7 +105,7 @@ def test_debounce_collapses_event_burst(tmp_path: Path) -> None:
 def test_ignored_and_temp_events_are_dropped(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     work_queue: indexer.WorkQueue = indexer.new_work_queue()
-    handler = watcher.build_handler(settings, work_queue, lambda _path: None)
+    handler = watcher.build_handler(settings, work_queue)
     from watchdog.events import FileCreatedEvent, FileModifiedEvent
 
     handler.on_created(FileCreatedEvent(str(tmp_path / "notes.md")))
@@ -111,6 +114,31 @@ def test_ignored_and_temp_events_are_dropped(tmp_path: Path) -> None:
     handler.on_modified(FileModifiedEvent(str(tmp_path / ".venv" / "x.py")))
     time.sleep(0.3)
     assert work_queue.empty()
+
+
+def test_gitignored_events_are_dropped(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text("artifacts/\n", encoding="utf-8")
+    (tmp_path / "artifacts").mkdir()
+    settings = _settings(tmp_path)
+    work_queue: indexer.WorkQueue = indexer.new_work_queue()
+    handler = watcher.build_handler(settings, work_queue)
+    from watchdog.events import FileCreatedEvent
+
+    handler.on_created(FileCreatedEvent(str(tmp_path / "artifacts" / "probe.py")))
+    time.sleep(0.3)
+    assert work_queue.empty()
+
+
+def test_gitignore_change_enqueues_sweep(tmp_path: Path) -> None:
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text("artifacts/\n", encoding="utf-8")
+    settings = _settings(tmp_path)
+    work_queue: indexer.WorkQueue = indexer.new_work_queue()
+    handler = watcher.build_handler(settings, work_queue)
+    from watchdog.events import FileModifiedEvent
+
+    handler.on_modified(FileModifiedEvent(str(gitignore)))
+    assert work_queue.get_nowait() is indexer.SWEEP_REQUEST
 
 
 def _symbol_in_index(settings: Settings, name: str) -> bool:

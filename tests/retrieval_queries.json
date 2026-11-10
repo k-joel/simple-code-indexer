@@ -62,9 +62,9 @@
       "tags": ["plugins"]
     },
     {
-      "id": "q11-cline-path",
-      "query": "where is the Cline MCP settings file written",
-      "expected_files": ["src/simple_code_indexer/harnesses/cline.py", "src/simple_code_indexer/setup_wizard/write.py"],
+      "id": "q11-opencode-path",
+      "query": "where is the OpenCode MCP settings file written",
+      "expected_files": ["src/simple_code_indexer/harnesses/opencode.py", "src/simple_code_indexer/setup_wizard/write.py"],
       "tags": ["harnesses", "setup"]
     },
     {
@@ -140,8 +140,8 @@
       "tags": ["faiss", "db"]
     },
     {
-      "id": "q24-nonrecursive-watch",
-      "query": "how does the watcher register non-recursive directory watches",
+      "id": "q24-recursive-root-watch",
+      "query": "how does the watcher use one recursive watch on the workspace root instead of per-directory watches",
       "expected_files": ["src/simple_code_indexer/watcher.py"],
       "tags": ["watcher"]
     },
@@ -240,6 +240,12 @@
       "query": "how is the global config written atomically with restricted permissions",
       "expected_files": ["src/simple_code_indexer/configfile.py", "src/simple_code_indexer/setup_wizard/__init__.py"],
       "tags": ["config", "setup"]
+    },
+    {
+      "id": "q41-gitignore",
+      "query": "how are .gitignore files parsed and applied when walking and watching the workspace",
+      "expected_files": ["src/simple_code_indexer/ignore.py", "src/simple_code_indexer/indexer.py", "src/simple_code_indexer/watcher.py"],
+      "tags": ["indexer", "watcher"]
     }
   ]
 }

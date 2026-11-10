@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx
 
-from simple_code_indexer.config import ManagedService, Settings
+from simple_code_indexer.config import ManagedService, Settings, ipv4_loopback
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +40,20 @@ _sleep = time.sleep
 
 def ensure_managed_services(settings: Settings) -> None:
     """Ensure configured containers are up and answering, then record the state."""
+    started = _clock()
     services = [("embedding", settings.embedding_service)]
     if settings.vector_store == "qdrant":
         services.append(("qdrant", settings.qdrant_service))
     else:
         # FAISS needs no server; an old qdrant.service block must not start Docker.
         LAST_STATE["qdrant"] = "not_managed"
+    logger.info(
+        "managed services: %s",
+        ", ".join(
+            f"{kind}={service.container if service is not None else 'not_managed'}"
+            for kind, service in services
+        ),
+    )
     for kind, service in services:
         if service is None:
             LAST_STATE[kind] = "not_managed"
@@ -54,6 +62,11 @@ def ensure_managed_services(settings: Settings) -> None:
             state = _ensure_container(service)
             if state is None:
                 LAST_STATE[kind] = "unavailable"
+                logger.error(
+                    "managed %s service %s is unavailable",
+                    kind,
+                    service.container,
+                )
                 continue
             if _wait_ready(kind, settings, service.startup_timeout_s):
                 LAST_STATE[kind] = state
@@ -70,6 +83,11 @@ def ensure_managed_services(settings: Settings) -> None:
         except Exception:
             logger.exception("managed %s service failed", kind)
             LAST_STATE[kind] = "unavailable"
+    logger.info(
+        "managed services settled in %d ms: %s",
+        int((_clock() - started) * 1000),
+        dict(LAST_STATE),
+    )
 
 
 def _ensure_container(service: ManagedService) -> str | None:
@@ -77,13 +95,21 @@ def _ensure_container(service: ManagedService) -> str | None:
     if not _docker_available():
         return None
     ok, status = _docker_output("inspect", "-f", "{{.State.Status}}", service.container)
+    logger.debug("container %s inspect: ok=%s status=%r", service.container, ok, status)
     if not ok:
         logger.warning(
             "container %s not found; trying its compose service", service.container
         )
         if not _compose_up(service):
             return None
-        return "started" if _wait_container(service.container) else None
+        container = _compose_container_name(service)
+        if container != service.container:
+            logger.info(
+                "compose created %s for the configured container %s",
+                container,
+                service.container,
+            )
+        return "started" if _wait_container(container) else None
     if status == "running":
         logger.info("managed container %s is already running", service.container)
         return "running"
@@ -189,6 +215,32 @@ def _compose_up(service: ManagedService) -> bool:
     )
 
 
+def _compose_container_name(service: ManagedService) -> str:
+    """The container compose actually created for the service.
+
+    `service.container` may be stale (e.g. written by an older wizard), while
+    compose names its containers `<project>-<service>-<n>` and reuses an
+    existing container with that name. Ask compose which one it created.
+    """
+    if service.compose_file is not None and service.compose_service is not None:
+        ok, output = _docker_output(
+            "compose",
+            "-f",
+            str(service.compose_file),
+            "ps",
+            "-a",
+            "--format",
+            "{{.Name}}",
+            service.compose_service,
+        )
+        if ok:
+            for line in output.splitlines():
+                name = line.strip()
+                if name:
+                    return name
+    return service.container
+
+
 def _wait_container(container: str, timeout: float = _CONTAINER_WAIT_S) -> bool:
     deadline = _clock() + timeout
     while _clock() < deadline:
@@ -201,23 +253,28 @@ def _wait_container(container: str, timeout: float = _CONTAINER_WAIT_S) -> bool:
 
 def _wait_ready(kind: str, settings: Settings, timeout_s: float) -> bool:
     logger.info("waiting up to %.0fs for the managed %s service", timeout_s, kind)
-    deadline = _clock() + timeout_s
+    started = _clock()
+    deadline = started + timeout_s
     while _clock() < deadline:
         if _probe(kind, settings):
+            logger.debug(
+                "managed %s service ready after %.0fs", kind, _clock() - started
+            )
             return True
         _sleep(_POLL_S)
+    logger.debug("managed %s service did not answer within %.0fs", kind, timeout_s)
     return False
 
 
 def _probe(kind: str, settings: Settings) -> bool:
     if kind == "qdrant":
-        base = settings.qdrant_url.rstrip("/")
+        base = ipv4_loopback(settings.qdrant_url.rstrip("/"))
         return _http_get(base + "/healthz", _PROBE_TIMEOUT_S) or _http_get(
             base + "/collections", _PROBE_TIMEOUT_S
         )
     headers = _embed_headers(settings)
     return _http_post(
-        settings.embed_base_url.rstrip("/") + "/v1/embeddings",
+        ipv4_loopback(settings.embed_base_url.rstrip("/") + "/v1/embeddings"),
         {"model": settings.embed_model, "input": ["ping"]},
         headers,
         _PROBE_TIMEOUT_S,
@@ -233,7 +290,8 @@ def _embed_headers(settings: Settings) -> dict[str, str]:
 def _http_get(url: str, timeout: float) -> bool:
     try:
         response = httpx.get(url, timeout=httpx.Timeout(timeout, connect=1.0))
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
+        logger.debug("probe GET %s failed: %s", url, exc)
         return False
     return response.status_code < 500
 
@@ -248,6 +306,7 @@ def _http_post(
             headers=headers,
             timeout=httpx.Timeout(timeout, connect=1.0),
         )
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
+        logger.debug("probe POST %s failed: %s", url, exc)
         return False
     return response.status_code < 500

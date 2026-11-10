@@ -197,11 +197,15 @@ def prefetch_grammars(registry: PluginRegistry | None = None) -> None:
     from simple_code_indexer import parse
 
     reg = registry if registry is not None else get_registry()
-    for grammar in reg.grammars():
+    grammars = reg.grammars()
+    loaded = 0
+    for grammar in grammars:
         try:
             parse._parser(grammar)
+            loaded += 1
         except Exception:
             logger.warning("grammar prefetch failed for %r", grammar, exc_info=True)
+    logger.info("grammar prefetch: %d/%d grammar(s) ready", loaded, len(grammars))
 
 
 def start_prefetch_thread() -> threading.Thread | None:

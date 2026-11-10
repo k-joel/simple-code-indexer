@@ -98,7 +98,7 @@ class Prompter:
                     choices=choices,
                     default=choices[default],
                     use_search_filter=search,
-                    use_jk_keys=True,
+                    use_jk_keys=not search,
                     instruction=instruction,
                 )
                 .ask()

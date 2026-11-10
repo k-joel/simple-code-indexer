@@ -7,10 +7,13 @@ and `embedding.document_prefix`), so EmbeddingGemma 2 sees its
 query-side ``Instruct: ...`` line. `embed_texts` stays raw for service probes.
 
 
-Environment fact: this llama.cpp instance has physical batch size 512, so any
-single input over ~512 tokens is rejected with HTTP 500. Texts are therefore
-split to a safe character budget and their piece vectors mean-pooled — one
-vector per original text.
+Environment fact: llama.cpp rejects a single input larger than its physical
+batch (``n_ubatch``, 512 by default), so texts are split to a safe character
+budget and their piece vectors mean-pooled — one vector per original text.
+
+Loopback URLs are rewritten to 127.0.0.1: on Windows ``localhost`` resolves to
+``::1`` first while Docker publishes IPv4 only, so every request would stall
+on the dead IPv6 attempt before retrying.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import time
 
 import httpx
 
-from simple_code_indexer.config import Settings
+from simple_code_indexer.config import Settings, ipv4_loopback
 from simple_code_indexer.errors import EmbedError
 
 logger = logging.getLogger(__name__)
@@ -58,6 +61,7 @@ def embed_texts(settings: Settings, texts: list[str]) -> list[list[float]]:
     global LAST_OK
     if not texts:
         return []
+    started = time.perf_counter()
     groups = [_split_for_limit(text) for text in texts]
     flat = [piece for group in groups for piece in group]
     vectors = _post_embeddings(settings, flat)
@@ -70,22 +74,33 @@ def embed_texts(settings: Settings, texts: list[str]) -> list[list[float]]:
             pooled.append(group_vectors[0])
         else:
             pooled.append([sum(values) / len(values) for values in zip(*group_vectors)])
+    was_ok = LAST_OK
     LAST_OK = True
+    logger.debug(
+        "embedded %d text(s) as %d piece(s) in %d ms",
+        len(texts),
+        len(flat),
+        int((time.perf_counter() - started) * 1000),
+    )
+    if was_ok is False:
+        logger.info("embedding endpoint recovered (%s)", settings.embed_base_url)
     return pooled
 
 
 def _post_embeddings(settings: Settings, texts: list[str]) -> list[list[float]]:
     """POST {base}/v1/embeddings with retries; validates count and dim."""
     global LAST_OK
-    url = settings.embed_base_url.rstrip("/") + "/v1/embeddings"
+    url = ipv4_loopback(settings.embed_base_url.rstrip("/") + "/v1/embeddings")
     payload = {"model": settings.embed_model, "input": texts}
     headers = (
         {"Authorization": f"Bearer {settings.embed_api_key}"}
         if settings.embed_api_key
         else {}
     )
+    was_ok = LAST_OK
     error: Exception | None = None
     for attempt in range(_ATTEMPTS):
+        attempt_started = time.perf_counter()
         try:
             # connect=1.0: fail fast when the endpoint is down; the full
             # timeout still covers real batch embedding latency.
@@ -106,6 +121,11 @@ def _post_embeddings(settings: Settings, texts: list[str]) -> list[list[float]]:
                     f"dimension mismatch: expected {settings.embed_dim}, "
                     f"got {len(vectors[0])}"
                 )
+            logger.debug(
+                "embed request ok: %d vector(s) in %d ms",
+                len(vectors),
+                int((time.perf_counter() - attempt_started) * 1000),
+            )
             return vectors
         except (
             EmbedError,
@@ -120,6 +140,13 @@ def _post_embeddings(settings: Settings, texts: list[str]) -> list[list[float]]:
             if attempt + 1 < _ATTEMPTS:
                 time.sleep(0.25 * (attempt + 1))
     LAST_OK = False
+    if was_ok is not False:
+        logger.warning(
+            "embedding endpoint failing: %s (%d attempt(s) to %s)",
+            error,
+            _ATTEMPTS,
+            url,
+        )
     raise EmbedError(f"embedding failed after {_ATTEMPTS} attempts: {url}") from error
 
 

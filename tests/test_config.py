@@ -7,6 +7,7 @@ import pytest
 from simple_code_indexer.config import (
     derive_collection_name,
     faiss_index_path,
+    ipv4_loopback,
     load_settings,
     normalize_workspace_path,
 )
@@ -14,6 +15,14 @@ from simple_code_indexer.errors import ConfigError
 
 # Qdrant rejects anything outside this charset (plan §2).
 COLLECTION_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def test_ipv4_loopback_rewrites_only_loopback_hosts() -> None:
+    assert ipv4_loopback("http://localhost:8080") == "http://127.0.0.1:8080"
+    assert ipv4_loopback("http://localhost/v1/models") == "http://127.0.0.1/v1/models"
+    assert ipv4_loopback("http://[::1]:8080") == "http://127.0.0.1:8080"
+    assert ipv4_loopback("http://127.0.0.1:8080") == "http://127.0.0.1:8080"
+    assert ipv4_loopback("http://embed.test:9000") == "http://embed.test:9000"
 
 
 def test_defaults_come_from_the_process_cwd(monkeypatch) -> None:
@@ -26,6 +35,9 @@ def test_defaults_come_from_the_process_cwd(monkeypatch) -> None:
         "EMBED_DIM",
         "VECTOR_STORE",
         "FAISS_PATH",
+        "LOG_LEVEL",
+        "LOG_MAX_BYTES",
+        "LOG_BACKUPS",
     ):
         monkeypatch.delenv(name, raising=False)
     cwd = Path.cwd().resolve()
@@ -45,11 +57,37 @@ def test_defaults_come_from_the_process_cwd(monkeypatch) -> None:
     assert settings.config_source is None
     assert settings.sweep_seconds == 45.0
     assert settings.debounce_ms == 400
+    assert settings.log_level == "debug"
+    assert settings.log_max_bytes == 5_000_000
+    assert settings.log_backups == 3
     assert settings.qdrant_collection.startswith("code_index_")
     assert settings.qdrant_collection.endswith("_2560")
     assert COLLECTION_RE.fullmatch(settings.qdrant_collection)
     assert ".cpp" in settings.allowed_exts
     assert ".git" in settings.ignore_dirs
+
+
+def test_inferred_home_workspace_is_refused(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.chdir(home)
+    with pytest.raises(ConfigError, match="user home directory"):
+        load_settings()
+
+
+def test_explicit_workspace_root_may_be_the_home_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("WORKSPACE_ROOT", str(home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.chdir(home)
+    settings = load_settings()
+    assert settings.workspace_root == home.resolve()
+    assert settings.index_db_path == home.resolve() / ".simple-ci" / "index.db"
 
 
 def test_env_overrides(monkeypatch) -> None:
@@ -211,3 +249,43 @@ def test_absolute_faiss_path_is_kept(tmp_path: Path, monkeypatch) -> None:
     other = (tmp_path / "elsewhere" / "index.faiss").resolve()
     _config(tmp_path, monkeypatch, f"faiss:\n  path: {other}\n")
     assert load_settings().faiss_path == other
+
+
+def test_log_section_values_reach_the_settings(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    monkeypatch.delenv("LOG_MAX_BYTES", raising=False)
+    monkeypatch.delenv("LOG_BACKUPS", raising=False)
+    _config(
+        tmp_path,
+        monkeypatch,
+        "log:\n  level: warning\n  max_bytes: 1234\n  backups: 2\n",
+    )
+    settings = load_settings()
+    assert settings.log_level == "warning"
+    assert settings.log_max_bytes == 1234
+    assert settings.log_backups == 2
+
+
+def test_log_env_overrides_the_file_and_normalizes_case(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _config(tmp_path, monkeypatch, "log:\n  level: warning\n")
+    monkeypatch.setenv("LOG_LEVEL", "INFO")
+    monkeypatch.setenv("LOG_MAX_BYTES", "2048")
+    monkeypatch.setenv("LOG_BACKUPS", "1")
+    settings = load_settings()
+    assert settings.log_level == "info"
+    assert settings.log_max_bytes == 2048
+    assert settings.log_backups == 1
+
+
+def test_invalid_log_levels_raise(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    _config(tmp_path, monkeypatch, "log:\n  level: loud\n")
+    with pytest.raises(ConfigError, match="log.level"):
+        load_settings()
+
+    _config(tmp_path, monkeypatch, "log:\n  level: debug\n")
+    monkeypatch.setenv("LOG_LEVEL", "verbose")
+    with pytest.raises(ConfigError, match="LOG_LEVEL"):
+        load_settings()

@@ -3,16 +3,25 @@
 ## Project Overview
 
 Minimal **code-index MCP server** (Python): watch files, index on save into **SQLite/FTS5** (lexical) + **FAISS** (semantic vectors, default) or **Qdrant** (opt-in).
+See [README.md](README.md) for the detailed overview.
+
+## Project Folders
+This project has four dedicated folders for non-production files. Pick the right one based on purpose:
+
+- [docs/](docs/) — Project documentation: the issue tracker, changelog, benchmarks, and tools inventory.
+- [ref-docs/](agent-docs/) — All reference documentation: research docs, best-practices guides, and instruction manuals.
+- [artifacts/](artifacts/) — All intermediate/throwaway artifact files (markdown, test files, scratch outputs, etc.) that aren't production code.
+- [tools/](tools/) — All internal scripts and tools used to support development (e.g. formatting, analysis, build helpers).
 
 ## Project Docs
 
 Read the relevant doc before planning or reporting work:
-- @ISSUES.md — the ongoing issue tracker. **Add every issue, bug or defect flagged during an LLM session here — even if it is only mentioned in passing in the summary — and delete the entry once it is fixed.** 
-- @NOTES.md — gotchas, watch-outs and oddities. **Add anything a future session needs to know that is not an open issue here.**
-
-## Generated Files
-
-- @/artifacts/ — All intermediate/throwaway artifact files (markdown, test files, scratch outputs, etc.) that aren't production code.
+- [docs/ISSUES.md](docs/ISSUES.md) — the ongoing issue tracker. **Add every issue, bug or defect flagged during an LLM session here — even if it is only mentioned in passing in the summary — and delete the entry once it is fixed.**
+- [docs/ARCH_ISSUES.md](docs/ARCH_ISSUES.md) — architectural debt and code smells. **Add every structural anti-pattern, code duplication, or AI-induced code smell spotted during a session here, and delete the entry once refactored.**
+- [docs/NOTES.md](docs/NOTES.md) — gotchas, watch-outs and oddities. **Add anything a future session needs to know that is not an open issue here.**
+- [docs/CHANGELOG.md](docs/CHANGELOG.md) — the user-facing, curated history of notable changes. **It must be updated after every agent session**; follow [ref-docs/changelog-best-practices.md](agent-docs/changelog-best-practices.md).
+- [docs/TOOLS.md](docs/TOOLS.md) — the inventory of development scripts in [tools/](tools/). **Check it before writing any new tool, and update it whenever a tool is created or modified.**
+- [docs/HANDOFF.md](docs/HANDOFF.md) — active session context and state. **Update with incomplete work, pending multi-step tasks, and exact next steps at the end of every session, and delete entries once the work is fully completed.**
 
 ## Toolchain (verified)
 
@@ -28,6 +37,9 @@ uv sync
 python setup.py                  # interactive wizard (questionary; installs uv if missing)
 python setup.py --dry-run        # print actions without touching files/containers
 python setup.py --yes --install-dir "$env:TEMP\sci-install"   # non-interactive
+python setup.py --uninstall --dry-run   # show what an uninstall would remove
+python setup.py --uninstall --yes       # remove install copy, config, services, models, MCP entries
+python setup.py --uninstall --keep-models   # same, but keep ~/.simple-ci/model/
 uv run ruff check .              # lint
 uv run ruff format .             # format
 uv run pyright                   # typecheck
@@ -71,7 +83,10 @@ Host-spawned MCP process (no container in this repo — [ADR-0008](docs/adr/0008
 | Qdrant (opt-in) | `http://localhost:6333` (no auth) — one derived collection per workspace |
 | Workspace | the MCP process cwd (`WORKSPACE_ROOT` overrides); index at `$WORKSPACE_ROOT/.simple-ci/index.db` |
 | Config | `~/.simple-ci/config.yaml` only (global); project-local configs are migrated by the wizard and never read; env vars win (`SIMPLE_CI_CONFIG=none` disables discovery) |
-| Install | `%APPDATA%\simple-code-indexer` (Windows), `~/Library/Application Support/...` (macOS), `$XDG_DATA_HOME/...` (Linux); harness entries run its `.venv` Python + `run_server.py` |
+| Logs | `<workspace>/.simple-ci/log/sci.log` (DEBUG, rotated 5 MB × 3; `log.level` / `LOG_LEVEL` controls the file) plus the INFO summary on stderr; stdout stays pure MCP |
+| Lifecycle | the server exits with its stdio session and when a launch-chain ancestor dies (`parent_watch.py`, uv launcher and venv trampoline included; `SIMPLE_CI_PARENT_WATCH=0` disables). A harness service started outside the UI (detached) has no UI ancestor and is not visible; the desktop-UI-started OpenCode service is covered |
+| Install | `%APPDATA%\simple-code-indexer` (Windows), `~/Library/Application Support/...` (macOS), `$XDG_DATA_HOME/...` (Linux); harness entries run `uv run --project <install> --no-sync python run_server.py` |
+| Install record | `setup.install_root` + `setup.harnesses` in `~/.simple-ci/config.yaml`; used by re-runs to remove deselected entries and by `--uninstall` |
 
 Config comes from the YAML file first, then env (e.g. `VECTOR_STORE`, `FAISS_PATH`,
 `QDRANT_URL`, `EMBED_BASE_URL`, `EMBED_API_KEY`) — never hardcode secrets or local URLs in
@@ -87,4 +102,5 @@ Probe the services with `uv run python tests/service_probe.py` before a live-mod
 - MCP config for the harness lives in `.mimocode/mimocode.json` (gitignored); changes need a session restart to reload. It points at the installed `run_server.py`, which pulls the repo and runs the server in the harness cwd. `python setup.py` writes the same entry for other harnesses (global scope, no per-location prompt).
 - Harness support is a plugin folder (`src/simple_code_indexer/harnesses/`); bad plugins are skipped, never fatal, and user drop-ins override builtins by `NAME`.
 - Tests must set `SIMPLE_CI_CONFIG=none` (the autouse fixture in `tests/conftest.py` does this) so a developer's global config cannot change defaults.
+- The watchdog path finalizes by hand and calls `os._exit(0)`: `stdio_server`'s stdin reader blocks in a non-cancellable worker thread, so returning from the serve loop would hang on the open pipe. Keep the vector flush + lock release before the exit.
 - No migrations/codegen tool yet — note them here when added.

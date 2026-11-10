@@ -12,6 +12,7 @@ Contract (same as `builtin/` language plugins — plain module globals):
     ROOT_KEY        JSON root key ("mcpServers", "servers", "mcp", ...)
     entry(...)      optional: build the per-harness server entry
     render(...)     optional: full override for merging into existing text
+    remove(...)     optional: strip the server entry (None = nothing to remove)
 
 Search order (later wins): builtin package → ``<repo>/harnesses`` →
 ``<workspace>/harnesses``. A user plugin overrides a builtin by NAME; bad
@@ -38,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 EntryFn = Callable[[list[str], dict[str, str]], dict[str, Any]]
 RenderFn = Callable[..., str]
+RemoveFn = Callable[..., str | None]
 
 _which = shutil.which
 _UNRESOLVED_VAR = re.compile(r"%[^%]+%")
@@ -54,6 +56,7 @@ class HarnessSpec:
     format: str
     entry: EntryFn
     render: RenderFn
+    remove: RemoveFn
 
     def detected(self, home: Path | None = None) -> bool:
         """True when one of the harness's home folders or binaries exists."""
@@ -190,6 +193,10 @@ def _spec_from_module(module: ModuleType, path: Path) -> HarnessSpec | None:
     if render is not None and not callable(render):
         logger.warning("harness plugin %s render must be callable", path)
         return None
+    remove = getattr(module, "remove", None)
+    if remove is not None and not callable(remove):
+        logger.warning("harness plugin %s remove must be callable", path)
+        return None
     entry = getattr(module, "entry", None)
     if entry is not None and not callable(entry):
         logger.warning("harness plugin %s entry must be callable", path)
@@ -205,6 +212,11 @@ def _spec_from_module(module: ModuleType, path: Path) -> HarnessSpec | None:
             if render is not None
             else _build_render(module, path, fmt)
         )
+        resolved_remove = (
+            cast(RemoveFn, remove)
+            if remove is not None
+            else _build_remove(module, path, fmt)
+        )
     except ValueError as exc:
         logger.warning("harness plugin %s: %s", path, exc)
         return None
@@ -218,6 +230,7 @@ def _spec_from_module(module: ModuleType, path: Path) -> HarnessSpec | None:
         format=fmt,
         entry=resolved_entry,
         render=resolved_render,
+        remove=resolved_remove,
     )
 
 
@@ -236,6 +249,17 @@ def _build_render(module: ModuleType, path: Path, fmt: str) -> RenderFn:
         root_key=root_key,
         name=name,
         entry=entry_fn(command, env),
+    )
+
+
+def _build_remove(module: ModuleType, path: Path, fmt: str) -> RemoveFn:
+    if fmt == "toml":
+        return lambda existing, *, name: _toml.remove(existing, name=name)
+    root_key = getattr(module, "ROOT_KEY", None)
+    if not isinstance(root_key, str) or not root_key:
+        raise ValueError("ROOT_KEY is required for JSON harness plugins")
+    return lambda existing, *, name: _json.remove(
+        existing, root_key=root_key, name=name
     )
 
 

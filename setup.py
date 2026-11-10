@@ -32,6 +32,11 @@ Usage: python setup.py [--dry-run] [--yes] [--model KEY] [--model-url URL]
                        [--install-dir PATH] [--no-install] [--config PATH]
                        [--gpu auto|nvidia|amd|intel|cpu]
 
+       python setup.py --install-only [--install-dir PATH] [--dry-run]
+
+       python setup.py --uninstall [--keep-models] [--dry-run] [--yes]
+                       [--install-dir PATH] [--config PATH]
+
   --dry-run        show every action without writing files or starting containers
   --yes            accept the recommended default for every prompt
   --model          download this embedding model without asking
@@ -43,11 +48,20 @@ Usage: python setup.py [--dry-run] [--yes] [--model KEY] [--model-url URL]
   --config-mode    answer the existing-global-config prompt
   --harnesses      'all', 'none', or a comma-separated list
   --install-dir    override the per-user install directory
+  --install-only   copy this checkout to the per-user install directory and
+                   exit; no config, services, harness entries, or uv sync of
+                   the copy
   --no-install     point harness entries at this checkout
   --config         write one explicit config file (advanced/testing)
   --gpu            override GPU detection for the container image
 
-Configuration is always global: ~/.simple-ci/config.yaml.
+  --uninstall      remove the per-user install copy, ~/.simple-ci/config.yaml,
+                   the docker assets + compose services, the model cache, and
+                   the MCP entries recorded under setup.harnesses
+  --keep-models    with --uninstall: keep ~/.simple-ci/model/ (downloaded GGUFs)
+
+Configuration is always global: ~/.simple-ci/config.yaml. Uninstall never
+touches a workspace's .simple-ci/ index.
 """
 
 

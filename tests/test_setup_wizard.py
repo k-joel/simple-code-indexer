@@ -11,7 +11,7 @@ import yaml
 
 from simple_code_indexer import configfile, model_prompts
 from simple_code_indexer import harnesses as harnesses_pkg
-from simple_code_indexer.config import load_settings
+from simple_code_indexer.config import ipv4_loopback, load_settings
 from simple_code_indexer.harnesses import load_harnesses
 from simple_code_indexer.setup_wizard import (
     SetupAborted,
@@ -45,6 +45,7 @@ class ScriptedPrompter(Prompter):
         self._texts = list(texts)
         self._multis = list(multis)
         self.messages: list[str] = []
+        self.menus: list[list[str]] = []
 
     def say(self, message: str = "") -> None:
         self.messages.append(message)
@@ -61,6 +62,7 @@ class ScriptedPrompter(Prompter):
         search: bool = False,
         instruction: str | None = None,
     ) -> int:
+        self.menus.append(list(options))
         return self._choices.pop(0) if self._choices else default
 
     def ask_text(
@@ -127,7 +129,11 @@ class FakeHttp(Http):
     ) -> None:
         self.dim = dim
         self.qdrant = qdrant
-        self.models_by_url = models_by_url or {}
+        # probe rewrites loopback URLs to 127.0.0.1; keys are normalised the
+        # same way so tests can keep spelling them "localhost".
+        self.models_by_url = {
+            ipv4_loopback(url): models for url, models in (models_by_url or {}).items()
+        }
         self.urls: list[str] = []
 
     def get_json(
@@ -138,7 +144,7 @@ class FakeHttp(Http):
     ) -> Any | None:
         self.urls.append(url)
         if url.endswith("/v1/models"):
-            base = url[: -len("/v1/models")]
+            base = ipv4_loopback(url[: -len("/v1/models")])
             return {
                 "data": [{"id": model} for model in self.models_by_url.get(base, [])]
             }
@@ -159,11 +165,11 @@ class FakeHttp(Http):
 
 def _workspace(tmp_path: Path) -> tuple[Path, Path, Path]:
     project = tmp_path / "project"
-    project.mkdir()
+    project.mkdir(exist_ok=True)
     home = tmp_path / "home"
-    home.mkdir()
+    home.mkdir(exist_ok=True)
     repo = tmp_path / "repo"
-    repo.mkdir()
+    repo.mkdir(exist_ok=True)
     (repo / "run_server.py").write_text("# launcher\n", encoding="utf-8")
     return project, home, repo
 
@@ -198,7 +204,11 @@ def _docker_runner(
     inspect: str = "running\n",
 ) -> FakeRunner:
     return FakeRunner(
-        which_map={"docker": "/usr/bin/docker", "uvx": "/usr/bin/uvx"},
+        which_map={
+            "docker": "/usr/bin/docker",
+            "uv": "/usr/bin/uv",
+            "uvx": "/usr/bin/uvx",
+        },
         results={
             ("docker", "info"): CommandResult(0),
             ("docker", "ps"): CommandResult(0, stdout=containers),
@@ -227,7 +237,7 @@ def test_existing_endpoint_writes_one_global_config(
     tmp_path: Path, monkeypatch
 ) -> None:
     prompts = ScriptedPrompter(
-        choices=[1, 1, 1],
+        choices=[2, 1, 1],
         texts=[EMBED_URL, "", "my-model", QDRANT_URL],
     )
     wizard, project, home = _wizard(tmp_path, prompts=prompts)
@@ -257,7 +267,7 @@ def test_existing_endpoint_writes_one_global_config(
 
 
 def test_cancel_at_embedding_choice_aborts_without_writing(tmp_path: Path) -> None:
-    prompts = ScriptedPrompter(choices=[2])
+    prompts = ScriptedPrompter(choices=[3])
     wizard, project, home = _wizard(tmp_path, prompts=prompts)
 
     assert wizard.run() == 1
@@ -275,7 +285,7 @@ def test_auto_download_writes_compose_and_services(tmp_path: Path, monkeypatch) 
         "download_model",
         lambda url, destination, **kwargs: downloaded.append((url, destination)),
     )
-    prompts = ScriptedPrompter(choices=[0, 1, 1, 0])
+    prompts = ScriptedPrompter(choices=[1, 1, 1, 0])
     runner = _docker_runner()
     wizard, project, home = _wizard(tmp_path, prompts=prompts, runner=runner)
 
@@ -289,7 +299,9 @@ def test_auto_download_writes_compose_and_services(tmp_path: Path, monkeypatch) 
     )
     assert "LLAMA_ARG_ALIAS=Qwen3-Embedding-0.6B" in embed["environment"]
     assert "LLAMA_ARG_POOLING=last" in embed["environment"]
-    assert "LLAMA_ARG_CTX_SIZE=32768" in embed["environment"]
+    assert "LLAMA_ARG_CTX_SIZE=8192" in embed["environment"]
+    assert "LLAMA_ARG_BATCH=2048" in embed["environment"]
+    assert "LLAMA_ARG_UBATCH=2048" in embed["environment"]
     assert not any("N_GPU_LAYERS" in item for item in embed["environment"])
     assert embed["volumes"] == ["../model:/models:ro"]
     assert "deploy" not in embed
@@ -353,7 +365,7 @@ def test_auto_download_gemma_on_nvidia_writes_prompts_and_devices(
         "download_model",
         lambda url, destination, **kwargs: downloaded.append((url, destination)),
     )
-    prompts = ScriptedPrompter(choices=[0, 0, 0])
+    prompts = ScriptedPrompter(choices=[1, 0, 0])
     runner = FakeRunner(
         which_map={
             "docker": "/usr/bin/docker",
@@ -476,7 +488,7 @@ def test_nvidia_init_failure_falls_back_to_cpu(tmp_path: Path, monkeypatch) -> N
 
 
 def test_existing_stopped_container_is_started(tmp_path: Path) -> None:
-    prompts = ScriptedPrompter(choices=[0, 1, 1], texts=[QDRANT_URL])
+    prompts = ScriptedPrompter(choices=[0, 0, 1, 1], texts=[QDRANT_URL])
     runner = _docker_runner(
         containers=(
             "embed-box\tghcr.io/ggml-org/llama.cpp:server\t"
@@ -499,6 +511,81 @@ def test_existing_stopped_container_is_started(tmp_path: Path) -> None:
     }
     assert document["vector_store"] == "qdrant"
     assert not (project / ".simple-ci" / "config.yaml").exists()
+
+
+def test_embedding_menu_lists_all_containers_with_running_marker(
+    tmp_path: Path,
+) -> None:
+    prompts = ScriptedPrompter(choices=[0, 0, 0])
+    runner = _docker_runner(
+        containers=(
+            "web-box\tnginx:latest\tUp 2 hours\t0.0.0.0:80->80/tcp\n"
+            "embed-box\tghcr.io/ggml-org/llama.cpp:server\t"
+            "Exited (1) 2 hours ago\t0.0.0.0:9191->8080/tcp\n"
+        ),
+        port="0.0.0.0:9191\n",
+        inspect="exited\n",
+    )
+    http = FakeHttp(models_by_url={"http://localhost:9191": ["my-model"]})
+    wizard, _project, home = _wizard(
+        tmp_path, prompts=prompts, runner=runner, http=http
+    )
+
+    assert wizard.run() == 0
+
+    assert prompts.menus[0] == [
+        "Use an existing embedding docker container",
+        "Download a model",
+        "Use an existing embedding server URL",
+        "Cancel",
+    ]
+    assert prompts.menus[1] == [
+        "web-box — nginx:latest (running)",
+        "embed-box — ghcr.io/ggml-org/llama.cpp:server",
+    ]
+    assert _global(home)["embedding"]["service"]["container"] == "web-box"
+
+
+def test_download_menu_marks_downloaded_models(tmp_path: Path, monkeypatch) -> None:
+    project, home, repo = _workspace(tmp_path)
+    model_dir = home / ".simple-ci" / "model"
+    model_dir.mkdir(parents=True)
+    (model_dir / CATALOG[0].filename).write_bytes(b"gguf")
+    monkeypatch.setattr(
+        provision, "download_model", lambda url, destination, **kwargs: None
+    )
+    prompts = ScriptedPrompter(choices=[1, 0, 0])
+    wizard = Wizard(
+        cwd=project,
+        home=home,
+        repo_root=repo,
+        prompts=prompts,
+        runner=_docker_runner(),
+        http=FakeHttp(),
+        no_install=True,
+        harnesses="none",
+    )
+
+    assert wizard.run() == 0
+
+    labels = prompts.menus[1]
+    assert labels[0].endswith(" (downloaded)")
+    assert labels[1].endswith("GB")
+    assert labels[2] == "Qwen3-Embedding-4B (2560-dim) — 3.3 GB"
+    assert len(labels) == len(CATALOG) + 1
+
+
+def test_catalog_lists_qwen3_4b_third() -> None:
+    assert [model.key for model in CATALOG[:3]] == [
+        "embeddinggemma2",
+        "qwen3-embedding-0.6b",
+        "qwen3-embedding-4b",
+    ]
+    model = CATALOG[2]
+    assert model.url.startswith("https://huggingface.co/Qwen/Qwen3-Embedding-4B-GGUF/")
+    assert model.filename == "Qwen3-Embedding-4B-Q6_K.gguf"
+    assert model.dim == 2560
+    assert model.pooling == "last"
 
 
 def test_existing_global_setup_is_reused(tmp_path: Path, monkeypatch) -> None:
@@ -809,7 +896,7 @@ def test_install_copies_repo_and_points_entries_at_the_install(
         home=_home,
         repo_root=repo,
         prompts=ScriptedPrompter(),
-        runner=FakeRunner(),
+        runner=FakeRunner(which_map={"uv": "/usr/bin/uv"}),
         install_dir=install_dir,
         platform="win32",
     )
@@ -820,9 +907,14 @@ def test_install_copies_repo_and_points_entries_at_the_install(
     assert (install_dir / ".git" / "config").is_file()
     assert not (install_dir / ".venv").exists()
     assert not (install_dir / "__pycache__").exists()
-    assert result.python == install_dir / ".venv" / "Scripts" / "python.exe"
+    assert result.root == install_dir
     assert result.server_command == [
-        str(result.python),
+        "/usr/bin/uv",
+        "run",
+        "--project",
+        str(install_dir),
+        "--no-sync",
+        "python",
         str(install_dir / "run_server.py"),
     ]
     assert synced == [install_dir]
@@ -834,6 +926,70 @@ def test_install_copies_repo_and_points_entries_at_the_install(
     assert "installed=true" in (install_dir / ".git" / "config").read_text(
         encoding="utf-8"
     )
+
+
+def test_install_only_copies_the_checkout_and_writes_no_config(
+    tmp_path: Path,
+) -> None:
+    _project, home, repo = _workspace(tmp_path)
+    (repo / "setup.py").write_text("# setup\n", encoding="utf-8")
+    target = tmp_path / "install"
+
+    code = wizard_run(
+        [
+            "--install-only",
+            "--repo-root",
+            str(repo),
+            "--install-dir",
+            str(target),
+        ]
+    )
+
+    assert code == 0
+    assert (target / "run_server.py").is_file()
+    assert (target / "setup.py").is_file()
+    assert not (home / ".simple-ci").exists()
+
+
+def test_install_only_defaults_to_the_per_user_app_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _project, _home, repo = _workspace(tmp_path)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("HOME", str(tmp_path / "user"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "user"))
+    target = install_mod.install_root(home=Path.home(), platform=sys.platform)
+
+    assert wizard_run(["--install-only", "--repo-root", str(repo)]) == 0
+
+    assert (target / "run_server.py").is_file()
+
+
+def test_install_only_dry_run_copies_nothing(tmp_path: Path) -> None:
+    _project, _home, repo = _workspace(tmp_path)
+    target = tmp_path / "install"
+
+    code = wizard_run(
+        [
+            "--install-only",
+            "--dry-run",
+            "--repo-root",
+            str(repo),
+            "--install-dir",
+            str(target),
+        ]
+    )
+
+    assert code == 0
+    assert not target.exists()
+
+
+def test_install_only_rejects_setup_flags() -> None:
+    with pytest.raises(SystemExit):
+        wizard_run(["--install-only", "--vector-store", "faiss"])
+    with pytest.raises(SystemExit):
+        wizard_run(["--install-only", "--uninstall"])
 
 
 def test_harness_install_merges_and_backs_up(tmp_path: Path, monkeypatch) -> None:
@@ -859,8 +1015,8 @@ def test_harness_install_merges_and_backs_up(tmp_path: Path, monkeypatch) -> Non
     )
     result = install_mod.InstallResult(
         root=repo,
-        python=Path("C:/Python/python.exe"),
         launcher=repo / "run_server.py",
+        uv="/usr/bin/uv",
     )
 
     wizard._step_harnesses(result)
@@ -869,10 +1025,230 @@ def test_harness_install_merges_and_backs_up(tmp_path: Path, monkeypatch) -> Non
     assert document["theme"] == "dark"
     assert document["mcpServers"]["other"] == {"command": "x"}
     entry = document["mcpServers"]["simple-code-indexer"]
-    assert entry["command"] == str(Path("C:/Python/python.exe"))
-    assert entry["args"] == [str(repo / "run_server.py")]
+    assert entry["command"] == "/usr/bin/uv"
+    assert entry["args"] == [
+        "run",
+        "--project",
+        str(repo),
+        "--no-sync",
+        "python",
+        str(repo / "run_server.py"),
+    ]
     assert list((home / ".cursor").glob("mcp.json.bak.*"))
     assert not (project / ".cursor" / "mcp.json").exists()
+
+
+def test_harness_install_is_recorded_in_the_config(tmp_path: Path) -> None:
+    wizard, _project, home = _wizard(
+        tmp_path,
+        prompts=ScriptedPrompter(),
+        runner=_docker_runner(),
+        embedding_url=EMBED_URL,
+        vector_store="faiss",
+        harnesses="cursor",
+    )
+
+    assert wizard.run() == 0
+
+    target = home / ".cursor" / "mcp.json"
+    setup = _global(home)["setup"]
+    assert setup["harnesses"] == [{"name": "cursor", "config": str(target)}]
+    assert "install_root" not in setup
+
+
+def test_the_install_copy_is_recorded(tmp_path: Path, monkeypatch) -> None:
+    project, home, repo = _workspace(tmp_path)
+    install_dir = tmp_path / "install"
+    monkeypatch.setattr(install_mod, "sync_env", lambda runner, target, output: True)
+    wizard = Wizard(
+        cwd=project,
+        home=home,
+        repo_root=repo,
+        prompts=ScriptedPrompter(),
+        runner=_docker_runner(),
+        http=FakeHttp(),
+        install_dir=install_dir,
+        harnesses="none",
+        embedding_url=EMBED_URL,
+        vector_store="faiss",
+    )
+
+    assert wizard.run() == 0
+
+    assert _global(home)["setup"]["install_root"] == str(install_dir.resolve())
+    assert (install_dir / "run_server.py").is_file()
+
+
+def _recorded_install(tmp_path: Path, home: Path) -> Path:
+    old = tmp_path / "old-install"
+    old.mkdir()
+    (old / install_mod.LAUNCHER_FILENAME).write_text("# launcher\n", encoding="utf-8")
+    config = home / ".simple-ci" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        yaml.safe_dump({"version": 1, "setup": {"install_root": str(old)}}),
+        encoding="utf-8",
+    )
+    return old
+
+
+def _moved_install_wizard(
+    tmp_path: Path, monkeypatch, prompts: ScriptedPrompter, **options
+) -> tuple[Wizard, Path, Path]:
+    project, home, repo = _workspace(tmp_path)
+    monkeypatch.setattr(install_mod, "sync_env", lambda runner, target, output: True)
+    options.setdefault("install_dir", tmp_path / "new-install")
+    wizard = Wizard(
+        cwd=project,
+        home=home,
+        repo_root=repo,
+        prompts=prompts,
+        runner=_docker_runner(),
+        http=FakeHttp(),
+        harnesses="none",
+        embedding_url=EMBED_URL,
+        vector_store="faiss",
+        **options,
+    )
+    return wizard, home, options["install_dir"]
+
+
+def test_a_changed_install_dir_removes_the_old_copy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    prompts = ScriptedPrompter()
+    wizard, home, new = _moved_install_wizard(tmp_path, monkeypatch, prompts)
+    old = _recorded_install(tmp_path, home)
+
+    assert wizard.run() == 0
+
+    assert not old.exists()
+    assert _global(home)["setup"]["install_root"] == str(new.resolve())
+    assert (new / "run_server.py").is_file()
+
+
+def test_declining_removal_keeps_the_old_copy(tmp_path: Path, monkeypatch) -> None:
+    prompts = ScriptedPrompter(yes=[False])
+    wizard, home, _new = _moved_install_wizard(tmp_path, monkeypatch, prompts)
+    old = _recorded_install(tmp_path, home)
+
+    assert wizard.run() == 0
+
+    assert (old / install_mod.LAUNCHER_FILENAME).is_file()
+    assert any("Kept" in message for message in prompts.messages)
+
+
+def test_dry_run_keeps_the_old_install_copy(tmp_path: Path, monkeypatch) -> None:
+    prompts = ScriptedPrompter()
+    wizard, home, _new = _moved_install_wizard(
+        tmp_path, monkeypatch, prompts, dry_run=True
+    )
+    old = _recorded_install(tmp_path, home)
+
+    assert wizard.run() == 0
+
+    assert old.is_dir()
+    assert any("Would delete the previous install copy" in m for m in prompts.messages)
+
+
+def test_deselecting_a_harness_removes_its_entry_and_backup(tmp_path: Path) -> None:
+    _project, home, _repo = _workspace(tmp_path)
+    target = home / ".cursor" / "mcp.json"
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        '{"mcpServers": {"other": {"command": "x"}}, "theme": "dark"}',
+        encoding="utf-8",
+    )
+    first = _wizard(
+        tmp_path,
+        prompts=ScriptedPrompter(),
+        harnesses="cursor",
+        embedding_url=EMBED_URL,
+        vector_store="faiss",
+        runner=_docker_runner(),
+    )[0]
+    assert first.run() == 0
+    assert list(target.parent.glob("mcp.json.bak.*"))
+    assert (
+        "simple-code-indexer"
+        in json.loads(target.read_text(encoding="utf-8"))["mcpServers"]
+    )
+
+    second = _wizard(
+        tmp_path,
+        prompts=ScriptedPrompter(),
+        harnesses="none",
+        embedding_url=EMBED_URL,
+        vector_store="faiss",
+        runner=_docker_runner(),
+    )[0]
+    assert second.run() == 0
+
+    document = json.loads(target.read_text(encoding="utf-8"))
+    assert document["theme"] == "dark"
+    assert document["mcpServers"] == {"other": {"command": "x"}}
+    assert not list(target.parent.glob("mcp.json.bak.*"))
+    assert "harnesses" not in _global(home).get("setup", {})
+
+
+def test_deselecting_the_only_harness_removes_the_created_config(
+    tmp_path: Path,
+) -> None:
+    wizard, _project, home = _wizard(
+        tmp_path,
+        prompts=ScriptedPrompter(),
+        runner=_docker_runner(),
+        embedding_url=EMBED_URL,
+        vector_store="faiss",
+        harnesses="cursor",
+    )
+    assert wizard.run() == 0
+    target = home / ".cursor" / "mcp.json"
+    assert target.is_file()
+
+    _wizard(tmp_path, prompts=ScriptedPrompter(), harnesses="none")[0].run()
+
+    assert not target.exists()
+    assert not (home / ".cursor").exists()
+
+
+def test_a_recorded_harness_path_that_moved_is_cleaned_up(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(harnesses_pkg, "_which", lambda _name: None)
+    project, home, repo = _workspace(tmp_path)
+    stale = home / ".old" / "mcp.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text(
+        '{"mcpServers": {"simple-code-indexer": {"command": "old"}}}',
+        encoding="utf-8",
+    )
+    specs = load_harnesses(user_dirs=[])
+    cursor_index = next(
+        index for index, spec in enumerate(specs) if spec.name == "cursor"
+    )
+    wizard = Wizard(
+        cwd=project,
+        home=home,
+        repo_root=repo,
+        prompts=ScriptedPrompter(multis=[[cursor_index]]),
+        runner=FakeRunner(),
+    )
+    wizard._record_harnesses = [{"name": "cursor", "config": str(stale)}]
+    result = install_mod.InstallResult(
+        root=repo,
+        launcher=repo / "run_server.py",
+        uv="/usr/bin/uv",
+    )
+
+    wizard._step_harnesses(result)
+
+    target = home / ".cursor" / "mcp.json"
+    assert not stale.exists()
+    assert not stale.parent.exists()
+    document = json.loads(target.read_text(encoding="utf-8"))
+    assert document["mcpServers"]["simple-code-indexer"]["command"] == "/usr/bin/uv"
+    assert wizard._record_harnesses == [{"name": "cursor", "config": str(target)}]
 
 
 def test_harness_selection_parser(tmp_path: Path) -> None:
@@ -882,9 +1258,9 @@ def test_harness_selection_parser(tmp_path: Path) -> None:
 
     assert wizard._parse_harness_selection("none", specs) == []
     assert wizard._parse_harness_selection("all", specs) == list(range(len(specs)))
-    names = {"cline", "mimo"}
+    names = {"mimo", "opencode"}
     expected = sorted(index for index, spec in enumerate(specs) if spec.name in names)
-    assert wizard._parse_harness_selection("cline,mimo", specs) == expected
+    assert wizard._parse_harness_selection("mimo,opencode", specs) == expected
     with pytest.raises(SetupAborted):
         wizard._parse_harness_selection("nope", specs)
 
@@ -947,8 +1323,15 @@ def test_no_install_entries_point_at_the_checkout(tmp_path: Path) -> None:
     target = home / ".cursor" / "mcp.json"
     document = json.loads(target.read_text(encoding="utf-8"))
     entry = document["mcpServers"]["simple-code-indexer"]
-    assert entry["command"] == sys.executable
-    assert entry["args"] == [str(wizard.repo_root / "run_server.py")]
+    assert entry["command"] == "/usr/bin/uv"
+    assert entry["args"] == [
+        "run",
+        "--project",
+        str(wizard.repo_root),
+        "--no-sync",
+        "python",
+        str(wizard.repo_root / "run_server.py"),
+    ]
 
 
 def test_legacy_models_directory_is_migrated(tmp_path: Path) -> None:
@@ -970,48 +1353,8 @@ def test_legacy_models_directory_is_migrated(tmp_path: Path) -> None:
     assert not legacy.exists()
 
 
-def test_gitignore_is_appended_once(tmp_path: Path) -> None:
-    project, home, repo = _workspace(tmp_path)
-    (project / ".git").mkdir()
-    gitignore = project / ".gitignore"
-    gitignore.write_text("dist/\n", encoding="utf-8")
-    wizard = Wizard(
-        cwd=project,
-        home=home,
-        repo_root=repo,
-        prompts=ScriptedPrompter(),
-        runner=FakeRunner(),
-    )
-
-    wizard._step_gitignore()
-    wizard._step_gitignore()
-
-    text = gitignore.read_text(encoding="utf-8")
-    assert text.startswith("dist/\n")
-    assert text.count(".simple-ci/") == 1
-
-
-def test_legacy_index_is_migrated(tmp_path: Path) -> None:
-    project, home, repo = _workspace(tmp_path)
-    legacy = project / ".index" / "index.db"
-    legacy.parent.mkdir()
-    legacy.write_bytes(b"old-index")
-    wizard = Wizard(
-        cwd=project,
-        home=home,
-        repo_root=repo,
-        prompts=ScriptedPrompter(),
-        runner=FakeRunner(),
-    )
-
-    wizard._step_migrate_index()
-
-    assert (project / ".simple-ci" / "index.db").read_bytes() == b"old-index"
-    assert not legacy.exists()
-
-
 def test_faiss_branch_writes_no_qdrant_config(tmp_path: Path) -> None:
-    prompts = ScriptedPrompter(choices=[1, 0], texts=[EMBED_URL, "", "my-model"])
+    prompts = ScriptedPrompter(choices=[2, 0], texts=[EMBED_URL, "", "my-model"])
     runner = _docker_runner()
     wizard, _project, home = _wizard(tmp_path, prompts=prompts, runner=runner)
 
@@ -1021,6 +1364,21 @@ def test_faiss_branch_writes_no_qdrant_config(tmp_path: Path) -> None:
     assert document["vector_store"] == "faiss"
     assert "qdrant" not in document
     assert not any(call[:2] == ["docker", "compose"] for call in runner.calls)
+
+
+def test_run_leaves_the_workspace_untouched(tmp_path: Path) -> None:
+    prompts = ScriptedPrompter(choices=[2, 0], texts=[EMBED_URL, "", "my-model"])
+    wizard, project, _home = _wizard(tmp_path, prompts=prompts)
+
+    assert wizard.run() == 0
+
+    assert not (project / ".simple-ci").exists()
+    assert not (project / ".index").exists()
+    assert not (project / ".gitignore").exists()
+    assert not any(
+        line.strip().startswith(("index:", "vectors:", "collection:"))
+        for line in prompts.messages
+    )
 
 
 def test_the_backend_default_follows_the_existing_config(tmp_path: Path) -> None:

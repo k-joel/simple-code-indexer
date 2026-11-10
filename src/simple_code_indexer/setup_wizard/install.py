@@ -1,8 +1,8 @@
 """Install the repo into a stable per-user directory.
 
-Harness entries point at the installed copy (its virtualenv Python plus
-``run_server.py``), so they survive deleting the original checkout and can
-self-update with ``git pull`` on every launch.
+Harness entries launch ``run_server.py`` through ``uv run --project <install>
+--no-sync``, so they survive deleting the original checkout and can self-update
+with ``git pull`` on every launch.
 """
 
 from __future__ import annotations
@@ -40,12 +40,21 @@ _IGNORED: tuple[str, ...] = (
 @dataclass(frozen=True, slots=True)
 class InstallResult:
     root: Path
-    python: Path
     launcher: Path
+    uv: str = "uv"
 
     @property
     def server_command(self) -> list[str]:
-        return [str(self.python), str(self.launcher)]
+        """Launch the installed copy through uv, preserving the caller's cwd."""
+        return [
+            self.uv,
+            "run",
+            "--project",
+            str(self.root),
+            "--no-sync",
+            "python",
+            str(self.launcher),
+        ]
 
 
 def install_root(
@@ -68,10 +77,16 @@ def install_root(
     return base / APP_DIRNAME
 
 
-def venv_python(root: Path, *, platform: str = sys.platform) -> Path:
-    if platform == "win32":
-        return root / ".venv" / "Scripts" / "python.exe"
-    return root / ".venv" / "bin" / "python"
+def target_root(
+    *,
+    home: Path | None = None,
+    install_dir: Path | None = None,
+    platform: str = sys.platform,
+) -> Path:
+    """The install target: an explicit --install-dir wins over the per-user default."""
+    if install_dir is not None:
+        return install_dir.expanduser().resolve()
+    return install_root(home=home, platform=platform)
 
 
 def copy_repo(source: Path, target: Path) -> None:
@@ -109,6 +124,16 @@ def sync_env(
     return True
 
 
-def existing_python(root: Path, *, platform: str, fallback: Path) -> Path:
-    candidate = venv_python(root, platform=platform)
-    return candidate if candidate.is_file() else fallback
+def prune_empty_dirs(start: Path, *, stop: Path) -> list[Path]:
+    """Remove `start` and its parents while empty, never at or above `stop`."""
+    boundary = stop.resolve()
+    current = start.resolve()
+    removed: list[Path] = []
+    while current != boundary and boundary in current.parents:
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        removed.append(current)
+        current = current.parent
+    return removed

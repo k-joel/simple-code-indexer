@@ -1,5 +1,10 @@
 # Global-only config, per-user install, self-updating launcher, and questionary menus
 
+**Partially superseded (2026-11-09):** harness entries no longer hardcode
+`<install>/.venv/.../python`; they run
+`uv run --project <install> --no-sync python <install>/run_server.py`. The per-user install,
+global config, and self-updating launcher decisions below are unchanged.
+
 `setup.py` now writes exactly one config file (`~/.simple-ci/config.yaml`), copies the repo
 (including `.git`) into the per-user app directory, and points every harness entry at that
 copy. The entry runs `run_server.py`, which pulls the latest code, re-syncs the virtualenv

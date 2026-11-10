@@ -7,12 +7,15 @@ maps, and optional specialized extractors.
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Any
 
 from simple_code_indexer.models import Chunk, Symbol
 from simple_code_indexer.registry import LanguageSpec, get_registry
+
+logger = logging.getLogger(__name__)
 
 _GENERIC_SYMBOL_NODES: dict[str, str] = {
     "function_declaration": "function",
@@ -40,7 +43,9 @@ _parsers: dict[str, Any] = {}
 def detect_language(path: Path) -> str | None:
     """Map a path to a plugin language name, or None if not allowlisted."""
     spec = get_registry().detect(path)
-    return spec.name if spec is not None else None
+    language = spec.name if spec is not None else None
+    logger.debug("detected language %s for %s", language or "text", path.name)
+    return language
 
 
 def chunk_source(
@@ -72,6 +77,7 @@ def chunk_source(
 def _parser(lang: str) -> Any:
     """Lazy parser load: keeps server startup <3 s (TDD §7.9)."""
     if lang not in _parsers:
+        logger.debug("loading tree-sitter grammar %s", lang)
         from tree_sitter_language_pack import get_parser
 
         _parsers[lang] = get_parser(lang)
@@ -82,10 +88,17 @@ def extract_symbols(path: Path, source: str) -> list[Symbol]:
     """Extract symbols from source; regex fallback when no grammar is loadable."""
     spec = get_registry().detect(path)
     if spec is None:
+        logger.debug("no language plugin for %s; using regex symbols", path.name)
         return _regex_symbols(source)
     try:
         parser = _parser(spec.grammar)
-    except (ImportError, LookupError, OSError, ValueError):
+    except (ImportError, LookupError, OSError, ValueError) as exc:
+        logger.warning(
+            "tree-sitter grammar %r unavailable for %s (%s); using regex symbols",
+            spec.grammar,
+            path.name,
+            exc,
+        )
         return _regex_symbols(source)
     tree = parser.parse(source.encode("utf-8"))
     return extract_from_tree(spec, tree.root_node, source)

@@ -8,6 +8,8 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from simple_code_indexer.config import ipv4_loopback
+
 logger = logging.getLogger(__name__)
 
 
@@ -76,7 +78,8 @@ def _headers(api_key: str | None) -> dict[str, str]:
 
 def list_models(http: Http, base_url: str, api_key: str | None = None) -> list[str]:
     """GET /v1/models, returning ids (llama.cpp and most OpenAI-compatible servers)."""
-    body = http.get_json(base_url.rstrip("/") + "/v1/models", _headers(api_key))
+    target = ipv4_loopback(base_url.rstrip("/") + "/v1/models")
+    body = http.get_json(target, _headers(api_key))
     if not isinstance(body, dict):
         return []
     data = body.get("data")
@@ -99,7 +102,7 @@ def embedding_dim(
 ) -> int | None:
     """POST one short text and return the vector length."""
     result = http.post_json(
-        base_url.rstrip("/") + "/v1/embeddings",
+        ipv4_loopback(base_url.rstrip("/") + "/v1/embeddings"),
         {"model": model, "input": ["dimension probe"]},
         _headers(api_key),
         timeout,
@@ -118,7 +121,7 @@ def embedding_dim(
 
 
 def qdrant_ready(http: Http, url: str) -> bool:
-    base = url.rstrip("/")
+    base = ipv4_loopback(url.rstrip("/"))
     return (
         http.get_json(base + "/healthz", timeout=2.0) is not None
         or http.get_json(base + "/collections", timeout=2.0) is not None

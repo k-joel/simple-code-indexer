@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
 
 from simple_code_indexer.models import Chunk, FileRecord, SearchHit, Symbol
+
+logger = logging.getLogger(__name__)
+
+# A connection that lives longer than this is worth a diagnostic line.
+_SLOW_DB_MS = 250
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -102,6 +109,8 @@ LIMIT ?
 @contextmanager
 def connect(db_path: Path, *, readonly: bool = False) -> Iterator[sqlite3.Connection]:
     """WAL connection with busy_timeout; readonly opens the file in mode=ro."""
+    started = time.perf_counter()
+    logger.debug("db open %s (%s)", db_path, "ro" if readonly else "rw")
     if readonly:
         uri = db_path.resolve().as_uri() + "?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
@@ -116,12 +125,17 @@ def connect(db_path: Path, *, readonly: bool = False) -> Iterator[sqlite3.Connec
         yield conn
     finally:
         conn.close()
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        if elapsed_ms >= _SLOW_DB_MS:
+            logger.debug("slow db session: %s took %d ms", db_path.name, elapsed_ms)
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    started = time.perf_counter()
     conn.executescript(_SCHEMA)
     _migrate_embedding_state(conn)
     conn.commit()
+    logger.debug("schema ensured in %d ms", int((time.perf_counter() - started) * 1000))
 
 
 def _migrate_embedding_state(conn: sqlite3.Connection) -> None:
@@ -130,6 +144,7 @@ def _migrate_embedding_state(conn: sqlite3.Connection) -> None:
         str(row[1]) for row in conn.execute("PRAGMA table_info(embedding_state)")
     }
     if "qdrant_point_id" in columns and "vector_id" not in columns:
+        logger.info("migrating embedding_state.qdrant_point_id -> vector_id")
         conn.execute(
             "ALTER TABLE embedding_state RENAME COLUMN qdrant_point_id TO vector_id"
         )
@@ -151,7 +166,16 @@ def upsert_file(conn: sqlite3.Connection, record: FileRecord) -> int:
     )
     row = conn.execute("SELECT id FROM files WHERE path = ?", (record.path,)).fetchone()
     assert row is not None
-    return int(row["id"])
+    file_id = int(row["id"])
+    logger.debug(
+        "file upsert %s: id=%d language=%s size=%d sha=%s",
+        record.path,
+        file_id,
+        record.language,
+        record.size,
+        record.sha256[:12],
+    )
+    return file_id
 
 
 def file_hash(conn: sqlite3.Connection, path: str) -> str | None:
@@ -170,6 +194,7 @@ def replace_file_symbols(
         """,
         [(file_id, s.name, s.kind, s.line, s.line_end, s.signature) for s in symbols],
     )
+    logger.debug("symbols for file %d: %d row(s)", file_id, len(symbols))
 
 
 def replace_file_chunks(
@@ -183,11 +208,13 @@ def replace_file_chunks(
         """,
         [(file_id, c.chunk_index, c.start_line, c.end_line, c.content) for c in chunks],
     )
+    logger.debug("chunks for file %d: %d row(s)", file_id, len(chunks))
 
 
 def delete_file(conn: sqlite3.Connection, path: str) -> None:
     # FK cascade drops symbols/chunks; FTS triggers keep chunks_fts aligned.
     conn.execute("DELETE FROM files WHERE path = ?", (path,))
+    logger.debug("deleted %s (cascades symbols/chunks/FTS rows)", path)
 
 
 def _fts_match_expression(query: str) -> str | None:
@@ -198,10 +225,18 @@ def _fts_match_expression(query: str) -> str | None:
 
 
 def fts_search(conn: sqlite3.Connection, query: str, limit: int) -> list[SearchHit]:
+    started = time.perf_counter()
     match = _fts_match_expression(query)
     if match is None:
+        logger.debug("fts query %.200r has no searchable tokens", query)
         return []
     rows = conn.execute(_FTS_SELECT, (match, limit)).fetchall()
+    logger.debug(
+        "fts %s -> %d hit(s) in %d ms",
+        match,
+        len(rows),
+        int((time.perf_counter() - started) * 1000),
+    )
     return [
         SearchHit(
             path=str(row["path"]),
@@ -225,11 +260,19 @@ def symbol_lookup(conn: sqlite3.Connection, name: str) -> list[Symbol]:
         ORDER BY f.path, s.line
     """
     rows = conn.execute(select.format(where="s.name = ?"), (name,)).fetchall()
+    fallback = False
     if not rows:
+        fallback = True
         rows = conn.execute(
             select.format(where="s.name LIKE ? ESCAPE '\\'"),
             (name.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_") + "%",),
         ).fetchall()
+    logger.debug(
+        "symbol lookup %r -> %d match(es)%s",
+        name,
+        len(rows),
+        " (LIKE fallback)" if fallback else "",
+    )
     return [
         Symbol(
             name=str(r["name"]),
@@ -289,6 +332,11 @@ def record_embedding_state(
         """,
         rows,
     )
+    logger.debug(
+        "embedding_state: %d row(s) status=%s",
+        len(rows),
+        rows[0][2] if rows else "-",
+    )
 
 
 def chunks_needing_embedding(conn: sqlite3.Connection) -> list[tuple[str, Chunk]]:
@@ -303,6 +351,11 @@ def chunks_needing_embedding(conn: sqlite3.Connection) -> list[tuple[str, Chunk]
         ORDER BY f.path, c.chunk_index
         """
     ).fetchall()
+    logger.debug(
+        "chunks needing embedding: %d chunk(s) in %d file(s)",
+        len(rows),
+        len({str(row["path"]) for row in rows}),
+    )
     return [
         (
             str(row["path"]),
@@ -374,10 +427,23 @@ def ensure_index_identity(
     if stored_backend == backend and stored == requested:
         # Backfill the explicit binding for a legacy Qdrant DB.
         set_meta(conn, _BACKEND_KEY, backend)
+        logger.debug("index identity unchanged (%s %s)", backend, requested)
         return False
     has_rows = conn.execute("SELECT EXISTS(SELECT 1 FROM files)").fetchone()
     invalidated = stored_backend is not None or bool(has_rows[0])
+    logger.debug(
+        "index identity differs: stored=%s/%s requested=%s/%s",
+        stored_backend,
+        stored,
+        backend,
+        requested,
+    )
     if invalidated:
+        logger.info(
+            "index invalidated: dropping indexed files for the %s binding %s",
+            backend,
+            requested,
+        )
         conn.execute("DELETE FROM files")  # cascades symbols/chunks/embedding_state
         conn.execute("DELETE FROM vector_labels")
     set_meta(conn, _BACKEND_KEY, backend)
@@ -405,6 +471,7 @@ def allocate_vector_label(conn: sqlite3.Connection, path: str, chunk_index: int)
         (label, path, chunk_index),
     )
     set_meta(conn, _LABEL_SEQ_KEY, str(label))
+    logger.debug("allocated label %d for %s#%d", label, path, chunk_index)
     return label
 
 
@@ -447,6 +514,7 @@ def delete_vector_labels(
         "DELETE FROM vector_labels WHERE path = ? AND chunk_index = ?",
         [(path, int(index)) for index in chunk_indexes],
     )
+    logger.debug("deleted %d vector label(s) for %s", len(chunk_indexes), path)
 
 
 def mark_vectors_dirty(conn: sqlite3.Connection, labels: list[int]) -> None:
@@ -454,14 +522,17 @@ def mark_vectors_dirty(conn: sqlite3.Connection, labels: list[int]) -> None:
         "UPDATE vector_labels SET dirty = 1 WHERE label = ?",
         [(int(label),) for label in labels],
     )
+    logger.debug("marked %d vector(s) dirty", len(labels))
 
 
 def mark_all_vectors_dirty(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE vector_labels SET dirty = 1")
+    logger.debug("marked all vector labels dirty")
 
 
 def clear_vector_dirty(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE vector_labels SET dirty = 0 WHERE dirty != 0")
+    logger.debug("cleared the vector dirty flags")
 
 
 def dirty_vector_chunks(conn: sqlite3.Connection) -> list[tuple[str, int]]:
@@ -500,7 +571,9 @@ def flag_chunks_for_reembed(conn: sqlite3.Connection) -> int:
         """
     ).fetchone()
     assert row is not None
-    return int(row[0])
+    covered = int(row[0])
+    logger.debug("flagged %d chunk(s) for re-embedding", covered)
+    return covered
 
 
 class ChunkSpan(NamedTuple):

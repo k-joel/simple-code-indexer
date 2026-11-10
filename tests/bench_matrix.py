@@ -160,8 +160,9 @@ def _downloaded_endpoint(
     service["container_name"] = container_name
     _docker(runner, ["rm", "-f", container_name])
     provision.write_compose(BENCH_COMPOSE, {service_name: service})
-    if not provision.compose_up(runner, BENCH_COMPOSE, service_name):
-        raise RuntimeError(f"docker compose could not start {container_name}")
+    started, detail = provision.compose_up(runner, BENCH_COMPOSE, service_name)
+    if not started:
+        raise RuntimeError(f"docker compose could not start {container_name}: {detail}")
     url = f"http://localhost:{port}"
     ready = provision.wait_until(
         lambda: probe.embedding_dim(http, url, model.api_model) is not None,

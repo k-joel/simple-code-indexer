@@ -31,19 +31,17 @@ GLOBAL_MODEL_DIRNAME = "model"
 COMPOSE_FILENAME = "docker-compose.yml"
 COMPOSE_TEMPLATE = "docker-compose.yml"
 GPU_SCRIPT_FILENAME = "gpu_init.sh"
-EMBED_CONTAINER = "simple-ci-embed"
-QDRANT_CONTAINER = "simple-ci-qdrant"
+# Compose derives the container name (<project>-<service>-<n>) unless the file
+# pins `container_name`. The packaged file sets the project instead, so the
+# generated containers are `simple-ci-embed-1` / `simple-ci-qdrant-1`; resolve
+# the real name with `compose_container_name` rather than guessing it.
+COMPOSE_PROJECT = "simple-ci"
+EMBED_SERVICE = "embed"
+QDRANT_SERVICE = "qdrant"
+EMBED_CONTAINER = f"{COMPOSE_PROJECT}-{EMBED_SERVICE}-1"
+QDRANT_CONTAINER = f"{COMPOSE_PROJECT}-{QDRANT_SERVICE}-1"
 
 EMBED_PORTS = (8080, 8000, 11434, 3000, 1234)
-_EMBED_NEEDLES = (
-    "llama",
-    "ollama",
-    "embed",
-    "tei",
-    "vllm",
-    "infinity",
-    "text-embeddings",
-)
 
 _DOCKER_TIMEOUT_S = 30.0
 _COMPOSE_TIMEOUT_S = 900.0
@@ -139,8 +137,6 @@ class EmbeddingContainer:
     image: str
     status: str
     url: str | None
-    models: tuple[str, ...] = ()
-    dim: int | None = None
 
     @property
     def running(self) -> bool:
@@ -220,8 +216,47 @@ def list_containers(runner: Runner) -> list[Container]:
     )
     if result.returncode != 0:
         return []
+    return _parse_container_lines(result.stdout)
+
+
+def container_status(runner: Runner, name: str) -> str | None:
+    for attempt in range(2):
+        result = runner.run(
+            ["docker", "inspect", "-f", "{{.State.Status}}", name],
+            timeout=_DOCKER_TIMEOUT_S,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+        if attempt == 0:
+            time.sleep(0.5)
+    return None
+
+
+def compose_ps(runner: Runner, compose_file: Path) -> list[Container]:
+    """Containers belonging to the project in `compose_file`."""
+    if not compose_file.is_file():
+        return []
+    result = runner.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(compose_file),
+            "ps",
+            "-a",
+            "--format",
+            "{{.Name}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}",
+        ],
+        timeout=_DOCKER_TIMEOUT_S,
+    )
+    if result.returncode != 0:
+        return []
+    return _parse_container_lines(result.stdout)
+
+
+def _parse_container_lines(text: str) -> list[Container]:
     containers: list[Container] = []
-    for line in result.stdout.splitlines():
+    for line in text.splitlines():
         parts = line.split("\t")
         if len(parts) < 3:
             continue
@@ -236,17 +271,76 @@ def list_containers(runner: Runner) -> list[Container]:
     return containers
 
 
-def container_status(runner: Runner, name: str) -> str | None:
-    for attempt in range(2):
+def compose_project(
+    compose_file: Path, runner: Runner | None = None, *, fallback: str = COMPOSE_PROJECT
+) -> str:
+    """The project name compose derives container names from.
+
+    A top-level `name:` wins over the directory name; `COMPOSE_PROJECT_NAME`
+    overrides both. Ask the daemon when we can, so a hand-edited file still
+    resolves to the containers it actually created.
+    """
+    if runner is not None and compose_file.is_file():
         result = runner.run(
-            ["docker", "inspect", "-f", "{{.State.Status}}", name],
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(compose_file),
+                "config",
+                "--format",
+                "json",
+            ],
             timeout=_DOCKER_TIMEOUT_S,
         )
         if result.returncode == 0:
-            return result.stdout.strip() or None
-        if attempt == 0:
-            time.sleep(0.5)
-    return None
+            try:
+                document = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                document = None
+            if isinstance(document, dict) and isinstance(document.get("name"), str):
+                return document["name"]
+    if compose_file.is_file():
+        try:
+            loaded = yaml.safe_load(compose_file.read_text(encoding="utf-8"))
+        except yaml.YAMLError:
+            loaded = None
+        if isinstance(loaded, dict) and isinstance(loaded.get("name"), str):
+            return loaded["name"]
+    return fallback
+
+
+def compose_container_name(
+    runner: Runner, compose_file: Path, service: str, *, fallback: str
+) -> str:
+    """The container compose created for `service`, resolved from the daemon.
+
+    The packaged file sets a top-level `name:` instead of `container_name`, so
+    compose composes the name itself (`simple-ci-embed-1`). Ask compose rather
+    than assume, and fall back to the derived name when it has never run.
+    """
+    project = compose_project(compose_file, runner)
+    expected = f"{project}-{service}-1"
+    for container in compose_ps(runner, compose_file):
+        if container.name == expected:
+            return container.name
+    for container in list_containers(runner):
+        if container.name.startswith(f"{project}-{service}-"):
+            return container.name
+    return fallback
+
+
+def container_name_for(
+    runner: Runner, name: str, *, compose_file: Path | None, service: str
+) -> str:
+    """Resolve `name` to a container that actually exists; `name` when unknown."""
+    if container_status(runner, name) is not None:
+        return name
+    if compose_file is not None:
+        resolved = compose_container_name(runner, compose_file, service, fallback=name)
+        if container_status(runner, resolved) is not None:
+            return resolved
+    return name
 
 
 def container_env(runner: Runner, name: str) -> dict[str, str]:
@@ -285,6 +379,26 @@ def start_container(runner: Runner, name: str) -> bool:
     return container_status(runner, name) == "running"
 
 
+def stop_container(runner: Runner, name: str, *, timeout: float = 60.0) -> bool:
+    """`docker stop` the container; True when it is no longer running."""
+    if container_status(runner, name) is None:
+        return False
+    if runner.run(["docker", "stop", name], timeout=timeout).returncode == 0:
+        return True
+    # Same slow-daemon caveat as start_container: trust the observed state.
+    return container_status(runner, name) != "running"
+
+
+def port_holders(runner: Runner, port: int) -> list[Container]:
+    """Running containers that publish `port` on the host."""
+    holders: list[Container] = []
+    needle = f":{port}->"
+    for container in list_containers(runner):
+        if container.running and needle in container.ports:
+            holders.append(container)
+    return holders
+
+
 def container_url(
     runner: Runner,
     name: str,
@@ -300,36 +414,6 @@ def container_url(
             if host_port.isdigit():
                 return f"http://localhost:{host_port}"
     return None
-
-
-def list_embedding_containers(
-    runner: Runner,
-    http: Any,
-    *,
-    ports: tuple[int, ...] = EMBED_PORTS,
-) -> list[EmbeddingContainer]:
-    """Existing Docker containers that look like an embedding server."""
-    from simple_code_indexer.setup_wizard import probe
-
-    found: list[EmbeddingContainer] = []
-    for container in list_containers(runner):
-        haystack = f"{container.name} {container.image}".lower()
-        if not any(needle in haystack for needle in _EMBED_NEEDLES):
-            continue
-        url = container_url(runner, container.name, ports)
-        models: tuple[str, ...] = ()
-        if url is not None and container.running:
-            models = tuple(probe.list_models(http, url))
-        found.append(
-            EmbeddingContainer(
-                name=container.name,
-                image=container.image,
-                status=container.status,
-                url=url,
-                models=models,
-            )
-        )
-    return found
 
 
 def find_qdrant_containers(runner: Runner) -> list[Container]:
@@ -385,15 +469,38 @@ def compose_service_for_container(compose_file: Path, container: str) -> str | N
             and definition.get("container_name") == container
         ):
             return name
+    # Without `container_name` compose names containers <project>-<service>-<n>,
+    # so a configured `simple-ci-embed-1` belongs to the `embed` service.
+    prefix = f"{compose_project(compose_file)}-"
+    if container.startswith(prefix) and container.endswith("-1"):
+        service = container[len(prefix) : -len("-1")]
+        if service in compose_services(compose_file):
+            return service
     return None
 
 
-def compose_up(runner: Runner, compose_file: Path, service: str) -> bool:
+def compose_up(runner: Runner, compose_file: Path, service: str) -> tuple[bool, str]:
+    """Run `compose up -d`; (ok, the daemon's error text when it failed)."""
     result = runner.run(
         ["docker", "compose", "-f", str(compose_file), "up", "-d", service],
         timeout=_COMPOSE_TIMEOUT_S,
     )
-    return result.returncode == 0
+    if result.returncode == 0:
+        return True, ""
+    detail = (result.stderr or result.stdout or "").strip()
+    return False, detail.splitlines()[-1] if detail else ""
+
+
+def compose_down(runner: Runner, compose_file: Path) -> tuple[bool, str]:
+    """Run `compose down --remove-orphans`; (ok, the daemon's error text)."""
+    result = runner.run(
+        ["docker", "compose", "-f", str(compose_file), "down", "--remove-orphans"],
+        timeout=_COMPOSE_TIMEOUT_S,
+    )
+    if result.returncode == 0:
+        return True, ""
+    detail = (result.stderr or result.stdout or "").strip()
+    return False, detail.splitlines()[-1] if detail else ""
 
 
 def write_compose(path: Path, services: dict[str, Any]) -> None:
@@ -405,6 +512,10 @@ def write_compose(path: Path, services: dict[str, Any]) -> None:
             if not isinstance(loaded, dict):
                 raise ValueError(f"{path} does not contain a compose mapping")
             document = loaded
+    # Pin the project so container names are predictable across machines. Set
+    # unconditionally: a file written before this key existed would otherwise
+    # derive names from the directory (`docker-embed-1`).
+    document["name"] = COMPOSE_PROJECT
     existing = document.setdefault("services", {})
     if not isinstance(existing, dict):
         raise TypeError(f"{path}: 'services' must be a mapping")
@@ -426,7 +537,7 @@ def render_embed_services(
     """Render the packaged compose template for one embedding model."""
     rendered = Template(template_text(COMPOSE_TEMPLATE)).substitute(
         IMAGE=image,
-        CONTAINER=EMBED_CONTAINER,
+        PROJECT=COMPOSE_PROJECT,
         MODEL_FILE=filename,
         API_MODEL=model.api_model,
         CTX_SIZE=str(model.ctx_size),
@@ -462,7 +573,6 @@ def embed_service(
 def qdrant_service(port: int) -> dict[str, Any]:
     return {
         "image": "qdrant/qdrant:latest",
-        "container_name": QDRANT_CONTAINER,
         "ports": [f"127.0.0.1:{port}:6333"],
         "volumes": ["../qdrant_storage:/qdrant/storage"],
         "restart": "unless-stopped",
@@ -470,14 +580,44 @@ def qdrant_service(port: int) -> dict[str, Any]:
 
 
 def available_port(host: str, preferred: int, attempts: int = 20) -> int:
-    """First bindable port at or after `preferred` (preferred when none is free)."""
+    """First bindable port at or after `preferred` (preferred when none is free).
+
+    `SO_REUSEADDR` must NOT be set: on Windows it lets `bind()` succeed on a
+    port a container already publishes, so the wizard picked 8080, compose
+    failed to start, and the run aborted after the container was created.
+    """
     for port in range(preferred, preferred + attempts):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 sock.bind((host, port))
             except OSError:
                 continue
+            return port
+    return preferred
+
+
+def port_is_free(runner: Runner, host: str, port: int) -> bool:
+    """True when nothing — container or host process — publishes `port`."""
+    if port_holders(runner, port):
+        return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind((host, port))
+        except OSError:
+            return False
+    return True
+
+
+def available_port_for_docker(
+    runner: Runner, host: str, preferred: int, attempts: int = 20
+) -> int:
+    """`available_port`, but a port a running container publishes also counts as taken.
+
+    Docker Desktop publishes through a host proxy, so `bind()` alone can
+    succeed while compose later fails with "address already in use".
+    """
+    for port in range(preferred, preferred + attempts):
+        if port_is_free(runner, host, port):
             return port
     return preferred
 
@@ -526,11 +666,27 @@ def download_model(
 
 
 def wait_until(
-    predicate: Callable[[], bool], *, timeout: float, interval: float = 1.0
+    predicate: Callable[[], bool],
+    *,
+    timeout: float,
+    interval: float = 1.0,
+    output: Callable[[str], None] | None = None,
+    progress_every: float = 15.0,
 ) -> bool:
-    deadline = time.monotonic() + timeout
+    """Poll `predicate` until it is true or `timeout` elapses.
+
+    `output` gets a heartbeat line every `progress_every` seconds so a slow
+    model load never looks like a hung setup.
+    """
+    start = time.monotonic()
+    deadline = start + timeout
+    next_report = start + progress_every
     while time.monotonic() < deadline:
         if predicate():
             return True
+        now = time.monotonic()
+        if output is not None and now >= next_report:
+            output(f"  still waiting ({now - start:.0f}s of {timeout:.0f}s) ...")
+            next_report = now + progress_every
         time.sleep(interval)
     return False

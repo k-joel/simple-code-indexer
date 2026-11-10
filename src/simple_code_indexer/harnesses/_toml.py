@@ -24,6 +24,26 @@ def upsert(existing: str, *, name: str, command: list[str], env: dict[str, str])
     return body + separator + block
 
 
+def remove(existing: str, *, name: str) -> str | None:
+    """Strip the marker block; None when absent, "" when nothing else remains.
+
+    The block is ours alone, so `name` is only accepted for symmetry with
+    `upsert` and the JSON helper.
+    """
+    del name
+    if _BEGIN not in existing or _END not in existing:
+        return None
+    before, _, rest = existing.partition(_BEGIN)
+    _, _, after = rest.partition(_END)
+    head = before.rstrip("\r\n")
+    tail = after.lstrip("\r\n")
+    if head and tail:
+        return f"{head}\n\n{tail}"
+    if head:
+        return f"{head}\n"
+    return tail
+
+
 def _render(name: str, command: list[str], env: dict[str, str]) -> str:
     lines = [
         _BEGIN,

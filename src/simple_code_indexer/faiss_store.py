@@ -12,6 +12,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +72,7 @@ def _ensure_locked(settings: Settings) -> None:
 
     path = faiss_index_path(settings)
     if _index is not None and _index_path == path and _index_dim == settings.embed_dim:
+        logger.debug("FAISS index cached: %d vector(s)", int(_index.ntotal))
         return
     faiss = _faiss()
     index = faiss.IndexIDMap2(faiss.IndexFlatIP(settings.embed_dim))
@@ -96,6 +98,14 @@ def _ensure_locked(settings: Settings) -> None:
             reset = True
         else:
             index = loaded
+            logger.info(
+                "loaded FAISS index %s: %d vector(s), dim %d",
+                path,
+                int(index.ntotal),
+                settings.embed_dim,
+            )
+    if reset:
+        logger.debug("new FAISS index for %s (dim %d)", path, settings.embed_dim)
     _index = index
     _index_path = path
     _index_dim = settings.embed_dim
@@ -151,6 +161,7 @@ def upsert_chunks(
 
     if not items:
         return []
+    started = time.perf_counter()
     try:
         vectors = np.asarray([vector for _, vector in items], dtype="float32")
     except (TypeError, ValueError) as exc:
@@ -193,6 +204,14 @@ def upsert_chunks(
                 _index.remove_ids(np.asarray(existing, dtype="int64"))
             _index.add_with_ids(vectors, np.asarray(labels, dtype="int64"))
             _dirty = True
+            logger.debug(
+                "faiss upsert %s: %d vector(s), %d replaced, %d stale, %d ms",
+                path,
+                len(labels),
+                len(existing),
+                len(stale),
+                int((time.perf_counter() - started) * 1000),
+            )
         except VectorStoreUnavailable:
             LAST_OK = False
             raise
@@ -219,6 +238,7 @@ def delete_by_path(settings: Settings, path: str) -> None:
                     _index.remove_ids(np.asarray(labels, dtype="int64"))
                 db.delete_vector_labels(conn, path, [index for _, index in rows])
             _dirty = _dirty or bool(labels)
+            logger.debug("faiss delete %s: %d label(s)", path, len(labels))
         except VectorStoreUnavailable:
             LAST_OK = False
             raise
@@ -245,17 +265,19 @@ def search(settings: Settings, vector: list[float], limit: int) -> list[VectorHi
         _ensure_locked(settings)
         try:
             assert _index is not None
-            if _index.ntotal == 0:
-                hits: list[VectorHit] = []
-            else:
-                k = max(1, min(int(limit), int(_index.ntotal)))
+            started = time.perf_counter()
+            ntotal = int(_index.ntotal)
+            k = 0
+            pairs: list[tuple[int, float]] = []
+            hits: list[VectorHit] = []
+            if ntotal:
+                k = max(1, min(int(limit), ntotal))
                 scores, labels = _index.search(query, k)
                 pairs = [
                     (int(label), float(score))
                     for label, score in zip(labels[0], scores[0], strict=True)
                     if int(label) != -1
                 ]
-                hits = []
                 if pairs:
                     with db.connect(settings.index_db_path, readonly=True) as conn:
                         mapping = db.vector_paths_for_labels(
@@ -271,6 +293,14 @@ def search(settings: Settings, vector: list[float], limit: int) -> list[VectorHi
                                     score=score,
                                 )
                             )
+            logger.debug(
+                "faiss search: ntotal=%d k=%d hits=%d dropped=%d in %d ms",
+                ntotal,
+                k,
+                len(hits),
+                len(pairs) - len(hits),
+                int((time.perf_counter() - started) * 1000),
+            )
         except VectorStoreUnavailable:
             LAST_OK = False
             raise
@@ -311,6 +341,7 @@ def flush(settings: Settings) -> None:
         if _index is None or not _dirty:
             return
         path = _index_path or faiss_index_path(settings)
+        started = time.perf_counter()
         try:
             _write_locked(path, _index)
         except Exception:
@@ -326,6 +357,12 @@ def flush(settings: Settings) -> None:
             LAST_OK = False
             logger.warning("cannot clear the dirty flags in %s", path, exc_info=True)
             return
+        logger.info(
+            "persisted %d vector(s) to %s in %d ms",
+            int(_index.ntotal),
+            path,
+            int((time.perf_counter() - started) * 1000),
+        )
     LAST_OK = True
 
 

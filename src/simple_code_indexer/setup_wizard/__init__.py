@@ -11,16 +11,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from simple_code_indexer import configfile, model_prompts
-from simple_code_indexer.config import (
-    derive_collection_name,
-    embedding_fingerprint,
-)
 from simple_code_indexer.errors import ConfigError
 from simple_code_indexer.harnesses import HarnessSpec, load_harnesses
 from simple_code_indexer.setup_wizard import (
@@ -29,11 +26,11 @@ from simple_code_indexer.setup_wizard import (
     install,
     probe,
     provision,
+    uninstall,
     write,
 )
 from simple_code_indexer.setup_wizard.prereqs import gpu_runtime_hint, install_docker
 from simple_code_indexer.setup_wizard.prompts import Prompter
-from simple_code_indexer.workspace_lock import WorkspaceLock
 
 SERVER_NAME = "simple-code-indexer"
 DEFAULT_EMBED_URL = "http://localhost:8080"
@@ -120,10 +117,13 @@ class Wizard:
         self.no_install = no_install
         self._docker_checked: bool | None = None
         self._written_harnesses: list[tuple[HarnessSpec, Path]] = []
+        self._record_install_root: Path | None = None
+        self._record_harnesses: list[dict[str, str]] = []
 
     def run(self) -> int:
         try:
             self._banner()
+            self._load_install_record()
             self._step_docker()
             self._step_migrate_global_assets()
             self._step_migrate_local_config()
@@ -136,11 +136,9 @@ class Wizard:
                 embedding = reused.embedding
                 backend = reused.backend
                 qdrant = reused.qdrant
-            self._step_gitignore()
-            self._step_migrate_index()
-            config_paths = self._write_global_config(embedding, backend, qdrant)
             install_result = self._step_install()
             self._step_harnesses(install_result)
+            config_paths = self._write_global_config(embedding, backend, qdrant)
             self._summary(embedding, backend, qdrant, config_paths, install_result)
             return 0
         except SetupAborted as exc:
@@ -398,7 +396,22 @@ class Wizard:
             return ExistingSetup(result, backend, qdrant_value)
         probed = probe.embedding_dim(self.http, base_url, model, result["api_key"])
         if probed is None and service_raw.get("container"):
-            container = str(service_raw["container"])
+            container = provision.container_name_for(
+                self.runner,
+                str(service_raw["container"]),
+                compose_file=(
+                    Path(str(service_raw["compose_file"]))
+                    if service_raw.get("compose_file")
+                    else provision.compose_path(self.home)
+                ),
+                service=provision.EMBED_SERVICE,
+            )
+            if container != str(service_raw["container"]):
+                self.prompts.say(
+                    f"Container {service_raw['container']} was renamed to "
+                    f"{container}; updating the config."
+                )
+                result["service"] = {**service_raw, "container": container}
             self.prompts.say(f"{base_url} is not answering; starting {container}.")
             provision.start_container(self.runner, container)
             provision.wait_until(
@@ -406,7 +419,8 @@ class Wizard:
                     probe.embedding_dim(self.http, base_url, model, result["api_key"])
                     is not None
                 ),
-                timeout=180.0,
+                timeout=DEFAULT_STARTUP_TIMEOUT_S,
+                output=self.prompts.say,
             )
             probed = probe.embedding_dim(self.http, base_url, model, result["api_key"])
         if probed is None:
@@ -432,64 +446,62 @@ class Wizard:
             return self._embedding_from_named_container(self.container)
         if self.model is not None:
             return self._embedding_auto()
-        kind, value = self._embedding_menu()
-        if kind == "cancel":
-            raise SetupAborted("no embedding model selected")
-        if kind == "running":
-            url, model = value
-            return self._embedding_from_url(url, default_model=model)
-        if kind == "container":
-            return self._embedding_from_container(value)
-        if kind == "gguf":
-            return self._embedding_from_gguf(value)
-        if kind == "download":
-            return self._embedding_auto()
-        return self._embedding_from_url()
+        while True:
+            kind = self._embedding_menu()
+            if kind == "cancel":
+                raise SetupAborted("no embedding model selected")
+            if kind == "container":
+                result = self._embedding_from_container_menu()
+                if result is not None:
+                    return result
+                continue
+            if kind == "download":
+                return self._embedding_auto()
+            return self._embedding_from_url()
 
-    def _embedding_menu(self) -> tuple[str, Any]:
-        options: list[tuple[str, Any]] = []
+    def _embedding_menu(self) -> str:
+        options: list[str] = []
         labels: list[str] = []
-        if not self.dry_run:
-            models = probe.list_models(self.http, DEFAULT_EMBED_URL)
-            if models:
-                options.append(("running", (DEFAULT_EMBED_URL, models[0])))
-                labels.append(
-                    f"Use the running server at {DEFAULT_EMBED_URL} ({models[0]})"
-                )
         if self._docker_ready():
-            for container in provision.list_embedding_containers(
-                self.runner, self.http
-            ):
-                options.append(("container", container))
-                state = "running" if container.running else container.status
-                model = container.models[0] if container.models else "model unknown"
-                labels.append(
-                    f"Container {container.name} — {container.image} — "
-                    f"{state} — {model}"
-                )
-            for path in provision.downloaded_models(self.home):
-                options.append(("gguf", path))
-                labels.append(
-                    f"Downloaded model {path.name} "
-                    f"({path.stat().st_size / 1e9:.1f} GB) — create a container"
-                )
-            options.append(("download", None))
-            labels.append("Download a model (EmbeddingGemma 2, Qwen3-0.6B, Nomic Code)")
-        options.append(("url", None))
+            options.append("container")
+            labels.append("Use an existing embedding docker container")
+            options.append("download")
+            labels.append("Download a model")
+        options.append("url")
         labels.append("Use an existing embedding server URL")
-        options.append(("cancel", None))
+        options.append("cancel")
         labels.append("Cancel")
+        default = (
+            options.index("download")
+            if self.assume_yes and "download" in options
+            else 0
+        )
         index = self._ask_choice(
             "How should semantic search get its embeddings?",
             labels,
-            default=0,
+            default=default,
             search=True,
         )
         return options[index]
 
-    def _embedding_from_url(
-        self, url: str | None = None, *, default_model: str | None = None
-    ) -> dict[str, Any]:
+    def _embedding_from_container_menu(self) -> dict[str, Any] | None:
+        if not self._docker_ready():
+            return None
+        containers = provision.list_containers(self.runner)
+        if not containers:
+            self.prompts.say("No Docker containers found.")
+            return None
+        labels = [
+            f"{container.name} — {container.image}"
+            + (" (running)" if container.running else "")
+            for container in containers
+        ]
+        index = self._ask_choice(
+            "Select an embedding container", labels, default=0, search=True
+        )
+        return self._embedding_from_named_container(containers[index].name)
+
+    def _embedding_from_url(self, url: str | None = None) -> dict[str, Any]:
         target = url or DEFAULT_EMBED_URL
         while True:
             chosen = (
@@ -500,9 +512,7 @@ class Wizard:
             result = self._configure_embedding(
                 chosen,
                 ask_key=True,
-                default_model=default_model
-                or self.embedding_model
-                or DEFAULT_EMBED_MODEL,
+                default_model=self.embedding_model or DEFAULT_EMBED_MODEL,
             )
             if result is not None:
                 return result
@@ -556,7 +566,9 @@ class Wizard:
         model = self.embedding_model
         if model is None and not self.dry_run:
             provision.wait_until(
-                lambda: bool(probe.list_models(self.http, url)), timeout=120.0
+                lambda: bool(probe.list_models(self.http, url)),
+                timeout=120.0,
+                output=self.prompts.say,
             )
             models = probe.list_models(self.http, url)
             model = models[0] if models else None
@@ -577,6 +589,7 @@ class Wizard:
             provision.wait_until(
                 lambda: probe.embedding_dim(self.http, url, model) is not None,
                 timeout=DEFAULT_STARTUP_TIMEOUT_S,
+                output=self.prompts.say,
             )
             dim = probe.embedding_dim(self.http, url, model)
         if dim is None:
@@ -595,26 +608,6 @@ class Wizard:
         self.prompts.say(f"Using {container.name} at {url} (model={model}, dim={dim})")
         return self._embedding_result(url, model, dim, service=service)
 
-    def _embedding_from_gguf(self, path: Path) -> dict[str, Any]:
-        model = catalog.for_filename(path.name)
-        if model is None:
-            api_model = self.embedding_model or self._ask_text(
-                "Model name served by llama.cpp", default=path.stem
-            )
-            model = catalog.EmbeddingModel(
-                key=path.stem,
-                label=path.name,
-                url="",
-                filename=path.name,
-                api_model=api_model,
-                dim=DEFAULT_EMBED_DIM,
-                pooling="last",
-                approx_gb=path.stat().st_size / 1e9,
-            )
-        elif self.embedding_model:
-            model = replace(model, api_model=self.embedding_model)
-        return self._provision_embedding(model, path, download=False)
-
     def _embedding_auto(self) -> dict[str, Any]:
         if self.model is not None:
             model = catalog.for_key(self.model)
@@ -623,8 +616,11 @@ class Wizard:
             if self.model_url:
                 model = replace(model, url=self.model_url)
         else:
+            downloaded = {path.name for path in provision.downloaded_models(self.home)}
             labels = [
-                f"{item.label} — {item.approx_gb:.1f} GB" for item in catalog.CATALOG
+                f"{item.label} — {item.approx_gb:.1f} GB"
+                + (" (downloaded)" if item.filename in downloaded else "")
+                for item in catalog.CATALOG
             ]
             labels.append("Cancel — I'll set up my own embedding server")
             choice = self._ask_choice(
@@ -650,7 +646,7 @@ class Wizard:
         service = {
             "container": provision.EMBED_CONTAINER,
             "compose_file": str(compose_file),
-            "compose_service": "embed",
+            "compose_service": provision.EMBED_SERVICE,
             "startup_timeout_s": DEFAULT_STARTUP_TIMEOUT_S,
         }
         result = self._embedding_result(
@@ -676,7 +672,7 @@ class Wizard:
         provision.write_compose(
             compose_file,
             {
-                "embed": provision.embed_service(
+                provision.EMBED_SERVICE: provision.embed_service(
                     model,
                     port,
                     destination.name,
@@ -685,16 +681,70 @@ class Wizard:
                 )
             },
         )
-        if not provision.compose_up(self.runner, compose_file, "embed"):
-            raise SetupAborted("docker compose could not start the embedding container")
+        failure = self._compose_start(compose_file, provision.EMBED_SERVICE, port)
+        if failure is not None:
+            raise SetupAborted(
+                "docker compose could not start the embedding container"
+                + (f": {failure}" if failure else "")
+                + f'\nRun `docker compose -f "{compose_file}" up -d '
+                f"{provision.EMBED_SERVICE}` to see the full Docker output."
+            )
+        container = provision.compose_container_name(
+            self.runner,
+            compose_file,
+            provision.EMBED_SERVICE,
+            fallback=provision.EMBED_CONTAINER,
+        )
+        result["service"]["container"] = container
+        # Trust the daemon over the port we asked for: compose may reuse the
+        # existing container, whose published port is the one that answers.
+        published = provision.container_url(
+            self.runner, container, provision.EMBED_PORTS
+        )
+        if published is not None and published != url:
+            self.prompts.say(f"{container} publishes {published}, not {url}.")
+            url = published
+            result["base_url"] = url
+        self.prompts.say(f"Waiting for {container} to answer at {url} ...")
         if not provision.wait_until(
             lambda: probe.embedding_dim(self.http, url, model.api_model) is not None,
-            timeout=300.0,
+            timeout=DEFAULT_STARTUP_TIMEOUT_S,
+            output=self.prompts.say,
         ):
             self.prompts.say("The model is still loading; the server will wait for it.")
         probed = probe.embedding_dim(self.http, url, model.api_model)
         result["dim"] = probed or model.dim
         return result
+
+    def _compose_start(self, compose_file: Path, service: str, port: int) -> str | None:
+        """`compose up`, clearing a port clash with a prompt instead of aborting.
+
+        Returns None when the service started, else the daemon's error text.
+        """
+        detail: str | None = None
+        for _attempt in range(3):
+            started, detail = provision.compose_up(self.runner, compose_file, service)
+            if started:
+                return None
+            holders = provision.port_holders(self.runner, port)
+            if not holders:
+                return detail or "docker compose failed"
+            names = ", ".join(container.name for container in holders)
+            self.prompts.say(
+                f"Port {port} is used by the running container {names}, so the "
+                f"embedding container cannot start."
+            )
+            if not self._ask_yes_no(f"Stop {names} and continue setup?", default=True):
+                raise SetupAborted(
+                    f"port {port} is in use by {names}; stop it and re-run setup.py"
+                )
+            if not all(
+                provision.stop_container(self.runner, container.name)
+                for container in holders
+            ):
+                raise SetupAborted(f"could not stop {names}")
+            self.prompts.say(f"Stopped {names}.")
+        return detail or "docker compose kept failing"
 
     def _embedding_result(
         self,
@@ -731,12 +781,19 @@ class Wizard:
 
     def _embed_port(self) -> int:
         """Keep the running container's published port so re-runs don't churn."""
-        url = provision.container_url(self.runner, provision.EMBED_CONTAINER)
+        compose_file = provision.compose_path(self.home)
+        container = provision.compose_container_name(
+            self.runner,
+            compose_file,
+            provision.EMBED_SERVICE,
+            fallback=provision.EMBED_CONTAINER,
+        )
+        url = provision.container_url(self.runner, container)
         if url is not None:
             _, _, published = url.rpartition(":")
             if published.isdigit():
                 return int(published)
-        return provision.available_port("127.0.0.1", 8080)
+        return provision.available_port_for_docker(self.runner, "127.0.0.1", 8080)
 
     def _configure_embedding(
         self,
@@ -864,7 +921,9 @@ class Wizard:
             )
         if not self.dry_run:
             provision.wait_until(
-                lambda: probe.qdrant_ready(self.http, url), timeout=120.0
+                lambda: probe.qdrant_ready(self.http, url),
+                timeout=120.0,
+                output=self.prompts.say,
             )
         compose_file = provision.compose_path(self.home)
         service = provision.existing_service(
@@ -880,25 +939,53 @@ class Wizard:
     def _qdrant_auto(self) -> dict[str, Any]:
         if not self.dry_run and not self._docker_ready():
             raise SetupAborted("Docker is required for automatic Qdrant setup")
-        port = 6333 if self.dry_run else provision.available_port("127.0.0.1", 6333)
         compose_file = provision.compose_path(self.home)
+        existing = provision.compose_container_name(
+            self.runner,
+            compose_file,
+            provision.QDRANT_SERVICE,
+            fallback=provision.QDRANT_CONTAINER,
+        )
+        published = provision.container_url(self.runner, existing, ports=(6333,))
+        if published is not None:
+            _, _, published_port = published.rpartition(":")
+            port = int(published_port) if published_port.isdigit() else 6333
+        elif self.dry_run:
+            port = 6333
+        else:
+            port = provision.available_port_for_docker(self.runner, "127.0.0.1", 6333)
         url = f"http://localhost:{port}"
         service = {
             "container": provision.QDRANT_CONTAINER,
             "compose_file": str(compose_file),
-            "compose_service": "qdrant",
+            "compose_service": provision.QDRANT_SERVICE,
             "startup_timeout_s": DEFAULT_STARTUP_TIMEOUT_S,
         }
         if self.dry_run:
             self.prompts.say(f"Would add the 'qdrant' service to {compose_file}")
             return {"url": url, "service": service}
         provision.write_compose(
-            compose_file, {"qdrant": provision.qdrant_service(port)}
+            compose_file, {provision.QDRANT_SERVICE: provision.qdrant_service(port)}
         )
-        if not provision.compose_up(self.runner, compose_file, "qdrant"):
-            raise SetupAborted("docker compose could not start Qdrant")
+        started, detail = provision.compose_up(
+            self.runner, compose_file, provision.QDRANT_SERVICE
+        )
+        if not started:
+            raise SetupAborted(
+                "docker compose could not start Qdrant"
+                + (f": {detail}" if detail else "")
+            )
+        service["container"] = provision.compose_container_name(
+            self.runner,
+            compose_file,
+            provision.QDRANT_SERVICE,
+            fallback=provision.QDRANT_CONTAINER,
+        )
+        self.prompts.say(f"Waiting for {service['container']} at {url} ...")
         if not provision.wait_until(
-            lambda: probe.qdrant_ready(self.http, url), timeout=120.0
+            lambda: probe.qdrant_ready(self.http, url),
+            timeout=120.0,
+            output=self.prompts.say,
         ):
             self.prompts.say("Qdrant is still starting; the server will wait for it.")
         return {"url": url, "service": service}
@@ -960,66 +1047,33 @@ class Wizard:
             return gpu.GpuInfo("cpu", info.name)
         return info
 
-    # -- workspace hygiene ----------------------------------------------
+    # -- config ----------------------------------------------------------
 
-    def _step_gitignore(self) -> None:
-        if self.dry_run:
-            root: Path | None = self.cwd
-        else:
-            root = write.git_root(self.cwd, self.runner)
-        if root is None:
-            self.prompts.say("No git repository found; skipping the .gitignore update.")
-            return
-        path = root / ".gitignore"
+    def _load_install_record(self) -> None:
+        """Remember what an earlier run installed, so a re-run can undo it."""
+        path = self.config_path or self._global_config_path()
         if not path.is_file():
-            if self._ask_yes_no(f"No .gitignore in {root}. Create one?", default=True):
-                self.prompts.say(
-                    f"{'Would create' if self.dry_run else 'Creating'} {path}"
-                )
-                if not self.dry_run:
-                    write.append_gitignore(path)
-            return
-        lines = path.read_text(encoding="utf-8").splitlines()
-        if any(line.strip() == write.GITIGNORE_ENTRY for line in lines):
-            self.prompts.say(f"{path} already ignores {write.GITIGNORE_ENTRY}")
-            return
-        if self._ask_yes_no(f"Add {write.GITIGNORE_ENTRY} to {path}?", default=True):
-            if not self.dry_run:
-                write.append_gitignore(path)
-            self.prompts.say(
-                f"{'Would add' if self.dry_run else 'Added'} "
-                f"{write.GITIGNORE_ENTRY} to {path}"
-            )
-
-    def _step_migrate_index(self) -> None:
-        legacy = self.cwd / ".index" / "index.db"
-        target = self.cwd / ".simple-ci" / "index.db"
-        if not legacy.is_file() or target.exists():
-            return
-        if not self._ask_yes_no(
-            "Found an old .index/ directory. Move it to .simple-ci/?", default=True
-        ):
-            return
-        if self.dry_run:
-            self.prompts.say(f"Would move {legacy} to {target}")
-            return
-        lock = WorkspaceLock(legacy)
-        if not lock.acquire():
-            self.prompts.say(
-                "Skipped: another server owns the old index; stop it and re-run."
-            )
             return
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            for suffix in ("", "-wal", "-shm"):
-                source = legacy.with_name(legacy.name + suffix)
-                if source.exists():
-                    os.replace(source, target.with_name(target.name + suffix))
-        finally:
-            lock.release()
-        self.prompts.say(f"Moved the index to {target}")
-
-    # -- config ----------------------------------------------------------
+            raw = configfile.load_config(path)
+            setup = configfile.get_mapping(raw, "setup")
+        except ConfigError:
+            return
+        install_root = setup.get("install_root")
+        if isinstance(install_root, str) and install_root.strip():
+            self._record_install_root = Path(install_root).expanduser()
+        items = setup.get("harnesses")
+        if not isinstance(items, list):
+            return
+        records: list[dict[str, str]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            config = item.get("config")
+            if isinstance(name, str) and isinstance(config, str) and name and config:
+                records.append({"name": name, "config": config})
+        self._record_harnesses = records
 
     def _write_global_config(
         self,
@@ -1049,6 +1103,10 @@ class Wizard:
         for key in ("model_key", "model_file", "gpu"):
             if embedding.get(key):
                 setup[key] = embedding[key]
+        if self._record_install_root is not None:
+            setup["install_root"] = str(self._record_install_root)
+        if self._record_harnesses:
+            setup["harnesses"] = [dict(item) for item in self._record_harnesses]
         if setup:
             document["setup"] = setup
         if backend == "qdrant":
@@ -1073,35 +1131,24 @@ class Wizard:
     # -- install ---------------------------------------------------------
 
     def _step_install(self) -> install.InstallResult:
+        uv = self.runner.which("uv") or "uv"
         if self.no_install:
-            python = install.existing_python(
-                self.repo_root,
-                platform=self.platform,
-                fallback=Path(sys.executable),
-            )
             result = install.InstallResult(
                 root=self.repo_root,
-                python=python,
                 launcher=self.repo_root / install.LAUNCHER_FILENAME,
+                uv=uv,
             )
             self.prompts.say(f"Using the source checkout: {self.repo_root}")
             return result
-        target = (
-            self.install_dir.expanduser().resolve()
-            if self.install_dir is not None
-            else install.install_root(home=self.home, platform=self.platform)
+        target = install.target_root(
+            home=self.home, install_dir=self.install_dir, platform=self.platform
         )
         if target == self.repo_root:
-            python = install.existing_python(
-                self.repo_root,
-                platform=self.platform,
-                fallback=Path(sys.executable),
-            )
             self.prompts.say(f"Already running from the install directory: {target}")
             return install.InstallResult(
                 root=target,
-                python=python,
                 launcher=target / install.LAUNCHER_FILENAME,
+                uv=uv,
             )
         self.prompts.say(f"Installing to {target} ...")
         if self.dry_run:
@@ -1111,13 +1158,50 @@ class Wizard:
             install.copy_repo(self.repo_root, target)
             if not install.sync_env(self.runner, target, self.prompts.say):
                 raise SetupAborted(f"uv sync failed in {target}")
+        self._remove_previous_install(target)
         result = install.InstallResult(
             root=target,
-            python=install.venv_python(target, platform=self.platform),
             launcher=target / install.LAUNCHER_FILENAME,
+            uv=uv,
         )
+        self._record_install_root = target
         self.prompts.say(f"Installed: {target}")
         return result
+
+    def _remove_previous_install(self, target: Path) -> None:
+        """Delete the copy a previous run recorded when --install-dir moved it."""
+        previous = self._record_install_root
+        if previous is None:
+            return
+        previous = previous.expanduser().resolve()
+        if previous == target or not previous.is_dir():
+            return
+        for protected in (self.repo_root, self.cwd):
+            if previous == protected or previous in protected.parents:
+                self.prompts.say(
+                    f"Skipping {previous}: it contains the working checkout."
+                )
+                return
+        if not (previous / install.LAUNCHER_FILENAME).is_file():
+            self.prompts.say(
+                f"Skipping {previous}: it does not look like an install copy "
+                f"(no {install.LAUNCHER_FILENAME})."
+            )
+            return
+        if not self._ask_yes_no(
+            f"Remove the previous install copy at {previous}?", default=True
+        ):
+            self.prompts.say(f"Kept {previous}; remove it by hand if it is not needed.")
+            return
+        if self.dry_run:
+            self.prompts.say(f"Would delete the previous install copy {previous}")
+            return
+        try:
+            shutil.rmtree(previous)
+        except OSError as exc:
+            self.prompts.say(f"Could not delete {previous}: {exc}")
+            return
+        self.prompts.say(f"Deleted the previous install copy: {previous}")
 
     # -- harnesses -------------------------------------------------------
 
@@ -1142,8 +1226,27 @@ class Wizard:
                 labels,
                 default=detected,
             )
+        by_name = {spec.name: spec for spec in specs}
+        recorded = {
+            item["name"]: Path(item["config"]) for item in self._record_harnesses
+        }
+        selected_names = {specs[index].name for index in selected}
+        unresolved: dict[str, str] = {}
+        for name, path in recorded.items():
+            if name in selected_names:
+                continue
+            spec = by_name.get(name)
+            if spec is None:
+                self.prompts.say(
+                    f"{name}: the harness plugin is gone; leaving {path} alone."
+                )
+                unresolved[name] = str(path)
+                continue
+            self._remove_harness_entry(spec, path)
+
         command = install_result.server_command
         written: dict[Path, HarnessSpec] = {}
+        kept: dict[str, str] = {}
         for index in selected:
             spec = specs[index]
             target = write.choose_target(spec, "global", self.cwd, self.home)
@@ -1151,11 +1254,15 @@ class Wizard:
                 self.prompts.say(f"{spec.label} has no global config path.")
                 continue
             resolved = target.resolve()
+            previous = recorded.get(spec.name)
+            if previous is not None and previous.resolve() != resolved:
+                self._remove_harness_entry(spec, previous)
             if resolved in written:
                 self.prompts.say(
                     f"{target} was already updated for {written[resolved].label}; "
                     f"skipping {spec.label}."
                 )
+                kept[spec.name] = str(target)
                 continue
             if self.dry_run:
                 snippet = write.render(spec, SERVER_NAME, command, {})
@@ -1169,10 +1276,37 @@ class Wizard:
                         "Add this entry manually:\n"
                         + write.render(spec, SERVER_NAME, command, {})
                     )
+                    if previous is not None and previous.resolve() == resolved:
+                        kept[spec.name] = str(previous)
                     continue
                 self.prompts.say(f"Updated {target}")
             written[resolved] = spec
             self._written_harnesses.append((spec, target))
+            kept[spec.name] = str(target)
+        kept.update(unresolved)
+        self._record_harnesses = [
+            {"name": name, "config": kept[name]} for name in sorted(kept)
+        ]
+
+    def _remove_harness_entry(self, spec: HarnessSpec, target: Path) -> None:
+        """Drop the server entry a previous run installed (and its backup)."""
+        if not target.is_file():
+            self.prompts.say(f"{spec.label}: no entry to remove at {target}")
+            return
+        if self.dry_run:
+            self.prompts.say(f"Would remove the server entry from {target}")
+            return
+        try:
+            removed = write.remove(spec, target, SERVER_NAME)
+        except (TypeError, ValueError, OSError) as exc:
+            self.prompts.say(f"Could not update {target}: {exc}")
+            return
+        write.remove_backups(target)
+        if not removed:
+            self.prompts.say(f"No server entry in {target}")
+            return
+        install.prune_empty_dirs(target.parent, stop=self.home)
+        self.prompts.say(f"Removed the server entry from {target}")
 
     def _parse_harness_selection(
         self, value: str, specs: list[HarnessSpec]
@@ -1200,14 +1334,10 @@ class Wizard:
         install_result: install.InstallResult,
     ) -> None:
         dim = int(embedding["dim"])
-        fingerprint = embedding_fingerprint(embedding.get("document_prefix"))
         self.prompts.say()
         self.prompts.say("Setup complete.")
         for path in config_paths:
             self.prompts.say(f"  config:       {path}")
-        self.prompts.say(
-            f"  index:        {self.cwd / configfile.LOCAL_DIRNAME / 'index.db'}"
-        )
         self.prompts.say(
             f"  embedding:    {embedding['base_url']} "
             f"(model={embedding['model']}, dim={dim})"
@@ -1221,14 +1351,6 @@ class Wizard:
         if backend == "qdrant":
             assert qdrant is not None
             self.prompts.say(f"  qdrant:       {qdrant['url']}")
-            self.prompts.say(
-                f"  collection:   {derive_collection_name(self.cwd, dim, fingerprint)}"
-            )
-        else:
-            self.prompts.say(
-                f"  vectors:      "
-                f"{self.cwd / configfile.LOCAL_DIRNAME / 'vectors.faiss'}"
-            )
         for spec, target in self._written_harnesses:
             self.prompts.say(f"  harness:      {spec.label} -> {target}")
         self.prompts.say()
@@ -1242,6 +1364,22 @@ class Wizard:
             self.prompts.say(
                 "Changing the embedding model later re-embeds the workspace."
             )
+
+
+def _install_only(args: argparse.Namespace) -> int:
+    """Copy the checkout into the install directory without running setup."""
+    repo_root = (args.repo_root or _default_repo_root()).resolve()
+    target = install.target_root(install_dir=args.install_dir)
+    prompts = Prompter()
+    if target == repo_root:
+        prompts.say(f"Already running from the install directory: {target}")
+        return 0
+    if args.dry_run:
+        prompts.say(f"Would copy {repo_root} to {target}")
+        return 0
+    install.copy_repo(repo_root, target)
+    prompts.say(f"Copied {repo_root} to {target}")
+    return 0
 
 
 def run(argv: list[str] | None = None) -> int:
@@ -1312,9 +1450,24 @@ def run(argv: list[str] | None = None) -> int:
         help="override the per-user install directory",
     )
     parser.add_argument(
+        "--install-only",
+        action="store_true",
+        help="copy this checkout to the install directory and exit",
+    )
+    parser.add_argument(
         "--no-install",
         action="store_true",
         help="point harness entries at this checkout instead of copying it",
+    )
+    parser.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="remove the install copy, config, services, models and MCP entries",
+    )
+    parser.add_argument(
+        "--keep-models",
+        action="store_true",
+        help="with --uninstall: keep the downloaded model cache",
     )
     args = parser.parse_args(argv)
     if args.scope is not None:
@@ -1322,6 +1475,49 @@ def run(argv: list[str] | None = None) -> int:
             "--scope was removed: configuration is always global "
             "(~/.simple-ci/config.yaml)"
         )
+    install_flags = {
+        "--model": args.model,
+        "--model-url": args.model_url,
+        "--container": args.container,
+        "--embedding-url": args.embedding_url,
+        "--embedding-model": args.embedding_model,
+        "--vector-store": args.vector_store,
+        "--gpu": args.gpu,
+        "--harnesses": args.harnesses,
+        "--config-mode": args.config_mode,
+    }
+    if args.keep_models and not args.uninstall:
+        parser.error("--keep-models requires --uninstall")
+    if args.install_only and args.uninstall:
+        parser.error("--install-only and --uninstall cannot be combined")
+    if args.uninstall:
+        conflicts = [name for name, value in install_flags.items() if value is not None]
+        if args.no_install:
+            conflicts.append("--no-install")
+        if conflicts:
+            parser.error("--uninstall does not accept " + ", ".join(conflicts))
+        return uninstall.Uninstaller(
+            home=Path.home(),
+            repo_root=args.repo_root,
+            prompts=Prompter(),
+            runner=provision.Runner(),
+            platform=sys.platform,
+            config_path=args.config.expanduser() if args.config else None,
+            install_dir=args.install_dir,
+            keep_models=args.keep_models,
+            dry_run=args.dry_run,
+            assume_yes=args.yes,
+            server_name=SERVER_NAME,
+        ).run()
+    if args.install_only:
+        conflicts = [name for name, value in install_flags.items() if value is not None]
+        if args.no_install:
+            conflicts.append("--no-install")
+        if args.config is not None:
+            conflicts.append("--config")
+        if conflicts:
+            parser.error("--install-only does not accept " + ", ".join(conflicts))
+        return _install_only(args)
     wizard = Wizard(
         cwd=Path.cwd(),
         repo_root=args.repo_root,

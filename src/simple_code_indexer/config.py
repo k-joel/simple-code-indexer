@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from simple_code_indexer import model_prompts
 from simple_code_indexer.errors import ConfigError
@@ -59,9 +60,15 @@ class Settings:
     embed_document_prefix: str | None = None
     embed_fingerprint: str = ""
     config_sources: tuple[Path, ...] = ()
+    log_level: str = "debug"
+    log_max_bytes: int = 5_000_000
+    log_backups: int = 3
 
 
 VECTOR_STORES: frozenset[str] = frozenset({"faiss", "qdrant"})
+LOG_LEVELS: frozenset[str] = frozenset(
+    {"debug", "info", "warning", "error", "critical"}
+)
 
 
 def faiss_index_path(settings: Settings) -> Path:
@@ -75,6 +82,21 @@ def is_allowed(settings: Settings, path: Path) -> bool:
         path.name in settings.allowed_filenames
         or path.suffix.lower() in settings.allowed_exts
     )
+
+
+def ipv4_loopback(url: str) -> str:
+    """Point a loopback URL at 127.0.0.1.
+
+    Docker publishes ``127.0.0.1:<port>`` (IPv4 only), while ``localhost`` on
+    Windows resolves to ``::1`` first. Connecting to the dead IPv6 address
+    stalls until the connect timeout, so every embedding request paid ~1 s
+    before retrying IPv4.
+    """
+    parts = urlsplit(url)
+    if parts.hostname in {"localhost", "::1"}:
+        netloc = f"127.0.0.1:{parts.port}" if parts.port else "127.0.0.1"
+        return urlunsplit(parts._replace(netloc=netloc))
+    return url
 
 
 def normalize_workspace_path(workspace_root: Path) -> str:
@@ -143,6 +165,28 @@ def workspace_root_from_env() -> Path:
     """`WORKSPACE_ROOT` when set, else the process cwd (the harness spawn dir)."""
     env_root = os.environ.get("WORKSPACE_ROOT")
     return Path(env_root).resolve() if env_root else Path.cwd().resolve()
+
+
+def _reject_home_workspace(workspace_root: Path) -> None:
+    """Refuse a harness spawn that resolved to the user's home directory.
+
+    Some clients (the OpenCode desktop home screen) start the global MCP entry
+    with the home directory as cwd. Indexing all of home would write a huge
+    `~/.simple-ci/index.db` next to the global config, so fail loudly instead;
+    an explicit `WORKSPACE_ROOT` still opts in.
+    """
+    if os.environ.get("WORKSPACE_ROOT"):
+        return
+    try:
+        home = Path.home().resolve()
+    except (OSError, RuntimeError):
+        return
+    if workspace_root == home:
+        raise ConfigError(
+            "the harness started the server in the user home directory "
+            f"({workspace_root}); refusing to index it. Start a session in a "
+            "project folder or set WORKSPACE_ROOT to the directory to index."
+        )
 
 
 def _pick_str(env_name: str, file_value: str | None, default: str) -> str:
@@ -228,17 +272,40 @@ def _faiss_path(raw_path: str | None, workspace_root: Path) -> Path | None:
     return candidate.resolve()
 
 
+def _log_level(file_value: str | None, env_value: str | None) -> str:
+    """LOG_LEVEL > `log.level` > debug; an unknown name is a config error."""
+    for name, value in (("LOG_LEVEL", env_value), ("log.level", file_value)):
+        if value is None:
+            continue
+        normalized = value.strip().lower()
+        if normalized not in LOG_LEVELS:
+            raise ConfigError(
+                f"{name} must be one of {sorted(LOG_LEVELS)}, got {value!r}"
+            )
+        return normalized
+    return "debug"
+
+
 def load_settings() -> Settings:
     from simple_code_indexer import configfile
     from simple_code_indexer.registry import get_registry
 
     registry = get_registry()
     workspace_root = workspace_root_from_env()
+    _reject_home_workspace(workspace_root)
     config_paths = configfile.config_paths(workspace_root)
     raw = configfile.load_layered_config(config_paths) if config_paths else {}
     embedding = configfile.get_mapping(raw, "embedding")
     qdrant = configfile.get_mapping(raw, "qdrant")
     faiss = configfile.get_mapping(raw, "faiss")
+    log = configfile.get_mapping(raw, "log")
+    env_log_level = os.environ.get("LOG_LEVEL")
+    file_log_level = (
+        None
+        if env_log_level is not None
+        else configfile.get_str(log, "level", where="log")
+    )
+    log_level = _log_level(file_log_level, env_log_level)
     env_vector_store = os.environ.get("VECTOR_STORE")
     file_vector_store = (
         None
@@ -325,4 +392,13 @@ def load_settings() -> Settings:
         embed_document_prefix=document_prefix,
         embed_fingerprint=fingerprint,
         config_sources=config_paths,
+        log_level=log_level,
+        log_max_bytes=_pick_int(
+            "LOG_MAX_BYTES",
+            configfile.get_int(log, "max_bytes", where="log"),
+            5_000_000,
+        ),
+        log_backups=_pick_int(
+            "LOG_BACKUPS", configfile.get_int(log, "backups", where="log"), 3
+        ),
     )

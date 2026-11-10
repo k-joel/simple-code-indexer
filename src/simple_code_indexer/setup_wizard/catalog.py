@@ -50,7 +50,20 @@ CATALOG: tuple[EmbeddingModel, ...] = (
         dim=1024,
         pooling="last",
         approx_gb=0.7,
-        ctx_size=32768,
+        ctx_size=8192,
+        query_prefix=model_prompts.QWEN_CODE_QUERY,
+    ),
+    EmbeddingModel(
+        key="qwen3-embedding-4b",
+        label="Qwen3-Embedding-4B (2560-dim)",
+        url="https://huggingface.co/Qwen/Qwen3-Embedding-4B-GGUF/resolve/main/"
+        "Qwen3-Embedding-4B-Q6_K.gguf",
+        filename="Qwen3-Embedding-4B-Q6_K.gguf",
+        api_model="Qwen3-Embedding-4B-Q6_K",
+        dim=2560,
+        pooling="last",
+        approx_gb=3.3,
+        ctx_size=8192,
         query_prefix=model_prompts.QWEN_CODE_QUERY,
     ),
     EmbeddingModel(
@@ -63,6 +76,7 @@ CATALOG: tuple[EmbeddingModel, ...] = (
         dim=3584,
         pooling="last",
         approx_gb=4.5,
+        ctx_size=8192,
     ),
 )
 
@@ -70,12 +84,5 @@ CATALOG: tuple[EmbeddingModel, ...] = (
 def for_key(key: str) -> EmbeddingModel | None:
     for model in CATALOG:
         if model.key == key:
-            return model
-    return None
-
-
-def for_filename(filename: str) -> EmbeddingModel | None:
-    for model in CATALOG:
-        if model.filename == filename:
             return model
     return None

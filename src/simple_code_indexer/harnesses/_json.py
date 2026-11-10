@@ -40,6 +40,33 @@ def upsert(existing: str, *, root_key: str, name: str, entry: dict[str, Any]) ->
     return json.dumps(document, indent=2, ensure_ascii=False) + "\n"
 
 
+def remove(existing: str, *, root_key: str, name: str) -> str | None:
+    """Delete `root_key[name]`, pruning emptied containers along the path.
+
+    `None` means the entry was not there (nothing to write); an empty string
+    means the document had nothing else in it (the writer deletes the file).
+    """
+    document = parse(existing)
+    node: dict[str, Any] = document
+    chain: list[tuple[dict[str, Any], str]] = []
+    for part in root_key.split("."):
+        child = node.get(part)
+        if not isinstance(child, dict):
+            return None
+        chain.append((node, part))
+        node = child
+    if name not in node:
+        return None
+    del node[name]
+    for parent, key in reversed(chain):
+        child = parent.get(key)
+        if isinstance(child, dict) and not child:
+            del parent[key]
+    if not document:
+        return ""
+    return json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+
+
 def _resolve_root(document: dict[str, Any], root_key: str) -> dict[str, Any]:
     node = document
     for part in root_key.split("."):

@@ -124,6 +124,28 @@ def test_no_prompt_leaves_texts_unchanged(monkeypatch) -> None:
     assert captured["texts"] == ["alpha"]
 
 
+def test_post_embeddings_rewrites_loopback_to_ipv4(monkeypatch) -> None:
+    urls: list[str] = []
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"data": [{"index": 0, "embedding": [0.0] * 2560}]}
+
+    def fake_post(url: str, **kwargs) -> Response:
+        urls.append(url)
+        return Response()
+
+    monkeypatch.setattr(embed.httpx, "post", fake_post)
+
+    vectors = embed._post_embeddings(_settings("http://localhost:8080"), ["alpha"])
+
+    assert urls == ["http://127.0.0.1:8080/v1/embeddings"]
+    assert len(vectors) == 1
+
+
 def test_split_for_limit_prefers_lines_and_covers_text() -> None:
     text = "\n".join(f"line {i:04d} " + "x" * 80 for i in range(60))
     pieces = embed._split_for_limit(text)

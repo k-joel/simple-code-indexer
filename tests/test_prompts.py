@@ -76,6 +76,12 @@ def test_interactive_prompts_use_questionary(monkeypatch) -> None:
     _, _, select_kwargs = fake.calls[-1]
     assert select_kwargs["default"]["value"] == 0
     assert select_kwargs["use_search_filter"] is True
+    assert select_kwargs["use_jk_keys"] is False
+
+    assert prompter.ask_choice("pick", ["a", "b", "c"], default=0) == 1
+    _, _, select_kwargs = fake.calls[-1]
+    assert select_kwargs["use_search_filter"] is False
+    assert select_kwargs["use_jk_keys"] is True
 
     assert prompter.ask_multi("toggle", ["a", "b", "c"], default=[0]) == [0, 2]
     _, _, checkbox_kwargs = fake.calls[-1]

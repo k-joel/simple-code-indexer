@@ -62,6 +62,7 @@ explicitly:
 ```bash
 python setup.py --yes --model embeddinggemma2 --gpu auto
 python setup.py --yes --model qwen3-embedding-0.6b --vector-store faiss
+python setup.py --yes --model qwen3-embedding-4b --vector-store faiss
 python setup.py --yes --container llamacpp-qwen3-embedding-4b-q6_k --vector-store qdrant
 ```
 
@@ -74,9 +75,19 @@ selected harness at that copy:
 | macOS | `~/Library/Application Support/simple-code-indexer` |
 | Linux | `$XDG_DATA_HOME/simple-code-indexer` or `~/.local/share/simple-code-indexer` |
 
-Harness entries run `<install>/.venv/.../python.exe <install>/run_server.py`. The launcher
-runs `git pull --ff-only --autostash` first, runs `uv sync` only when `HEAD` moved, and then
-starts the server **in the harness's working directory**, so workspace inference is preserved.
+Harness entries run `uv run --project <install> --no-sync python <install>/run_server.py`.
+The launcher runs `git pull --ff-only --autostash` first, runs `uv sync` only when `HEAD`
+moved, and then starts the server **in the harness's working directory**, so workspace
+inference is preserved.
+
+To refresh only the installed copy — no prompts, config, services, harness entries, or
+environment sync of the copy — run:
+
+```bash
+python setup.py --install-only               # copies this checkout to the install directory
+python setup.py --install-only --dry-run     # print the source and target, copy nothing
+python setup.py --install-only --install-dir PATH
+```
 
 ### What the wizard asks
 
@@ -84,15 +95,34 @@ starts the server **in the harness's working directory**, so workspace inference
 |---|---|
 | Docker | Detected; if missing, offers to install it (`winget` on Windows, `brew` on macOS, the get.docker.com script on Linux) and waits for the daemon |
 | Existing config | If `~/.simple-ci/config.yaml` exists, shows it and offers **use / reconfigure / show file / cancel** (`--config-mode use\|reconfigure` answers non-interactively) |
-| Embedding source | A running server on `localhost:8080`, an existing Docker container (started for you; `--container NAME` forces one), an already-downloaded GGUF in `~/.simple-ci/model/`, a catalog download, or an existing URL |
+| Embedding source | An existing Docker container (every container is listed; running ones are marked `(running)` and stopped ones are started for you — `--container NAME` forces one), a catalog download (models already in `~/.simple-ci/model/` are marked `(downloaded)`), an existing URL, or Cancel |
 | Embedding dimension | Always probed from a real `/v1/embeddings` call; catalog values are only an offline fallback |
 | Vector store | **FAISS** (recommended — a local file, no Docker) or **Qdrant** (existing container/URL, or Docker compose) |
 | Harnesses | Multi-select from detected harnesses; selected harnesses are always installed at their **global** scope (`--harnesses all\|none\|name,name` is non-interactive) |
 | Install | Copies the repo to the per-user app directory and runs `uv sync` there (`--install-dir`, `--no-install`) |
 
-The wizard also appends `.simple-ci/` to the project `.gitignore` and offers to migrate a
-legacy `.index/` directory. `--config PATH` writes one explicit config file for tests/advanced
-use. `--scope` was removed: configuration is always global.
+The wizard writes nothing into the current workspace: config, services, models and the
+installed copy are all global. The server creates `<project>/.simple-ci/` (index + vectors)
+only when it runs in a project. `--config PATH` writes one explicit config file for
+tests/advanced use. `--scope` was removed: configuration is always global.
+
+### Uninstall
+
+```bash
+python setup.py --uninstall --dry-run        # print the plan, delete nothing
+python setup.py --uninstall                  # asks once; --yes skips the prompt
+python setup.py --uninstall --keep-models    # keep the downloaded GGUFs
+```
+
+Uninstall is record-driven. The wizard records `setup.install_root` and `setup.harnesses`
+(`{name, config}` per harness) in `config.yaml`, so the same record also lets a later
+`python setup.py` **remove the entry from a harness you deselect**. `--uninstall` stops the
+compose services (`docker compose ... down --remove-orphans`, best-effort), then deletes the
+installed copy, `~/.simple-ci/config.yaml`, `~/.simple-ci/docker/`, the model cache (unless
+`--keep-models`), the recorded MCP entries and the `<config>.bak.<stamp>` backups setup
+created. Workspace `.simple-ci/` indexes, externally managed containers and plain
+`--embedding-url` endpoints are left alone; a config path that does not look like an install
+(no `run_server.py`) or that contains the working checkout is never deleted.
 
 ### Model prompt instructions
 
@@ -120,6 +150,7 @@ identity, so changing it re-embeds the workspace; changing only the query prefix
 | `%APPDATA%/simple-code-indexer/` | Installed copy (`.git`, source, `.venv`, `run_server.py`) that harnesses launch |
 | `<project>/.simple-ci/index.db` | SQLite index (+ WAL files and the single-writer lock) |
 | `<project>/.simple-ci/vectors.faiss` | FAISS vectors (default backend; override with `faiss.path`) |
+| `<project>/.simple-ci/log/sci.log` | Runtime diagnostics (rotated: `sci.log.1 … sci.log.3`) |
 
 The FAISS index and SQLite database stay **per workspace**; only the configuration is global.
 `vector_store` and an optional `faiss.path` live in the global file, so every project uses the
@@ -143,13 +174,13 @@ Builtin plugins write the server entry into each client's own file:
 | Windsurf / Devin Local | `~/.config/devin/mcp_config.json` (legacy `~/.codeium/windsurf/mcp_config.json`) |
 | VS Code | `%APPDATA%/Code/User/mcp.json` (and macOS/Linux equivalents) |
 | Zed | `~/.config/zed/settings.json` |
-| Cline | `~/.cline/data/settings/cline_mcp_settings.json` |
 | Command Code | `~/.commandcode/mcp.json` |
 | MiMoCode | `~/.config/mimocode/mimocode.json`, `~/.config/mimocode/config.json`, legacy `~/.mimocode/mimocode.json` |
 
 The wizard does **not** ask where to save each harness: selected harnesses are installed at
 their global scope. The entry is
-`<install>/.venv/.../python <install>/run_server.py`. Restart the harness after it is written;
+`uv run --project <install> --no-sync python <install>/run_server.py`. Restart the harness
+after it is written;
 the file is read at session start. Codex/MiMo/OpenCode get a 120 s startup timeout because the
 launcher may sync dependencies and the server waits for Docker services before serving.
 
@@ -170,7 +201,7 @@ embedding:
   query_prefix: "task: code retrieval | query: {query}"
   document_prefix: "title: {title} | text: {content}"
   service:                 # optional: server starts this container at boot
-    container: simple-ci-embed
+    container: simple-ci-embed-1   # compose-derived: <project>-<service>-<n>
     compose_file: /home/you/.simple-ci/docker/docker-compose.yml
     compose_service: embed
     startup_timeout_s: 60
@@ -195,8 +226,8 @@ qdrant:
   url: http://localhost:6333
   collection: code_index_my-app_1a2b3c4d_768   # optional; derived when absent
   service:                 # optional: server starts this container at boot
-    container: simple-ci-qdrant
-    compose_file: /home/you/.simple-ci/docker-compose.yml
+    container: simple-ci-qdrant-1
+    compose_file: /home/you/.simple-ci/docker/docker-compose.yml
     compose_service: qdrant
     startup_timeout_s: 45
 sweep_seconds: 45
@@ -252,6 +283,30 @@ The existing Qwen3-4B container was originally created with `LLAMA_ARG_POOLING=m
 recreating it with `last`, its nDCG@10 rose from 0.317 to 0.719. The wizard warns when it
 detects a Qwen3 model in a mean-pooling container.
 
+### Logging
+
+Every server process writes `<workspace>/.simple-ci/log/sci.log` (rotated at 5 MB, three
+backups) while stderr keeps the INFO summary the harness shows. The file is DEBUG by default:
+startup banner, managed-service lifecycle, every database write and FTS query, chunk
+boundaries, per-file index outcomes, sweep summaries, watcher events, embed/vector-store
+timings, and every tool call with its query, hit count and latency. File contents are never
+logged — only paths, sizes, line ranges and counts.
+
+```yaml
+log:
+  level: debug        # debug | info | warning | error | critical (file only)
+  max_bytes: 5000000
+  backups: 3
+```
+
+Environment overrides: `LOG_LEVEL`, `LOG_MAX_BYTES`, `LOG_BACKUPS`. `get_status.log_file`
+reports the active path. Quick looks:
+
+```powershell
+Get-Content .simple-ci/log/sci.log -Tail 80            # last events
+Select-String -Path .simple-ci/log/sci.log -Pattern "ERROR|WARNING|tool="
+```
+
 ### Troubleshooting
 
 | Symptom | Fix |
@@ -283,7 +338,12 @@ detects a Qwen3 model in a mean-pooling container.
 
 Start the backing services (let the wizard manage them, run your own compose project, or
 `docker run` them), then let the harness spawn the server per session. The FAISS backend
-needs only the embedding endpoint. Nothing to stop: the server exits with the session.
+needs only the embedding endpoint. The server exits when the stdio session closes; it also
+watches the processes that launched it (the uv launcher and venv trampoline included), so it
+exits when a harness process disappears even if the pipe stays open.
+`SIMPLE_CI_PARENT_WATCH=0` disables that watchdog. A service started outside the harness UI
+(e.g. `opencode service start` from a shell) has no UI ancestor and is the known exception —
+see the harness bullet below.
 
 ```bash
 # Qdrant, only when vector_store: qdrant
@@ -312,7 +372,12 @@ uv run python tests/service_probe.py    # expect: embeddings OK dim=<your config
     "simple-code-indexer": {
       "type": "local",
       "command": [
-        "C:\\Users\\you\\AppData\\Roaming\\simple-code-indexer\\.venv\\Scripts\\python.exe",
+        "C:\\Users\\you\\.local\\bin\\uv.exe",
+        "run",
+        "--project",
+        "C:\\Users\\you\\AppData\\Roaming\\simple-code-indexer",
+        "--no-sync",
+        "python",
         "C:\\Users\\you\\AppData\\Roaming\\simple-code-indexer\\run_server.py"
       ],
       "enabled": true,
@@ -326,6 +391,11 @@ uv run python tests/service_probe.py    # expect: embeddings OK dim=<your config
 - The launcher runs `git pull --ff-only --autostash` in the installed copy, re-runs `uv sync`
   when `HEAD` moved, then starts the server in the harness's cwd. Set `SIMPLE_CI_GIT_PULL=0`
   to skip the pull (offline use or local development).
+- The server watches its launch chain (including the uv launcher and venv `python.exe`
+  trampoline) and exits when an ancestor process dies; `SIMPLE_CI_PARENT_WATCH=0` disables it.
+  When OpenCode's desktop UI starts `opencode-cli serve --service`, the UI is an ancestor, so
+  closing it stops the server even though the service survives. A service started from a shell
+  is detached and not covered; stop it with `opencode service stop` when needed.
 - Gate: `mimo mcp list` must show `✓ simple-code-indexer connected`.
 - Tools exposed: `search_code` (lexical; `semantic=true` uses the vector store), `symbol_lookup`, `get_status`.
 
@@ -373,14 +443,14 @@ Remove-Item -Recurse -Force .simple-ci   # or: rm -rf .simple-ci
 | Save not picked up within 5 s | Reconciliation sweep (45 s) is the backstop; then check `last_sweep` in `get_status`. |
 | Semantic hits empty but lexical works | The vector-store identity changed without a rebuild (restart the session), or vectors failed earlier — the next sweep retries chunks whose `embedding_state` is not `ok`; if the log reports a vector width/collection-size mismatch, align `EMBED_DIM` (and for Qdrant delete the mismatched collection). |
 | `config_file: null` in `get_status` | `~/.simple-ci/config.yaml` does not exist; run `python setup.py` or create one. Project-local configs are ignored |
-| Logs | stderr of the spawned server (harness); never files in the workspace root. |
+| Logs | stderr of the spawned server (harness, INFO) **and** `<workspace>/.simple-ci/log/sci.log` (DEBUG, rotated). `get_status.log_file` names the active file; nothing is written to the workspace root. |
 
 ### Retired state
 
 The pre-ADR-0008 deployment used a global collection `code_index_2560` and a
 `docker exec`-attached container. Nothing reads that collection now — delete it in Qdrant
-by hand when convenient. The old `.index/` directory is migrated by the wizard and remains
-ignored for backwards compatibility. Switching a workspace from Qdrant to FAISS (or back)
+by hand when convenient. The old `.index/` directory is no longer read or migrated; delete
+it by hand. Switching a workspace from Qdrant to FAISS (or back)
 also leaves the previous store's vectors orphaned; the Qdrant collection can be deleted by
 hand, and the FAISS file is replaced on the next identity reset.
 
