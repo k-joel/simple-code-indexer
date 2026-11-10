@@ -4,13 +4,15 @@ Run it in a fresh process per model/backend combination (``bench_matrix.py`` doe
 that) so FAISS and embed module state never leak between runs.
 
     uv run python tests/retrieval_bench.py \
-        --workspace . --model embeddinggemma-2 --base-url http://localhost:8080 \
+        --workspace . --local-path artifacts/bench/local \
+        --model embeddinggemma-2 --base-url http://localhost:8080 \
         --vector-store faiss --reset --out artifacts/gemma-faiss.json
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import os
@@ -23,7 +25,13 @@ from pathlib import Path
 from typing import Any
 
 from simple_code_indexer import db, embed, indexer, vector_store
-from simple_code_indexer.config import faiss_index_path, load_settings
+from simple_code_indexer.config import (
+    Settings,
+    derive_collection_name,
+    faiss_index_path,
+    load_settings,
+)
+from simple_code_indexer.configfile import LOCAL_DIRNAME
 from simple_code_indexer.errors import ConfigError, EmbedError, VectorStoreUnavailable
 from simple_code_indexer.setup_wizard import probe
 
@@ -39,11 +47,30 @@ _ENV_OVERRIDES = (
     "VECTOR_STORE",
     "QDRANT_URL",
     "QDRANT_COLLECTION",
-    "FAISS_PATH",
-    "INDEX_DB",
     "SWEEP_SECONDS",
     "DEBOUNCE_MS",
 )
+
+
+def _local_state_env(local_path: Path) -> dict[str, str]:
+    """Point the index and the vectors at one folder instead of `.simple-ci`."""
+    resolved = local_path.expanduser().resolve()
+    return {
+        "INDEX_DB": str(resolved / "index.db"),
+        "FAISS_PATH": str(resolved / "vectors.faiss"),
+    }
+
+
+def _isolate_collection(settings: Settings, local_path: Path) -> Settings:
+    """Derive the Qdrant collection from the scratch folder, not the workspace."""
+    return dataclasses.replace(
+        settings,
+        qdrant_collection=derive_collection_name(
+            local_path.expanduser().resolve(),
+            settings.embed_dim,
+            settings.embed_fingerprint,
+        ),
+    )
 
 
 def recall_at_k(ranked: list[str], expected: list[str], k: int) -> float:
@@ -182,6 +209,8 @@ def run(args: argparse.Namespace) -> int:
 
     for name in _ENV_OVERRIDES:
         os.environ.pop(name, None)
+    if args.local_path is not None:
+        os.environ.update(_local_state_env(args.local_path))
     os.environ["WORKSPACE_ROOT"] = str(workspace)
 
     http = probe.Http()
@@ -206,7 +235,16 @@ def run(args: argparse.Namespace) -> int:
     os.environ["SIMPLE_CI_CONFIG"] = str(config_path)
 
     settings = load_settings()
+    if args.local_path is not None:
+        settings = _isolate_collection(settings, args.local_path)
     if args.reset:
+        live_index = workspace / LOCAL_DIRNAME / "index.db"
+        if settings.index_db_path.resolve() == live_index.resolve():
+            print(
+                f"warning: --reset deletes the live workspace index {live_index}; "
+                "pass --local-path DIR to isolate the benchmark",
+                file=sys.stderr,
+            )
         _reset(settings, args.vector_store)
 
     started = time.perf_counter()
@@ -325,6 +363,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--label", default=None)
+    parser.add_argument(
+        "--local-path",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="write index.db, vectors.faiss and the Qdrant collection into DIR "
+        "instead of <workspace>/.simple-ci",
+    )
     parser.add_argument("--reset", action="store_true")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args(argv)

@@ -179,6 +179,7 @@ def _downloaded_endpoint(
 def _run_bench(
     *,
     workspace: Path,
+    local_path: Path,
     label: str,
     model: str,
     base_url: str,
@@ -191,6 +192,8 @@ def _run_bench(
         str(BENCH_SCRIPT),
         "--workspace",
         str(workspace),
+        "--local-path",
+        str(local_path),
         "--model",
         model,
         "--base-url",
@@ -345,10 +348,12 @@ def main(argv: list[str] | None = None) -> int:
         for backend in backends:
             label = f"{spec.label} / {backend}"
             out = run_dir / f"{spec.key}-{backend}.json"
+            local_path = run_dir / "local" / f"{spec.key}-{backend}"
             print(f"-- {label}")
             results.append(
                 _run_bench(
                     workspace=workspace,
+                    local_path=local_path,
                     label=label,
                     model=model,
                     base_url=url,

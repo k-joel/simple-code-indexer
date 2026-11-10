@@ -304,6 +304,23 @@ def stats(conn: sqlite3.Connection) -> dict[str, int]:
     }
 
 
+def embedding_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Embedded vs pending chunk counts; a chunk is pending until status='ok'."""
+    row = conn.execute(
+        """
+        SELECT
+          (SELECT COUNT(*) FROM chunks) AS chunks,
+          (SELECT COUNT(*) FROM chunks c
+             JOIN embedding_state e ON e.chunk_id = c.id
+            WHERE e.status = 'ok') AS embedded
+        """
+    ).fetchone()
+    assert row is not None
+    chunks = int(row["chunks"])
+    embedded = int(row["embedded"])
+    return {"embedded": embedded, "pending": chunks - embedded}
+
+
 def chunk_ids_for_path(conn: sqlite3.Connection, path: str) -> list[tuple[int, int]]:
     """(chunk_id, chunk_index) pairs for one indexed path."""
     rows = conn.execute(

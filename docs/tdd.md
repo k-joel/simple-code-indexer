@@ -328,7 +328,7 @@ class Settings:
     faiss_path: Path | None = None
     embed_query_prefix: str | None = None       # e.g. "task: code retrieval | query: {query}"
     embed_document_prefix: str | None = None    # e.g. "title: {title} | text: {content}"
-    embed_fingerprint: str = ""                 # sha256(document_prefix)[:8], or ""
+    embed_fingerprint: str = ""                 # sha256(document_prefix + chunker)[:8]
     config_sources: tuple[Path, ...] = ()       # every layered file, lowest precedence first
     log_level: str = "debug"                    # file verbosity; stderr stays at info
     log_max_bytes: int = 5_000_000              # rotation threshold
@@ -344,9 +344,10 @@ variable overrides the merged file value.
 Prompt resolution is env (`EMBED_QUERY_PREFIX`, `EMBED_DOCUMENT_PREFIX`) > explicit file
 value (empty disables) > `model_prompts.defaults_for_model(embed_model)`. Templates are
 validated at load time (`{query}` / `{title}` / `{content}`); bad placeholders raise
-`ConfigError`. `embed_fingerprint` hashes only the document prefix, because only that
-changes stored chunk vectors; it is appended to the FAISS identity and the derived Qdrant
-collection name.
+`ConfigError`. `embed_fingerprint` hashes the document prefix plus the chunker profile
+(`parse.CHUNKER_VERSION`), because both change stored chunk vectors; it is appended to the
+FAISS identity and the derived Qdrant collection name. Changing only the query prompt does
+not change the fingerprint and does not force a re-embed.
 **Never** hardcode secrets in code; `EMBED_API_KEY` / `embedding.api_key` is optional and
 sent as a bearer token. If a feature is unused, omit it from config entirely (no empty
 blocks that enable fallbacks).
@@ -390,7 +391,7 @@ Use context managers for connections; specific exceptions (`sqlite3.Error`) wrap
 
 - `detect_language(path) -> str | None` from extension allowlist.
 - `extract_symbols(path, source) -> list[Symbol]` via `tree_sitter_language_pack.get_parser(lang)`.
-- `chunk_source(source, max_lines=80, max_chars=2000) -> list[Chunk]` — line-aligned windows; fallback for unknown languages: regex-ish symbol scan (def/class/function) + same chunker.
+- `chunk_source(source, max_lines=30, max_chars=1200, overlap_lines=15) -> list[Chunk]` — line-aligned overlapping windows. Focused windows matter for mean-pooled embedding models; 50% overlap keeps a symbol inside at least one window even when it straddles a boundary. A char-budget cut never skips lines (the next window starts at the first uncovered line). Fallback for unknown languages: regex-ish symbol scan (def/class/function) + the same chunker. Changing the defaults/overlap requires bumping `CHUNKER_VERSION` so stored vectors are invalidated.
 
 v1 allowlist minimum: `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`, `.py`, `.ts`, `.js`. Generic chunking for anything else in the allowlist.
 
@@ -398,10 +399,16 @@ v1 allowlist minimum: `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`, `.py`, `.ts`, `.js`. 
 
 ### 7.5 `embed.py`
 
-- `embed_texts(texts: Sequence[str]) -> list[list[float]]` — one POST `{base}/v1/embeddings` with `{"model": …, "input": texts}`. Raw: no prompt, used by service probes.
+- `embed_texts(texts: Sequence[str]) -> list[list[float]]` — one or more POSTs to
+  `{base}/v1/embeddings` with `{"model": …, "input": texts}`; inputs are split into batches of at
+  most 16 pieces so a bulk reindex cannot occupy the shared endpoint for an entire file. Raw: no
+  prompt, used by service probes.
 - `embed_documents(texts, title=…)` — applies `embed_document_prefix` (EmbeddingGemma 2's `title: {title} | text: {content}`, `title: none` when absent) then calls `embed_texts`.
 - `embed_query(text)` — applies `embed_query_prefix` (EmbeddingGemma's `task: code retrieval | query: …`, Qwen3's `Instruct: …\nQuery: …`) then calls `embed_texts`.
 - Explicit `timeout=15`, **retries=0..2**, no default OpenAI client behavior toward the public internet.
+- At most 2 HTTP posts in flight per process (`threading.BoundedSemaphore`), and retries use
+  full-jitter exponential backoff (`U(0, min(2 s, 0.5 s · 2^attempt))`). This is request-level
+  back-pressure, not an endpoint-wide limiter: N workspaces still multiply the load.
 - Measure dim on first response; assert equals `Settings.embed_dim`.
 - Fail soft on index path: log, mark `embedding_state.status='error'`, continue lexical indexing.
 - Retry on the next sweep: `indexer.reembed_pending` re-embeds chunks whose
@@ -485,7 +492,23 @@ Output shapes are the contract (probe-tested). Do not emit `outputSchema`.
 }
 ```
 
-When `semantic=true`, `source` is `"semantic"` (or `"hybrid"` if fused later).
+When `semantic=true`, `source` is `"semantic"` (or `"hybrid"` if fused later). Semantic responses
+always include `ready` and `pending_embeddings` (chunks whose `embedding_state.status != 'ok'`);
+`message` appears only while `ready` is false:
+
+```json
+{
+  "hits": [],
+  "source": "semantic",
+  "ready": false,
+  "pending_embeddings": 12,
+  "message": "semantic index is warming up: 12 chunk(s) still pending embedding"
+}
+```
+
+An empty `hits` with `ready: false` means vectors are still being written, not that nothing
+matched; `ready: true` with empty `hits` is a genuine no-match. A failed embedding or vector-store
+call returns `ready: false` with a `semantic search unavailable: …` message instead of raising.
 
 ### 8.2 `symbol_lookup`
 
@@ -517,6 +540,8 @@ Ambiguous: `found: true` with `matches[]` sorted by path.
   "files_indexed": 12,
   "symbols_indexed": 87,
   "chunks_indexed": 240,
+  "vectors_indexed": 228,
+  "pending_embeddings": 12,
   "watcher_alive": true,
   "last_sweep": "2026-10-17T20:01:02Z",
   "ignored_dirs": 3,
@@ -540,7 +565,10 @@ Ambiguous: `found: true` with `matches[]` sorted by path.
 `workspace` is how a live harness's workspace inference is verified (`vector_index` names
 the FAISS file or the derived Qdrant collection). `ignored_dirs`/`ignored_files` are what
 the last sweep pruned via `.gitignore` (0 before the first sweep completes or when none
-match). `config_file` is `null` when no config file exists. `log_file` is `null` when the
+match). `vectors_indexed` counts chunks with `embedding_state.status='ok'`; `pending_embeddings`
+is `chunks_indexed - vectors_indexed` (an absent row, `error`, and `missing` all count as
+pending). `vector_store_ok` alone does not mean vectors exist — it is true for an empty index.
+`config_file` is `null` when no config file exists. `log_file` is `null` when the
 log could not be opened. `services` values are `running`, `started`, `unavailable`, or
 `not_managed`.
 

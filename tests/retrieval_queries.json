@@ -246,6 +246,12 @@
       "query": "how are .gitignore files parsed and applied when walking and watching the workspace",
       "expected_files": ["src/simple_code_indexer/ignore.py", "src/simple_code_indexer/indexer.py", "src/simple_code_indexer/watcher.py"],
       "tags": ["indexer", "watcher"]
+    },
+    {
+      "id": "q42-walk-pruning",
+      "query": "how does the indexer avoid walking into virtualenv and cache directories",
+      "expected_files": ["src/simple_code_indexer/indexer.py"],
+      "tags": ["indexer"]
     }
   ]
 }

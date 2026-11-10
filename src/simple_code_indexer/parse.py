@@ -39,6 +39,18 @@ _REGEX_SYMBOLS: tuple[tuple[re.Pattern[str], str], ...] = (
 
 _parsers: dict[str, Any] = {}
 
+# Chunk shape is a retrieval-quality knob, not only a token budget. The
+# configured model (EmbeddingGemma 2) mean-pools each input, so a focused
+# 30-line window scores far above an 80-line block that mixes unrelated
+# declarations; 50% overlap keeps a whole function body inside at least one
+# window even when it straddles a boundary. CHUNKER_VERSION is part of the
+# vector identity (see config.embedding_fingerprint), so changing any of these
+# values re-embeds the workspace instead of mixing old and new vectors.
+CHUNK_LINES = 30
+CHUNK_CHARS = 1200
+CHUNK_OVERLAP_LINES = 15
+CHUNKER_VERSION = f"windows/{CHUNK_LINES}x{CHUNK_OVERLAP_LINES}/{CHUNK_CHARS}"
+
 
 def detect_language(path: Path) -> str | None:
     """Map a path to a plugin language name, or None if not allowlisted."""
@@ -49,14 +61,28 @@ def detect_language(path: Path) -> str | None:
 
 
 def chunk_source(
-    source: str, *, max_lines: int = 80, max_chars: int = 2000
+    source: str,
+    *,
+    max_lines: int = CHUNK_LINES,
+    max_chars: int = CHUNK_CHARS,
+    overlap_lines: int = CHUNK_OVERLAP_LINES,
 ) -> list[Chunk]:
-    """Line-aligned chunk windows bounded by max_lines and max_chars."""
+    """Line-aligned overlapping windows bounded by max_lines and max_chars.
+
+    Adjacent windows share `overlap_lines` lines so a symbol that crosses a
+    window boundary still appears whole in one of them. The char budget may end
+    a window early; the next window then starts at the first uncovered line, so
+    a long-line file never loses content.
+    """
     lines = source.splitlines()
+    if not lines:
+        return []
+    total = len(lines)
+    step = max(1, max_lines - max(0, overlap_lines))
     chunks: list[Chunk] = []
     start = 0
-    while start < len(lines):
-        end = min(start + max_lines, len(lines))
+    while start < total:
+        end = min(start + max_lines, total)
         content = "\n".join(lines[start:end])
         while len(content) > max_chars and end > start + 1:
             end -= 1
@@ -70,7 +96,9 @@ def chunk_source(
                     content=content,
                 )
             )
-        start = end
+        if end >= total:
+            break
+        start = max(start + 1, min(start + step, end))
     return chunks
 
 

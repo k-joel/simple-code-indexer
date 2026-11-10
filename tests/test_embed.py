@@ -1,9 +1,11 @@
 import json
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import replace
 from pathlib import Path
 
+import httpx
 import pytest
 
 from simple_code_indexer import embed
@@ -124,6 +126,24 @@ def test_no_prompt_leaves_texts_unchanged(monkeypatch) -> None:
     assert captured["texts"] == ["alpha"]
 
 
+def test_embed_texts_splits_requests_into_batches(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_post(settings: Settings, texts: list[str]) -> list[list[float]]:
+        calls.append(list(texts))
+        return [[0.0] * settings.embed_dim for _ in texts]
+
+    monkeypatch.setattr(embed, "_post_embeddings", fake_post)
+    settings = _settings("http://unused")
+
+    vectors = embed.embed_texts(settings, [f"text-{i}" for i in range(40)])
+
+    assert [len(call) for call in calls] == [16, 16, 8]
+    assert len(vectors) == 40
+    assert calls[0][0] == "text-0"
+    assert calls[-1][-1] == "text-39"
+
+
 def test_post_embeddings_rewrites_loopback_to_ipv4(monkeypatch) -> None:
     urls: list[str] = []
 
@@ -144,6 +164,80 @@ def test_post_embeddings_rewrites_loopback_to_ipv4(monkeypatch) -> None:
 
     assert urls == ["http://127.0.0.1:8080/v1/embeddings"]
     assert len(vectors) == 1
+
+
+def test_retry_uses_jittered_backoff_and_marks_not_ok(monkeypatch) -> None:
+    delays: list[float] = []
+    attempts = 0
+
+    def failing_post(url: str, **kwargs) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr(embed.httpx, "post", failing_post)
+    monkeypatch.setattr(embed, "_sleep", delays.append)
+    monkeypatch.setattr(embed, "LAST_OK", None)
+
+    with pytest.raises(EmbedError):
+        embed._post_embeddings(_settings("http://localhost:8080"), ["alpha"])
+
+    assert attempts == embed._ATTEMPTS
+    assert len(delays) == embed._ATTEMPTS - 1
+    for attempt, delay in enumerate(delays):
+        ceiling = min(embed._BACKOFF_CAP_S, embed._BACKOFF_BASE_S * 2**attempt)
+        assert 0.0 <= delay <= ceiling
+    assert embed.LAST_OK is False
+
+
+def test_post_embeddings_caps_in_flight_requests(monkeypatch) -> None:
+    lock = threading.Lock()
+    release = threading.Event()
+    active = 0
+    peak = 0
+    started = 0
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"data": [{"index": 0, "embedding": [0.0] * 2560}]}
+
+    def fake_post(url: str, **kwargs) -> Response:
+        nonlocal active, peak, started
+        with lock:
+            active += 1
+            started += 1
+            peak = max(peak, active)
+            if started >= embed._MAX_INFLIGHT:
+                release.set()
+        release.wait(timeout=2.0)
+        with lock:
+            active -= 1
+        return Response()
+
+    monkeypatch.setattr(embed.httpx, "post", fake_post)
+    results: list[list[list[float]]] = []
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            results.append(
+                embed._post_embeddings(_settings("http://localhost:8080"), ["alpha"])
+            )
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assertions
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+
+    assert not errors
+    assert len(results) == 4
+    assert peak == embed._MAX_INFLIGHT
 
 
 def test_split_for_limit_prefers_lines_and_covers_text() -> None:

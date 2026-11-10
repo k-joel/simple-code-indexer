@@ -61,7 +61,8 @@ def test_defaults_come_from_the_process_cwd(monkeypatch) -> None:
     assert settings.log_max_bytes == 5_000_000
     assert settings.log_backups == 3
     assert settings.qdrant_collection.startswith("code_index_")
-    assert settings.qdrant_collection.endswith("_2560")
+    assert f"_{settings.embed_dim}_" in settings.qdrant_collection
+    assert settings.qdrant_collection.endswith(settings.embed_fingerprint)
     assert COLLECTION_RE.fullmatch(settings.qdrant_collection)
     assert ".cpp" in settings.allowed_exts
     assert ".git" in settings.ignore_dirs
@@ -101,7 +102,8 @@ def test_env_overrides(monkeypatch) -> None:
     assert settings.sweep_seconds == 10.0
     # Collection follows the overridden workspace, not the process cwd.
     assert "_data_" in settings.qdrant_collection
-    assert settings.qdrant_collection.endswith("_2560")
+    assert f"_{settings.embed_dim}_" in settings.qdrant_collection
+    assert settings.qdrant_collection.endswith(settings.embed_fingerprint)
 
 
 def test_collection_env_override_wins(monkeypatch) -> None:
@@ -115,7 +117,8 @@ def test_embed_dim_env_is_encoded_in_the_name(monkeypatch) -> None:
     monkeypatch.delenv("QDRANT_COLLECTION", raising=False)
     settings = load_settings()
     assert settings.embed_dim == 1024
-    assert settings.qdrant_collection.endswith("_1024")
+    assert "_1024_" in settings.qdrant_collection
+    assert settings.qdrant_collection.endswith(settings.embed_fingerprint)
 
 
 def test_collection_name_matches_the_spec_algorithm(tmp_path: Path) -> None:

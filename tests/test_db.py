@@ -172,6 +172,31 @@ def test_chunks_needing_embedding_reports_missing_and_failed(
         assert db.chunks_needing_embedding(conn) == []
 
 
+def test_embedding_counts_tracks_ok_and_pending(tmp_path: Path) -> None:
+    with db.connect(db_path=tmp_path / "index.db") as conn:
+        db.ensure_schema(conn)
+        file_id = db.upsert_file(conn, _record())
+        db.replace_file_chunks(
+            conn,
+            file_id,
+            [
+                Chunk(chunk_index=0, start_line=1, end_line=1, content="int a()"),
+                Chunk(chunk_index=1, start_line=2, end_line=2, content="int b()"),
+            ],
+        )
+        ids = db.chunk_ids_for_path(conn, "src/foo.cpp")
+        assert db.embedding_counts(conn) == {"embedded": 0, "pending": 2}
+
+        db.record_embedding_state(conn, [(ids[0][0], "point-0", "error")])
+        assert db.embedding_counts(conn) == {"embedded": 0, "pending": 2}
+
+        db.record_embedding_state(
+            conn,
+            [(ids[0][0], "point-0", "ok"), (ids[1][0], "point-1", "ok")],
+        )
+        assert db.embedding_counts(conn) == {"embedded": 2, "pending": 0}
+
+
 def _seed_rows(conn) -> None:
     file_id = db.upsert_file(conn, _record())
     db.replace_file_chunks(

@@ -7,16 +7,29 @@ Run it from the workspace to index: the server inherits the process cwd unless
 `WORKSPACE_ROOT` is set. Dumps the exact wire payloads so harness rejections
 (outputSchema, tasks) can be inspected byte-for-byte. Exits non-zero if any
 contract check fails.
+
+The server's stderr is drained on a thread (an unread pipe blocks the server on
+its next INFO log write), and `PROBE_TIMEOUT` (seconds, default 180) bounds the
+child's lifetime so a stall becomes `PROBE FAIL` instead of a hang.
 """
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
+
+_STDERR_TAIL: collections.deque[str] = collections.deque(maxlen=200)
+_DEFAULT_PROBE_TIMEOUT_S = 180.0
+
+
+def _stderr_tail(lines: int = 10) -> str:
+    return "\n".join(list(_STDERR_TAIL)[-lines:])
 
 
 class ProbeError(SystemExit):
@@ -39,7 +52,11 @@ def _read_until(proc: subprocess.Popen[str], msg_id: int) -> dict[str, Any]:
     for _ in range(200):
         line = proc.stdout.readline()
         if not line:
-            raise ProbeError(f"server closed stdout waiting for id {msg_id}")
+            tail = _stderr_tail()
+            raise ProbeError(
+                f"server closed stdout waiting for id {msg_id}"
+                + (f"; stderr tail:\n{tail}" if tail else "")
+            )
         try:
             msg = json.loads(line)
         except json.JSONDecodeError:
@@ -58,8 +75,15 @@ def _send(proc: subprocess.Popen[str], msg: dict[str, Any]) -> None:
     proc.stdin.flush()
 
 
-def main() -> None:
-    cmd = sys.argv[1:] or [sys.executable, "-m", "simple_code_indexer.server"]
+def _drain_stderr(proc: subprocess.Popen[str]) -> None:
+    """Keep the child's stderr pipe empty; retain only a tail for failures."""
+    assert proc.stderr is not None
+    for line in proc.stderr:
+        _STDERR_TAIL.append(line.rstrip())
+
+
+def _spawn(cmd: list[str]) -> tuple[subprocess.Popen[str], threading.Timer]:
+    """Spawn the server with a drained stderr and a bounded lifetime."""
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
@@ -69,6 +93,19 @@ def main() -> None:
         encoding="utf-8",
         errors="replace",
     )
+    threading.Thread(
+        target=_drain_stderr, args=(proc,), daemon=True, name="stderr-drain"
+    ).start()
+    timeout = float(os.environ.get("PROBE_TIMEOUT", _DEFAULT_PROBE_TIMEOUT_S))
+    watchdog = threading.Timer(timeout, proc.kill)
+    watchdog.daemon = True
+    watchdog.start()
+    return proc, watchdog
+
+
+def main() -> None:
+    cmd = sys.argv[1:] or [sys.executable, "-m", "simple_code_indexer.server"]
+    proc, watchdog = _spawn(cmd)
     assert proc.stdin is not None and proc.stdout is not None
 
     try:
@@ -113,6 +150,8 @@ def main() -> None:
             "files_indexed",
             "symbols_indexed",
             "chunks_indexed",
+            "vectors_indexed",
+            "pending_embeddings",
             "watcher_alive",
             "workspace",
             "vector_store",
@@ -203,13 +242,15 @@ def main() -> None:
                 time.sleep(1.0)
         print("PROBE OK")
     finally:
+        watchdog.cancel()
         proc.kill()
         try:
-            _, stderr_text = proc.communicate(timeout=5)
+            proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            stderr_text = ""
-        if stderr_text:
-            print(stderr_text, file=sys.stderr)
+            pass
+        tail = _stderr_tail()
+        if tail:
+            print(f"-- server stderr (tail) --\n{tail}", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -38,9 +38,10 @@ def describe(settings: Settings) -> str:
 def identity(settings: Settings) -> tuple[str, str]:
     """The binding stored in `meta`: (url, collection) or (path, dim).
 
-    A non-empty `embed_fingerprint` (a document prompt) is part of the FAISS
-    dimension slot, so changing how chunks are formatted re-embeds them. Query
-    prompts do not affect stored vectors and leave the identity untouched.
+    A non-empty `embed_fingerprint` (document prompt + chunker profile) is part
+    of the FAISS dimension slot, so changing how chunks are produced or
+    formatted re-embeds them. Query prompts do not affect stored vectors and
+    leave the identity untouched.
     """
     if backend(settings) == "qdrant":
         return (settings.qdrant_url, settings.qdrant_collection)

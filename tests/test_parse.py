@@ -53,20 +53,43 @@ def test_detect_language() -> None:
 
 def test_chunk_source_line_windows() -> None:
     source = "\n".join(f"line {i}" for i in range(1, 201))
-    chunks = chunk_source(source, max_lines=80, max_chars=10_000)
+    chunks = chunk_source(source, max_lines=80, max_chars=10_000, overlap_lines=0)
     assert [c.chunk_index for c in chunks] == [0, 1, 2]
     assert chunks[0].start_line == 1 and chunks[0].end_line == 80
     assert chunks[1].start_line == 81
     assert chunks[2].end_line == 200
 
 
+def test_chunk_source_defaults_overlap() -> None:
+    source = "\n".join(f"line {i}" for i in range(1, 201))
+    chunks = chunk_source(source)
+    assert chunks[0].start_line == 1 and chunks[0].end_line == 30
+    assert chunks[1].start_line == 16 and chunks[1].end_line == 45
+    assert chunks[-1].end_line == 200
+    assert [c.chunk_index for c in chunks] == list(range(len(chunks)))
+    covered: set[int] = set()
+    for chunk in chunks:
+        covered.update(range(chunk.start_line, chunk.end_line + 1))
+    assert covered == set(range(1, 201))
+
+
 def test_chunk_source_char_budget() -> None:
     source = "\n".join("x" * 100 for _ in range(50))
-    chunks = chunk_source(source, max_lines=80, max_chars=500)
+    chunks = chunk_source(source, max_lines=80, max_chars=500, overlap_lines=0)
     assert chunks
     for chunk in chunks:
         # Last chunk may hold a single unbreakable line.
         assert len(chunk.content) <= 500 or chunk.start_line == chunk.end_line
+
+
+def test_chunk_source_char_budget_never_skips_lines() -> None:
+    source = "\n".join("x" * 100 for _ in range(50))
+    chunks = chunk_source(source, max_lines=30, max_chars=500, overlap_lines=15)
+    covered: set[int] = set()
+    for chunk in chunks:
+        covered.update(range(chunk.start_line, chunk.end_line + 1))
+        assert len(chunk.content) <= 500 or chunk.start_line == chunk.end_line
+    assert covered == set(range(1, 51))
 
 
 def test_chunk_source_empty() -> None:

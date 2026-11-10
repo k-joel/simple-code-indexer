@@ -254,9 +254,12 @@ uv run python tests/mcp_probe.py
 ```
 
 `get_status` reports the resolved `workspace`, `vector_store`, `vector_store_ok`,
-`vector_index` (the FAISS file path or the Qdrant collection), `config_file` (the global
+`vector_index` (the FAISS file path or the Qdrant collection), `vectors_indexed` /
+`pending_embeddings` (chunk embedding progress), `config_file` (the global
 file, or `null`), `config_files` (0 or 1 entry), and `services` (`running`, `started`,
-`unavailable`, or `not_managed`). `tests/service_probe.py` resolves the same settings, so it
+`unavailable`, or `not_managed`). Semantic `search_code` responses also carry `ready` and
+`pending_embeddings`, so empty hits during indexing are distinguishable from a genuine
+no-match. `tests/service_probe.py` resolves the same settings, so it
 probes the configured endpoint and model automatically.
 
 ### Retrieval benchmark
@@ -268,12 +271,18 @@ a lexical FTS baseline):
 ```bash
 uv run python tests/retrieval_bench.py --workspace . --model embeddinggemma-2 \
   --base-url http://localhost:8080 --vector-store faiss --reset \
-  --out artifacts/bench/gemma-faiss.json
+  --local-path artifacts/bench/local --out artifacts/bench/gemma-faiss.json
 ```
+
+`--local-path DIR` keeps a run away from the workspace's live index: the SQLite database and
+the FAISS file go into `DIR` instead of `<workspace>/.simple-ci`, so `--reset` cannot delete an
+index a running MCP server is using. Without the flag, `--reset` still targets the live index
+and prints a warning naming it.
 
 `tests/bench_matrix.py` runs every model/backend combination, starts the containers
 (including the downloadable catalog models), deletes the index/collection between runs, and
-writes `artifacts/retrieval-quality-*.{md,json}`:
+writes `artifacts/retrieval-quality-*.{md,json}`. Each run gets its own scratch folder under
+`artifacts/bench/<timestamp>/local/`:
 
 ```bash
 uv run python tests/bench_matrix.py --workspace . --vector-stores faiss,qdrant
@@ -413,7 +422,9 @@ uv run python tests/live_watch_probe.py
 ```
 
 Run them from the workspace you want indexed: each probe spawns the server, which inherits
-that cwd unless `WORKSPACE_ROOT` is set.
+that cwd unless `WORKSPACE_ROOT` is set. The probe drains the server's stderr on a thread (an
+unread pipe would block the server on a log write), and `PROBE_TIMEOUT` (seconds, default 180)
+bounds the run so a stall fails instead of hanging.
 
 ### Rebuild the index
 
@@ -441,7 +452,8 @@ Remove-Item -Recurse -Force .simple-ci   # or: rm -rf .simple-ci
 | `vector_store_ok`/`embed_ok: false` | `tests/service_probe.py`; check `get_status.services` and the Docker container logs. `vector_store_ok: false` with `vector_store: faiss` usually means faiss failed to import or the file is unwritable. |
 | Server exits with `already owns …index.db` | Two sessions share one workspace; the second refuses to start (single writer, ADR-0004). Close the other session. |
 | Save not picked up within 5 s | Reconciliation sweep (45 s) is the backstop; then check `last_sweep` in `get_status`. |
-| Semantic hits empty but lexical works | The vector-store identity changed without a rebuild (restart the session), or vectors failed earlier — the next sweep retries chunks whose `embedding_state` is not `ok`; if the log reports a vector width/collection-size mismatch, align `EMBED_DIM` (and for Qdrant delete the mismatched collection). |
+| Semantic hits empty but lexical works | `pending_embeddings > 0` / `ready: false` means vectors are still being written — wait for the sweep. Otherwise the vector-store identity changed without a rebuild (restart the session), or vectors failed earlier — the next sweep retries chunks whose `embedding_state` is not `ok`; if the log reports a vector width/collection-size mismatch, align `EMBED_DIM` (and for Qdrant delete the mismatched collection). |
+| Embedding requests slow or time out with several workspaces open | Every open workspace runs its own server but they share one embedding endpoint; `embed.py` caps each request at 16 inputs and two in flight per process, but N workspaces still multiply the load. Close idle sessions or raise `embedding.timeout_s`. |
 | `config_file: null` in `get_status` | `~/.simple-ci/config.yaml` does not exist; run `python setup.py` or create one. Project-local configs are ignored |
 | Logs | stderr of the spawned server (harness, INFO) **and** `<workspace>/.simple-ci/log/sci.log` (DEBUG, rotated). `get_status.log_file` names the active file; nothing is written to the workspace root. |
 

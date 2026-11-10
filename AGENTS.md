@@ -46,7 +46,8 @@ uv run pyright                   # typecheck
 uv run pytest                    # all tests
 uv run pytest tests/test_smoke.py::test_main_imports   # single test
 uv run python tests/retrieval_bench.py --workspace . --model embeddinggemma-2 \
-  --base-url http://localhost:8080 --vector-store faiss --reset   # one model
+  --base-url http://localhost:8080 --vector-store faiss --reset \
+  --local-path artifacts/bench/local   # one model, never the live .simple-ci index
 uv run python tests/bench_matrix.py --workspace .                # all models/backends
 ```
 

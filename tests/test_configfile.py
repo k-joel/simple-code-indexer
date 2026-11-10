@@ -127,7 +127,9 @@ def test_qwen_gets_a_query_only_instruction(tmp_path: Path, monkeypatch) -> None
 
     assert settings.embed_query_prefix == model_prompts.QWEN_CODE_QUERY
     assert settings.embed_document_prefix is None
-    assert settings.embed_fingerprint == ""
+    # The chunker profile is part of the vector identity even when documents
+    # are embedded raw, so a chunking change still invalidates stored vectors.
+    assert settings.embed_fingerprint
 
 
 def test_explicit_empty_prompt_disables_defaults(tmp_path: Path, monkeypatch) -> None:
@@ -154,7 +156,7 @@ def test_explicit_empty_prompt_disables_defaults(tmp_path: Path, monkeypatch) ->
 
     assert settings.embed_query_prefix is None
     assert settings.embed_document_prefix is None
-    assert settings.embed_fingerprint == ""
+    assert settings.embed_fingerprint
 
 
 def test_bad_prompt_placeholders_raise(tmp_path: Path, monkeypatch) -> None:
@@ -270,7 +272,8 @@ def test_file_values_reach_settings(tmp_path: Path, monkeypatch) -> None:
     assert settings.embed_api_key == "file-key"
     assert settings.embed_timeout_s == 22.5
     assert settings.qdrant_url == "http://example.test:6333"
-    assert settings.qdrant_collection.endswith("_1024")
+    assert "_1024_" in settings.qdrant_collection
+    assert settings.qdrant_collection.endswith(settings.embed_fingerprint)
     assert settings.sweep_seconds == 10.0
     assert settings.debounce_ms == 250
 

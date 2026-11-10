@@ -90,6 +90,7 @@ def _json_result(payload: dict[str, Any]) -> types.CallToolResult:
 def _status_payload(settings: Settings) -> dict[str, Any]:
     with db.connect(settings.index_db_path, readonly=True) as conn:
         counts = db.stats(conn)
+        embedding = db.embedding_counts(conn)
     registry = get_registry()
     from simple_code_indexer.parse import _parsers
 
@@ -99,6 +100,8 @@ def _status_payload(settings: Settings) -> dict[str, Any]:
         "files_indexed": counts["files"],
         "symbols_indexed": counts["symbols"],
         "chunks_indexed": counts["chunks"],
+        "vectors_indexed": embedding["embedded"],
+        "pending_embeddings": embedding["pending"],
         "watcher_alive": watcher.is_alive(),
         "last_sweep": indexer.LAST_SWEEP,
         "ignored_dirs": sweep_stats.ignored_dirs if sweep_stats else 0,
@@ -120,14 +123,19 @@ def _status_payload(settings: Settings) -> dict[str, Any]:
 
 
 def _semantic_hits(settings: Settings, query: str, limit: int) -> dict[str, Any]:
+    with db.connect(settings.index_db_path, readonly=True) as conn:
+        embedding = db.embedding_counts(conn)
+    ready = embedding["pending"] == 0
     embed_started = time.perf_counter()
     try:
         vector = embed.embed_query(settings, query)
         embed_ms = int((time.perf_counter() - embed_started) * 1000)
         search_started = time.perf_counter()
-        vector_hits = vector_store.search(settings, vector, limit)
+        # Over-fetch: adjacent chunks overlap, so the top `limit` vector hits
+        # can collapse to fewer distinct spans after dedupe below.
+        vector_hits = vector_store.search(settings, vector, limit * 3)
         search_ms = int((time.perf_counter() - search_started) * 1000)
-    except (EmbedError, VectorStoreUnavailable):
+    except (EmbedError, VectorStoreUnavailable) as exc:
         logger.warning(
             "semantic search failed for %.200r (store=%s, embed_ok=%s)",
             query,
@@ -135,13 +143,31 @@ def _semantic_hits(settings: Settings, query: str, limit: int) -> dict[str, Any]
             embed.LAST_OK,
             exc_info=True,
         )
-        return {"hits": [], "source": "semantic"}
+        return {
+            "hits": [],
+            "source": "semantic",
+            "ready": False,
+            "pending_embeddings": embedding["pending"],
+            "message": f"semantic search unavailable: {exc}",
+        }
     hits: list[dict[str, Any]] = []
+    kept_spans: dict[str, list[tuple[int, int]]] = {}
+    orphans = overlaps = 0
     with db.connect(settings.index_db_path, readonly=True) as conn:
         for vector_hit in vector_hits:
             span = db.get_chunk(conn, vector_hit.path, vector_hit.chunk_index)
             if span is None:
-                continue  # orphan point (delete raced); lexical row is source of truth
+                orphans += 1  # delete raced; the lexical row is source of truth
+                continue
+            if any(
+                span.start_line <= end and start <= span.end_line
+                for start, end in kept_spans.get(vector_hit.path, [])
+            ):
+                overlaps += 1  # overlapping window of a higher-ranked chunk
+                continue
+            kept_spans.setdefault(vector_hit.path, []).append(
+                (span.start_line, span.end_line)
+            )
             hits.append(
                 {
                     "file": vector_hit.path,
@@ -152,22 +178,43 @@ def _semantic_hits(settings: Settings, query: str, limit: int) -> dict[str, Any]
                     "source": "semantic",
                 }
             )
+            if len(hits) == limit:
+                break
     logger.debug(
-        "semantic search: %d vector hit(s), %d orphan(s) dropped, "
-        "embed=%d ms, store=%d ms",
+        "semantic search: %d vector hit(s), %d orphan(s), %d overlapping, "
+        "%d returned, embed=%d ms, store=%d ms",
         len(vector_hits),
-        len(vector_hits) - len(hits),
+        orphans,
+        overlaps,
+        len(hits),
         embed_ms,
         search_ms,
     )
     if not hits:
-        logger.info(
-            "semantic search returned no hits (store=%s, store_ok=%s, embed_ok=%s)",
+        log = logger.warning if not ready else logger.info
+        log(
+            "semantic search returned no hits (pending=%d, store=%s, "
+            "store_ok=%s, embed_ok=%s)",
+            embedding["pending"],
             vector_store.describe(settings),
             vector_store.last_ok(settings),
             embed.LAST_OK,
         )
-    return {"hits": hits, "source": "semantic"}
+    payload: dict[str, Any] = {
+        "hits": hits,
+        "source": "semantic",
+        "ready": ready,
+        "pending_embeddings": embedding["pending"],
+    }
+    if not ready:
+        message = (
+            f"semantic index is warming up: {embedding['pending']} chunk(s) "
+            "still pending embedding"
+        )
+        if hits:
+            message += " (results may be incomplete)"
+        payload["message"] = message
+    return payload
 
 
 def _search_code(settings: Settings, args: dict[str, Any]) -> dict[str, Any]:

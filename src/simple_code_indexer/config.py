@@ -113,8 +113,8 @@ def derive_collection_name(
 ) -> str:
     """Per-workspace Qdrant collection: readable slug + path hash + vector dim.
 
-    `fingerprint` pins a document-prompt variant; it is omitted when chunks are
-    embedded raw so existing collection names stay stable.
+    `fingerprint` pins the vector-shaping profile (document prompt + chunker);
+    it is omitted only when the caller passes an empty fingerprint.
     """
     digest = hashlib.sha256(
         normalize_workspace_path(workspace_root).encode("utf-8")
@@ -125,10 +125,16 @@ def derive_collection_name(
 
 
 def embedding_fingerprint(document_prefix: str | None) -> str:
-    """Short hash of the document prefix; empty when chunks are embedded raw."""
-    if not document_prefix:
-        return ""
-    return hashlib.sha256(document_prefix.encode("utf-8")).hexdigest()[:8]
+    """Short hash of the vector-shaping inputs: document prefix + chunker.
+
+    Both change the stored vectors, so either change must invalidate the FAISS
+    identity and the derived Qdrant collection. Query prompts are not included:
+    they affect only the query side and never stored vectors.
+    """
+    from simple_code_indexer.parse import CHUNKER_VERSION
+
+    material = f"{document_prefix or ''}\x00{CHUNKER_VERSION}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:8]
 
 
 def _prompt(

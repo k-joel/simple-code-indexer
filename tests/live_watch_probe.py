@@ -11,12 +11,11 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
 
-from mcp_probe import ProbeError, _read_until, _rpc, _send
+from mcp_probe import ProbeError, _read_until, _rpc, _send, _spawn, _stderr_tail
 
 SYMBOL = f"liveWatchProbeIndexOnSave{os.getpid()}"
 WORKSPACE = Path(os.environ.get("WORKSPACE_ROOT") or Path.cwd()).resolve()
@@ -30,14 +29,7 @@ int {SYMBOL}(int seed) {{
 
 
 def main() -> None:
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "simple_code_indexer.server"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-    )
+    proc, watchdog = _spawn([sys.executable, "-m", "simple_code_indexer.server"])
     assert proc.stdin is not None and proc.stdout is not None
     probe_file = PROBE_FILE
     started = time.monotonic()
@@ -132,12 +124,12 @@ def main() -> None:
     finally:
         probe_file.unlink(missing_ok=True)
         time.sleep(1.0)  # let the tombstone pass the 400 ms debounce before kill
+        watchdog.cancel()
         proc.kill()
         proc.wait()
-        if proc.stderr is not None:
-            stderr_text = proc.stderr.read()
-            if stderr_text:
-                print(stderr_text, file=sys.stderr)
+        tail = _stderr_tail()
+        if tail:
+            print(tail, file=sys.stderr)
 
 
 if __name__ == "__main__":

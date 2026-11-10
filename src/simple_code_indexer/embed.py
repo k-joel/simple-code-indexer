@@ -19,6 +19,8 @@ on the dead IPv6 attempt before retrying.
 from __future__ import annotations
 
 import logging
+import random
+import threading
 import time
 
 import httpx
@@ -35,6 +37,23 @@ _ATTEMPTS = 3  # initial + 2 retries (TDD §7.5)
 # 512 tokens of Qwen tokenizer over dense code stays under ~1300 chars;
 # 1200 leaves margin. Pieces are mean-pooled back to one vector per text.
 _SAFE_CHARS = 1200
+# Requests are split so one workspace's bulk reindex cannot occupy the shared
+# endpoint for the length of an entire file. Several workspaces may share one
+# embedding container (one server per workspace), so smaller requests let a
+# small file's request interleave instead of timing out behind a huge one.
+_MAX_INPUTS = 16
+# Per-process cap on concurrent HTTP posts (writer, service probe and query
+# can otherwise hit the endpoint together). This is not endpoint-wide limiting.
+_MAX_INFLIGHT = 2
+_INFLIGHT = threading.BoundedSemaphore(_MAX_INFLIGHT)
+_BACKOFF_BASE_S = 0.5
+_BACKOFF_CAP_S = 2.0
+_sleep = time.sleep  # test seam
+
+
+def _retry_delay(attempt: int) -> float:
+    """Full-jitter exponential backoff: U(0, min(cap, base * 2**attempt))."""
+    return random.uniform(0.0, min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * 2**attempt))
 
 
 def _split_for_limit(text: str, limit: int = _SAFE_CHARS) -> list[str]:
@@ -64,7 +83,11 @@ def embed_texts(settings: Settings, texts: list[str]) -> list[list[float]]:
     started = time.perf_counter()
     groups = [_split_for_limit(text) for text in texts]
     flat = [piece for group in groups for piece in group]
-    vectors = _post_embeddings(settings, flat)
+    vectors: list[list[float]] = []
+    batches = 0
+    for start in range(0, len(flat), _MAX_INPUTS):
+        vectors.extend(_post_embeddings(settings, flat[start : start + _MAX_INPUTS]))
+        batches += 1
     pooled: list[list[float]] = []
     index = 0
     for group in groups:
@@ -77,9 +100,10 @@ def embed_texts(settings: Settings, texts: list[str]) -> list[list[float]]:
     was_ok = LAST_OK
     LAST_OK = True
     logger.debug(
-        "embedded %d text(s) as %d piece(s) in %d ms",
+        "embedded %d text(s) as %d piece(s) in %d batch(es) in %d ms",
         len(texts),
         len(flat),
+        batches,
         int((time.perf_counter() - started) * 1000),
     )
     if was_ok is False:
@@ -104,12 +128,13 @@ def _post_embeddings(settings: Settings, texts: list[str]) -> list[list[float]]:
         try:
             # connect=1.0: fail fast when the endpoint is down; the full
             # timeout still covers real batch embedding latency.
-            response = httpx.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=httpx.Timeout(settings.embed_timeout_s, connect=1.0),
-            )
+            with _INFLIGHT:
+                response = httpx.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=httpx.Timeout(settings.embed_timeout_s, connect=1.0),
+                )
             response.raise_for_status()
             body = response.json()
             data = sorted(body["data"], key=lambda item: item["index"])
@@ -138,7 +163,7 @@ def _post_embeddings(settings: Settings, texts: list[str]) -> list[list[float]]:
             error = exc
             logger.debug("embed attempt %d/%d failed: %s", attempt + 1, _ATTEMPTS, exc)
             if attempt + 1 < _ATTEMPTS:
-                time.sleep(0.25 * (attempt + 1))
+                _sleep(_retry_delay(attempt))
     LAST_OK = False
     if was_ok is not False:
         logger.warning(

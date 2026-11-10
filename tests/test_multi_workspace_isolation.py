@@ -197,7 +197,13 @@ def _observe(workspace: Path, own: str, other: str) -> dict[str, Any]:
     try:
         server.start()
         status = server.poll(
-            "get_status", {}, lambda s: s.get("watcher_alive") and s.get("last_sweep")
+            "get_status",
+            {},
+            lambda s: (
+                s.get("watcher_alive")
+                and s.get("last_sweep")
+                and s.get("pending_embeddings") == 0
+            ),
         )
         symbol = server.poll("symbol_lookup", {"symbol": own}, lambda s: "line" in s)
         return {
