@@ -251,6 +251,9 @@ def fts_search(conn: sqlite3.Connection, query: str, limit: int) -> list[SearchH
 
 
 def symbol_lookup(conn: sqlite3.Connection, name: str) -> list[Symbol]:
+    if not name.strip():
+        logger.debug("symbol lookup with an empty name -> 0 match(es)")
+        return []
     select = """
         SELECT s.name, s.kind, s.line, s.line_end, s.signature,
                f.path AS path, f.language AS language

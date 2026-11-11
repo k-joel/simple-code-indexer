@@ -1,11 +1,13 @@
+import logging
 import sqlite3
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from simple_code_indexer import db, embed, indexer, watcher
+from simple_code_indexer import db, embed, indexer, logging_setup, watcher
 from simple_code_indexer.config import IGNORE_DIRS, Settings
 from simple_code_indexer.errors import EmbedError
 from simple_code_indexer.registry import get_registry
@@ -102,21 +104,47 @@ def test_debounce_collapses_event_burst(tmp_path: Path) -> None:
     assert work_queue.qsize() == 1, "burst was not collapsed to one work item"
 
 
-def test_ignored_and_temp_events_are_dropped(tmp_path: Path) -> None:
+def test_ignored_and_temp_events_are_dropped(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     settings = _settings(tmp_path)
     work_queue: indexer.WorkQueue = indexer.new_work_queue()
     handler = watcher.build_handler(settings, work_queue)
-    from watchdog.events import FileCreatedEvent, FileModifiedEvent
+    from watchdog.events import (
+        DirCreatedEvent,
+        FileCreatedEvent,
+        FileDeletedEvent,
+        FileModifiedEvent,
+    )
 
-    handler.on_created(FileCreatedEvent(str(tmp_path / "notes.md")))
-    handler.on_created(FileCreatedEvent(str(tmp_path / ".#scratch.cpp")))
-    handler.on_created(FileCreatedEvent(str(tmp_path / "lib.cpp.tmp")))
-    handler.on_modified(FileModifiedEvent(str(tmp_path / ".venv" / "x.py")))
+    with caplog.at_level(logging.DEBUG, logger="simple_code_indexer.watcher"):
+        caplog.clear()
+        handler.on_created(FileCreatedEvent(str(tmp_path / "notes.md")))
+        handler.on_created(FileCreatedEvent(str(tmp_path / ".#scratch.cpp")))
+        handler.on_created(FileCreatedEvent(str(tmp_path / "lib.cpp.tmp")))
+        handler.on_modified(FileModifiedEvent(str(tmp_path / ".venv" / "x.py")))
+        handler.on_modified(
+            FileModifiedEvent(str(tmp_path / ".simple-ci" / "index.db"))
+        )
+        handler.on_created(DirCreatedEvent(str(tmp_path / "node_modules")))
+        handler.on_deleted(FileDeletedEvent(str(tmp_path / ".git" / "config")))
     time.sleep(0.3)
     assert work_queue.empty()
+    # Ignored dirs/files must be dropped before any event logging: a logged
+    # event writes sci.log, which is itself watched (ISS-9 loop).
+    assert [
+        record
+        for record in caplog.records
+        if ".venv" in record.getMessage()
+        or ".simple-ci" in record.getMessage()
+        or "node_modules" in record.getMessage()
+        or ".git" in record.getMessage()
+    ] == []
 
 
-def test_gitignored_events_are_dropped(tmp_path: Path) -> None:
+def test_gitignored_events_are_dropped(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     (tmp_path / ".gitignore").write_text("artifacts/\n", encoding="utf-8")
     (tmp_path / "artifacts").mkdir()
     settings = _settings(tmp_path)
@@ -124,9 +152,67 @@ def test_gitignored_events_are_dropped(tmp_path: Path) -> None:
     handler = watcher.build_handler(settings, work_queue)
     from watchdog.events import FileCreatedEvent
 
-    handler.on_created(FileCreatedEvent(str(tmp_path / "artifacts" / "probe.py")))
+    with caplog.at_level(logging.DEBUG, logger="simple_code_indexer.watcher"):
+        caplog.clear()
+        handler.on_created(FileCreatedEvent(str(tmp_path / "artifacts" / "probe.py")))
     time.sleep(0.3)
     assert work_queue.empty()
+    assert caplog.records == []
+
+
+def test_a_nested_negation_cannot_queue_a_file_under_an_ignored_dir(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".gitignore").write_text("artifacts/\n", encoding="utf-8")
+    (tmp_path / "artifacts" / "sub").mkdir(parents=True)
+    (tmp_path / "artifacts" / "sub" / ".gitignore").write_text(
+        "!keep.py\n", encoding="utf-8"
+    )
+    settings = _settings(tmp_path)
+    work_queue: indexer.WorkQueue = indexer.new_work_queue()
+    handler = watcher.build_handler(settings, work_queue)
+    from watchdog.events import FileCreatedEvent
+
+    handler.on_created(
+        FileCreatedEvent(str(tmp_path / "artifacts" / "sub" / "keep.py"))
+    )
+    time.sleep(0.3)
+    assert work_queue.empty()
+
+
+def test_idle_server_does_not_grow_its_own_log(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """ISS-9: the log write must never be observed, logged and re-triggered."""
+    settings = replace(
+        _settings(tmp_path), index_db_path=tmp_path / "state" / "index.db"
+    )
+    log_file = logging_setup.configure_file(settings)
+    assert log_file is not None
+    work_queue: indexer.WorkQueue = indexer.new_work_queue()
+    observer = watcher.start_watcher(settings, work_queue)
+    try:
+        assert watcher.wait_until_ready(timeout=5.0)
+        time.sleep(0.3)  # let the watcher-ready banner flush
+        with caplog.at_level(logging.DEBUG, logger="simple_code_indexer.watcher"):
+            logging.getLogger("simple_code_indexer.test").debug("idle-log probe")
+            time.sleep(1.0)  # watchdog delivers the log write to the handler
+            settled = log_file.stat().st_size
+            time.sleep(1.5)  # a regressed loop writes again within ~0.4 s
+            assert log_file.stat().st_size == settled, (
+                "the watcher logged its own log write (ISS-9 regression)"
+            )
+            assert work_queue.empty()
+        assert not [
+            record
+            for record in caplog.records
+            if record.name == "simple_code_indexer.watcher"
+            and "sci.log" in record.getMessage()
+        ]
+    finally:
+        observer.stop()
+        observer.join(timeout=2.0)
+        logging_setup.detach_file()
 
 
 def test_gitignore_change_enqueues_sweep(tmp_path: Path) -> None:

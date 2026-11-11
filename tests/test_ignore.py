@@ -83,6 +83,19 @@ def test_nested_gitignore_overrides_root(tmp_path: Path) -> None:
     assert _yielded(_settings(tmp_path)) == ["sub/keep.py"]
 
 
+def test_nested_negation_cannot_escape_an_ignored_parent(tmp_path: Path) -> None:
+    # Git cannot re-include a file whose parent directory is excluded, so the
+    # deeper `!keep.py` must not resurrect a file under root-ignored artifacts/.
+    _write(tmp_path / ".gitignore", "artifacts/\n")
+    _write(tmp_path / "artifacts" / "sub" / ".gitignore", "!keep.py\n")
+    _write(tmp_path / "artifacts" / "sub" / "keep.py", "def keep():\n    pass\n")
+    rules = IgnoreRules(tmp_path)
+
+    assert rules.is_ignored("artifacts/sub")
+    assert rules.is_ignored("artifacts/sub/keep.py")
+    assert _yielded(_settings(tmp_path)) == []
+
+
 def test_anchored_pattern_only_matches_at_root(tmp_path: Path) -> None:
     _write(tmp_path / ".gitignore", "/build\n")
     _write(tmp_path / "build" / "x.py", "def root_build():\n    pass\n")
@@ -126,6 +139,18 @@ def test_index_one_file_skips_gitignored(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
 
     outcome = indexer.index_one_file(settings, tmp_path / "secret.py")
+    assert outcome.status == "skipped_filtered"
+
+
+def test_index_one_file_skips_a_file_under_an_ignored_dir(tmp_path: Path) -> None:
+    # The watcher hands over absolute paths directly, bypassing the walk; the
+    # per-file filter must still see the ancestor directory ignore.
+    _write(tmp_path / ".gitignore", "artifacts/\n")
+    _write(tmp_path / "artifacts" / "sub" / ".gitignore", "!keep.py\n")
+    path = tmp_path / "artifacts" / "sub" / "keep.py"
+    _write(path, "def keep():\n    pass\n")
+
+    outcome = indexer.index_one_file(_settings(tmp_path), path)
     assert outcome.status == "skipped_filtered"
 
 

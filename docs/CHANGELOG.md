@@ -47,6 +47,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `symbol_lookup` with an empty or whitespace-only `symbol` returns no matches instead of
+  treating it as a wildcard and returning every indexed symbol.
+- The watcher no longer logs events from ignored directories or its own log file, so an idle
+  server no longer grows `sci.log` in a self-triggering loop. Ignored paths (including the
+  active log file) are dropped before any event logging.
+- The watcher and `index_one_file` now honor ignored **directories** for nested paths: every
+  ancestor directory is checked before the path itself, so a deeper `.gitignore` negation
+  (`!keep.py`) cannot re-include a file under a root-ignored tree such as `artifacts/`.
 - Semantic search now finds the ignored-directory pruning logic: the query
   "how does the indexer avoid walking into virtualenv and cache directories" returns
   `indexer.py:106-135` (the `os.walk`/`dirnames[:]` loop) at rank 1. The 80-line chunk

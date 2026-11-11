@@ -123,6 +123,9 @@ def test_symbol_lookup_exact_and_prefix(tmp_path: Path) -> None:
         assert len(prefix) == 2
 
         assert db.symbol_lookup(conn, "nope") == []
+        # ISS-8: an empty name must not turn the LIKE fallback into `%`.
+        assert db.symbol_lookup(conn, "") == []
+        assert db.symbol_lookup(conn, "   ") == []
 
 
 def test_delete_file_removes_rows(tmp_path: Path) -> None:

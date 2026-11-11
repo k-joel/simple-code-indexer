@@ -132,8 +132,8 @@ Record, in the eventual report:
 git status --short
 Get-Content "$env:USERPROFILE\.simple-ci\config.yaml" -ErrorAction SilentlyContinue
 Test-Path "<workspace>\.simple-ci"
-Get-CimInstance Win32_Process -Filter "name='python.exe'" |
-  Where-Object { $_.CommandLine -like '*run_server.py*' } |
+Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -in @('python.exe','uv.exe') -and $_.CommandLine -like '*run_server.py*' } |
   Select-Object ProcessId, CreationDate, CommandLine
 ```
 
@@ -159,19 +159,42 @@ Confirm the four choices in the output: model, vector store, install target, har
 python setup.py --yes --model embeddinggemma2 --vector-store faiss --harnesses <name>
 ```
 
-Run it in the background if the model must download (see `NOTES.md` for the long-command cap),
-then read the log file it writes.
+If the model must download, run it in the background (see `NOTES.md` for the long-command cap)
+and capture the output to a file; the wizard prints its progress, it does not write a log file.
+
+**Then refresh the installed copy from the working tree — mandatory:**
+
+```powershell
+python setup.py --install-only
+```
+
+The primary agent **must** run this after the last edit. `--install-only` copies the checkout
+(including uncommitted changes) to the install directory and exits; it preserves the installed
+`.git` and `.venv`, and it cannot be combined with `--model`, `--harnesses`, `--uninstall`, or the
+other wizard flags. Without it the harness may launch a stale copy and the run tests the wrong
+code. The full install above also copies the working tree, so re-running `--install-only` after
+every later edit is what keeps the test honest.
+
+`--install-only` deliberately **does not sync the copy's `.venv`**. If `pyproject.toml` or
+`uv.lock` changed since the last full install, sync it before probing (this was a real failure:
+a stale copy raised `ModuleNotFoundError: pathspec` on the next launch):
+
+```powershell
+uv sync --project "$env:APPDATA\simple-code-indexer"
+```
+
+The §4.3 import check below is what catches this; do not skip it.
 
 ### 4.3 External verification checklist
 
 | Check | Evidence |
 |---|---|
 | Global config | `~/.simple-ci/config.yaml` has `embedding.model`, `embedding.dim`, `vector_store`, a `service` block, and `setup.install_root`/`setup.harnesses` |
-| Container | `docker ps` shows the embed container `Up` with the published port; `docker logs` ends with `listening on http://0.0.0.0:8080` |
+| Container | `docker ps` shows the embed container `Up` with the published port; `docker logs <container>` contains `listening on http://0.0.0.0:8080` (the tail is request logs once it has served) |
 | Endpoint | `uv run python tests/service_probe.py` → `embeddings OK dim=... model=...` and `PROBE OK` |
-| Install copy | `%APPDATA%\simple-code-indexer` exists with `.venv`; the venv imports the server |
+| Install copy | `%APPDATA%\simple-code-indexer` exists with `.venv`; `--install-only` ran after the last edit and a spot-checked changed file matches the checkout |
 | Tools | the installed venv reports exactly `search_code`, `symbol_lookup`, `get_status` |
-| Harness entry | expected path contains `command` = uv and `args` = `run --project <install> --no-sync python <install>/run_server.py` |
+| Harness entry | matches the harness schema: `command` + `args` for most JSON clients, or one `command` array for OpenCode; the launcher is `uv run --project <install> --no-sync python <install>/run_server.py` |
 | Workspace untouched | `<workspace>/.simple-ci` does **not** exist yet |
 
 ```powershell
@@ -184,9 +207,9 @@ uv run --project "$env:APPDATA\simple-code-indexer" --no-sync python -c `
 ### 4.4 Pin the workspace (harness permitting)
 
 The server indexes `WORKSPACE_ROOT` when set, otherwise its process cwd. Harnesses that spawn
-stdio servers outside the project directory (documented for Cline; possible for others) index
-the wrong tree — including drive roots or home. The server rejects a home directory, but not an
-arbitrary large directory.
+stdio servers outside the project directory (observed with OpenCode's home-screen global entry;
+possible for others) index the wrong tree — including drive roots or home. The server rejects a
+home directory, but not an arbitrary large directory.
 
 In the harness entry, add the workspace explicitly:
 
@@ -208,27 +231,50 @@ path.
 
 `run_server.py` runs `git pull --ff-only --autostash --quiet` inside the **installed copy** before
 importing the server (fail-soft, 20 s). If upstream has moved, the secondary session tests
-upstream, not the checkout.
+upstream, not the checkout; `--autostash` can also park uncommitted edits in a stash if the pull
+conflicts. Since §4.2 refreshed the copy from the working tree, pin that snapshot.
 
 ```powershell
 git rev-parse HEAD
 git ls-remote origin refs/heads/master
 ```
 
-If they differ, pick one:
+If they differ, or the checkout has uncommitted changes, pick one:
 
 - accept it and say so in the report ("tested upstream `<sha>`"), or
-- add `"SIMPLE_CI_GIT_PULL": "0"` to the entry's env and test the installed snapshot.
+- add `SIMPLE_CI_GIT_PULL=0` to the entry's environment (`env` for most JSON clients,
+  `environment` for OpenCode) and test the installed snapshot.
 
 ### 4.6 Prove the server works before blaming the harness
 
-Drive the installed launcher with the official MCP SDK client against a throwaway workspace
-(two small `.py` files). This validates initialize → tools/list → indexing → `get_status` →
-lexical + semantic search → symbol lookup, and that closing stdin shuts the server down.
+Drive the installed launcher with the official MCP SDK client against a throwaway workspace.
+The probe must cover the whole lifecycle, not just "it starts":
 
-A minimal driver is in Appendix B.2. Expected: all three tools, both search modes return hits
-(allow a short wait for vectors), and closing stdin yields exit code 0 within a few seconds with
-`workspace lock released` and `shutting down after Ns` in the scratch log.
+1. **Indexing** — seed a fresh workspace with several languages (`.py`, `.cpp`, `.vimrc`),
+   filename matches (`Dockerfile`, `CMakeLists.txt`), a `.gitignore`d file, an ignored directory
+   (`.venv`), a disallowed format (`.md`, `.json`), plus empty, syntactically broken, Unicode,
+   and >300-line files. Poll `get_status` until `last_sweep` is set and the counts are stable;
+   `files_indexed` must equal the enumerator count, and the ignored/disallowed paths must be
+   absent from SQLite. Wait until `pending_embeddings` reaches 0.
+2. **Querying** — run Appendix A plus the edge suite: exact lexical hits, an unrelated semantic
+   query, duplicate and nonexistent symbols, empty query/symbol, punctuation-only input, and
+   `limit=0`/`limit=1000` clamps. No call may raise or hang.
+3. **Watching** — create, modify, and delete a file and assert the index follows within ~5 s;
+   append to `.gitignore` and assert the sweep drops the now-ignored file. Leave the server idle
+   for ~30 s and assert the log is not growing from its own writes (ISS-9: the watcher currently
+   logs `watcher: file modified …sci.log` and re-triggers itself).
+4. **Startup/shutdown** — close stdin; expect exit code 0, `workspace lock released`,
+   `shutting down after Ns`, `vector store flushed`, and `final index:`. Restart in the same
+   workspace and expect the reconcile log `checked=N indexed≈0 unchanged≈N`. While a server is
+   running, a second one must exit 1 with `another simple-code-indexer already owns`.
+5. **Logging** — assert the session log slice (from the `starting (pid=...)` banner) contains the
+   startup banner, config/workspace/embed lines, lock acquired, services, vector store, watcher
+   ready, `serving on stdio`, a `tool=` line per query, `indexed ... in N ms` per fixture, the
+   sweep summary, and the shutdown lines; and no unexpected `ERROR`/`CRITICAL`/`Traceback`, and
+   no repeated `watcher: file modified …sci.log` self-events.
+
+A minimal driver is in Appendix B.2. If the probe cannot assert one of these from `sci.log`,
+that is a logging gap: add the missing log line before writing the handoff.
 
 ### 4.7 Record the installed entry
 
@@ -250,12 +296,19 @@ Create `artifacts/mcp-handoff.md` from the template in §9.1. It must contain:
 4. **Baseline `get_status`** — paste the full JSON and list the assertions (workspace, store,
    index path, single config source, log file, watcher).
 5. **Indexing watch** — poll until `files_indexed` and `chunks_indexed` are stable for two
-   reads; record every sample; expected count from §4.3. Include the **vectors-lag** warning:
-   counts are SQLite rows, FAISS vectors are written afterwards; retry a 0-hit semantic query
-   once after 10–15 s and record both attempts.
-6. **Query suite with ground truth** — lexical, semantic, symbol, a nonexistent symbol, and an
-   unrelated semantic query. Use Appendix A or regenerate ground truth for the target repo.
-7. **Log/artifact inspection** — `sci.log` tail, index/vector/log sizes, sqlite counts.
+   reads; record every sample; use the expected count from Appendix A (recompute it at handoff
+   time). Include the **vectors-lag** warning: counts are SQLite rows, so check
+   `pending_embeddings`/`vectors_indexed`; retry a 0-hit semantic query once after 10–15 s and
+   record both attempts. Do **not** claim `indexed≈0` from counts alone: compare each file's
+   stored `mtime`/`size` with the filesystem (or accept `indexed>0` and record it). The
+   2026-11-10 run re-indexed 5 files that had changed after the previous index build even though
+   the row counts looked stable.
+6. **Query suite with ground truth** — lexical, semantic, symbol, a nonexistent symbol, an
+   unrelated semantic query, and the edge suite in Appendix A. Regenerate ground truth for the
+   target repo.
+7. **Log/artifact inspection** — the current session slice of `sci.log` (from its
+   `starting (pid=...)` banner, not the raw tail across sessions), index/vector/log sizes, and
+   sqlite counts; assert the log contract from §4.6.5.
 8. **Results template** — the exact sections and verdict table to fill in.
 9. **Failure path** — missing entry, wrong workspace, held lock, hanging tool call (include the
    stderr-pipe note), and "still write the results document".
@@ -263,7 +316,8 @@ Create `artifacts/mcp-handoff.md` from the template in §9.1. It must contain:
     harness, and run no further MCP calls.
 
 **Ground-truth rule:** every expected `file:line` must be verified at handoff time
-(`grep -n`/`grep -rn`); line numbers drift. Prefer file-level expectations when lines move often.
+(`git grep -n` or `Select-String`); line numbers drift. Prefer file-level expectations when lines
+move often.
 
 The human then restarts the harness (required — entries are read at startup), opens the target
 workspace, and gives the secondary agent:
@@ -277,17 +331,20 @@ workspace, and gives the secondary agent:
 The secondary agent follows the handoff. Order matters:
 
 1. **Preflight:** server listed and connected; exactly three tools; record PID + start time.
-   - One launch can appear as **two** `python.exe` processes: uv's venv `python.exe` is a
-     trampoline over the base interpreter. Count *instances* by the trampoline parent, not raw
-     process count.
+   - One launch can appear as several processes: `uv.exe` → the venv `python.exe` trampoline →
+     the base interpreter. Count *server instances* by the `index.db` lock / parent chain, not by
+     raw `python.exe` count.
 2. **`get_status`:** paste the full JSON; stop if `workspace` is wrong.
-3. **Index the workspace:** poll until counts are stable; record the timeline. Do not rely on
-   `vector_store_ok` for vector readiness.
-4. **Query suite:** call the tools through the harness. Record top-3 `file:line` + score and
-   PASS/FAIL per query. If the harness cannot expose the tools, record FAIL and stop — a direct
-   handler run may be added as diagnostic evidence, clearly labelled.
-5. **Inspect:** log tail (startup lines, `serving on stdio`, `tool=` lines, errors), artifact
-   sizes, sqlite counts.
+3. **Index the workspace:** poll until counts are stable; record the timeline and
+   `pending_embeddings`/`vectors_indexed`. Do not rely on `vector_store_ok` alone for vector
+   readiness.
+4. **Query suite:** call the tools through the harness. Run Appendix A including its edge suite;
+   record top-3 `file:line` + score and PASS/FAIL per query. If the harness cannot expose the
+   tools, record FAIL and stop — a direct handler run may be added as diagnostic evidence,
+   clearly labelled.
+5. **Inspect:** the current session slice of `sci.log` (from `starting (pid=...)`) — startup
+   lines, `serving on stdio`, `tool=` lines, the sweep summary, shutdown lines, errors — plus
+   artifact sizes and sqlite counts.
 6. **Write `artifacts/mcp-results.md`** using the template. Include the raw JSON and log lines.
 7. **Tell the human to close the harness.** Leave the server running; Stage 4 needs the
    shutdown evidence.
@@ -301,21 +358,24 @@ The secondary agent follows the handoff. Order matters:
 Compare the recorded PID/start time with the live process list, then read the log tail:
 
 ```powershell
-Get-CimInstance Win32_Process -Filter "name='python.exe'" |
-  Where-Object { $_.CommandLine -like '*run_server.py*' } |
+Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -in @('python.exe','uv.exe') -and $_.CommandLine -like '*run_server.py*' } |
   Select-Object ProcessId, ParentProcessId, CreationDate, CommandLine
-Get-Content "<workspace>\.simple-ci\log\sci.log" -Tail 25
+Get-Content "<workspace>\.simple-ci\log\sci.log" -Tail 40
 ```
 
-- **Pass:** the recorded PID is gone and the log ends with `workspace lock released` and
-  `shutting down after Ns`.
+- **Pass:** the recorded PID is gone and the **current session slice** of the log (from its
+  `starting (pid=...)` banner) contains, in order, `workspace lock released`,
+  `shutting down after Ns`, `vector store flushed`, and `final index:`. The raw tail may also
+  contain earlier sessions; do not anchor on the absolute last line.
 - **Fail (processes remain):** first read the server's `parent watchdog: watching ...` line. If
   the harness UI is in that list, the watchdog should have fired — treat survival as a
-  regression. If it is not, the harness service was started detached (shell/daemon) and no
-  process watchdog can see the UI. Look for a harness background service that outlived the UI
-  and still holds the child's stdin (e.g. `opencode-cli serve --service`, an extension host, a
-  desktop helper). Closing the window does not close the pipe. Record the parent, then stop the
-  process tree only with the human's consent:
+  regression. If it is not, the harness service was started detached (shell/daemon) **or it was
+  started by an earlier UI and reused by the current one** — the new UI is then a sibling, not an
+  ancestor, so the walk stops at the service. Look for a harness background service that outlived
+  the UI and still holds the child's stdin (e.g. `opencode-cli serve --service`, an extension
+  host, a desktop helper). Closing the window does not close the pipe. Record the parent, then
+  stop the process tree only with the human's consent:
 
   ```powershell
   taskkill /PID <trampoline-or-parent> /T /F
@@ -326,9 +386,11 @@ Get-Content "<workspace>\.simple-ci\log\sci.log" -Tail 25
 
 ### 7.2 Validate the results
 
-- sqlite counts equal `get_status` (`files`, `symbols`, `chunks`);
+- sqlite counts equal `get_status` (`files_indexed`, `symbols_indexed`, `chunks_indexed` map to
+  the `files`, `symbols`, `chunks` tables);
 - `files_indexed` is close to the computed expected count (drift is fine — report it);
-- no `ERROR`/`CRITICAL`/traceback in `sci.log`;
+- the current session slice of `sci.log` has no unexpected `ERROR`/`CRITICAL`/traceback (a
+  deliberate duplicate-server lock refusal is the one expected `ERROR`);
 - every query PASS/FAIL is backed by a `file:line` and score;
 - note which status fields came from a direct-handler invocation (they read
   `watcher_alive=false`, `log_file=null`, etc.) versus the live server.
@@ -366,11 +428,12 @@ servers; direct invocation is not an MCP-channel test).
 | Server absent from the harness after restart | entry path/schema wrong; harness overwrote or deleted the file; restart not done | read the entry file, validate JSON, check the harness MCP log, restart once, add an issue |
 | Server starts then exits immediately | home workspace rejected, bad config YAML, lock held | read `sci.log`; look for `another simple-code-indexer already owns` or a config error |
 | `get_status.workspace` is not the target | harness spawns with another cwd and no `WORKSPACE_ROOT` | add `WORKSPACE_ROOT` to the entry; restart |
-| Indexing stalls at 0 chunks | embedding endpoint down or wrong model/dim | `tests/service_probe.py`, container logs, `embed_ok`/log errors |
-| Semantic query returns 0 hits | vectors still being written, or empty index | wait 10–15 s and retry once; check `faiss search: ntotal=` in the log; see ISS-4 |
-| A tool call hangs and the log's last line is an INFO record | harness is not draining the server's stderr pipe | record it (ISS-2); the server blocks in a log write on the serve thread |
-| Server survives closing the harness | check the server's `parent watchdog: watching` line: if the UI is absent, the service was started detached | record the parent, stop the service/tree with consent, file a lifecycle issue |
-| Four `python.exe` for two sessions | uv venv trampoline + base interpreter | count trampolines, not processes |
+| `files_indexed`/`chunks_indexed` stay 0 | workspace wrong, walk pruned everything, or a database error | compare `get_status.workspace` with the target; check the `sweep:` line and `failed to index`/tracebacks in the session log |
+| `chunks_indexed` climbs but `pending_embeddings` never falls | embedding endpoint down or wrong model/dim | `tests/service_probe.py`, container logs, `embed_ok`/`embedding failed` lines |
+| Semantic query returns 0 hits | vectors still being written, or empty index | check `pending_embeddings` and the `faiss search: ntotal=` line; wait 10–15 s and retry once |
+| A tool call hangs and the log's last line is an INFO record | harness is not draining the server's stderr pipe | record it; the server blocks in a log write on the serve thread. Keep the stderr-drain rule in `NOTES.md` |
+| Server survives closing the harness | check the server's `parent watchdog: watching` line: if the UI is absent, the service was started detached **or reused from an earlier UI** (the new UI is a sibling) | record the parent, stop the service/tree with consent; file a lifecycle issue only when the UI **was** in the watched list |
+| Several processes per session | `uv.exe` launcher → venv `python.exe` trampoline → base interpreter | count server instances by the `index.db` lock, not processes |
 | One expected file missing from top-3 | retrieval quality | record FAIL with hits/scores; file an issue; do not retry the same query endlessly |
 
 ---
@@ -394,7 +457,7 @@ Write only under artifacts/.
 | Install copy | <%APPDATA%/simple-code-indexer> |
 | Embedding | <url> / <model> / <dim> |
 | Vector store | <faiss|qdrant> |
-| Entry | <path>, key <name> |
+| Entry | <path>, key/dotted path <name> |
 | Indexable files (expected) | <N> |
 | Index / vectors / log | <.simple-ci/...> |
 
@@ -405,25 +468,26 @@ Write only under artifacts/.
 1. Server listed/connected; screen text: ___
 2. Tools: search_code, symbol_lookup, get_status
 3. Powershell: Get-CimInstance ... -> record ProcessId + CreationDate
-   (one launch may be two processes: venv trampoline + base interpreter)
+   (one launch may be uv.exe -> venv trampoline -> base interpreter)
 
 ## Baseline get_status
 <paste full JSON; assertions: workspace, vector_store, vector_index, config_files, log_file>
 
 ## Indexing watch
 Poll get_status every 20-30 s until files_indexed and chunks_indexed are stable twice.
-Record each sample. Expected files ≈ <N>. Vectors lag the counts: retry a 0-hit semantic
-query once after 10-15 s and record both attempts.
+Record each sample. Expected files ≈ <N>. Vectors lag the counts: check pending_embeddings
+and retry a 0-hit semantic query once after 10-15 s and record both attempts.
 
 ## Query suite
 | id | tool | query | expected file |
 |---|---|---|---|
 | L1 | search_code lexical | <q> | <file> |
 | ... | | | |
-Run all of them; record #hits, top-3 file:line+score, PASS/FAIL.
+Run Appendix A plus its edge suite; record #hits, top-3 file:line+score, PASS/FAIL.
 
 ## Inspect
-- Get-Content "<workspace>\.simple-ci\log\sci.log" -Tail 120
+- The current session slice of "<workspace>\.simple-ci\log\sci.log" (from its last
+  `starting (pid=...)` banner), not the raw tail across sessions
 - sizes of index.db / vectors.faiss / sci.log
 - sqlite counts must match get_status
 
@@ -462,7 +526,8 @@ further MCP calls.
 | id | tool | query | #hits | top-3 file:line + score | PASS/FAIL | notes |
 
 ## Log evidence
-(startup lines, lock, serving, tool= lines, errors)
+(session slice: startup lines, lock, serving, sweep summary, tool= lines, semantic/FAISS lines,
+watchdog line, errors)
 
 ## Artifacts
 (index.db / vectors.faiss / sci.log sizes; sqlite counts)
@@ -490,10 +555,15 @@ further MCP calls.
 ## 10. Definition of done
 
 - [ ] Dry run and real install completed with explicit model/store/harness flags.
+- [ ] `python setup.py --install-only` ran after the last edit; the installed copy matches the
+      working tree (uncommitted changes included).
 - [ ] §4.3 checklist observed and recorded (config, container, probe, install copy, entry).
 - [ ] §4.5 upstream check done; `SIMPLE_CI_GIT_PULL=0` used if testing the working tree.
-- [ ] §4.6 SDK probe passed in a scratch workspace, including clean shutdown.
-- [ ] Handoff written with verified ground truth, PID instruction, results template, failure path.
+- [ ] §4.6 comprehensive SDK probe passed in a scratch workspace: indexing, ignored/disallowed
+      paths, query edge cases, watch create/modify/delete, lock refusal, and clean shutdown.
+- [ ] Log contract asserted from the session slice; any missing evidence added as logging.
+- [ ] Handoff written with verified ground truth, expected count, PID instruction, results
+      template, failure path.
 - [ ] Secondary session recorded PID/start time and wrote results with raw evidence.
 - [ ] Shutdown verified against the recorded PID and log lines; stragglers explained.
 - [ ] Final report written to `artifacts/`.
@@ -510,26 +580,46 @@ with an equivalent suite for another target repo.
 
 | id | tool | query | expected |
 |---|---|---|---|
-| L1 | lexical | `iter_workspace_files` | `src/simple_code_indexer/indexer.py` |
-| L2 | lexical | `LLAMA_ARG_POOLING` | `src/simple_code_indexer/setup_wizard/__init__.py` |
-| L3 | lexical | `vector_label_seq` | `src/simple_code_indexer/db.py` |
-| S1 | semantic | how does the indexer avoid walking into virtualenv and cache directories | `src/simple_code_indexer/indexer.py` (known miss, ISS-5 — keep as a regression probe) |
+| L1 | lexical | `iter_workspace_files` | `src/simple_code_indexer/indexer.py` (def ~line 94; tests also match — top-3) |
+| L2 | lexical | `LLAMA_ARG_POOLING` | `src/simple_code_indexer/setup_wizard/__init__.py` (~line 578) or `tests/test_setup_wizard.py` (the compose `.yml` is not indexed) |
+| L3 | lexical | `vector_label_seq` | `src/simple_code_indexer/db.py` (~line 395) |
+| S1 | semantic | how does the indexer avoid walking into virtualenv and cache directories | `src/simple_code_indexer/indexer.py` (regression probe for the 30-line chunker; must PASS now) |
 | S2 | semantic | prevent two indexer servers from writing to the same workspace at once | `workspace_lock.py` or `server.py` |
 | S3 | semantic | merge Codex TOML config using marker comments so user comments survive | `harnesses/_toml.py` |
 | S4 | semantic | allocate monotonic FAISS label ids so ids are never reused | `db.py` or `faiss_store.py` |
+| S5 | semantic | stop the server when the launching harness process dies while stdin stays open | `parent_watch.py` or `server.py` |
 | Y1 | symbol | `iter_workspace_files` | `indexer.py` |
-| Y2 | symbol | `WorkspaceLock` | `workspace_lock.py` |
-| Y3 | symbol | `_acquire_workspace_lock` | `server.py` |
+| Y2 | symbol | `WorkspaceLock` | `workspace_lock.py` (~line 30) |
+| Y3 | symbol | `_acquire_workspace_lock` | `server.py` (~line 384) |
 | Y4 | symbol | `DefinitelyNotARealSymbolXYZ` | `found: false` |
 | U1 | semantic | how to bake sourdough bread | non-empty code chunks, clearly lower scores |
+
+Edge suite (same workspace, run through the harness where possible):
+
+| id | tool | input | expected |
+|---|---|---|---|
+| E1 | lexical | empty string | `hits: []`, `source: lexical`, no error |
+| E2 | lexical | punctuation/operators only (`AND OR " (*)`) | no error; zero or sane hits (tokens are stripped) |
+| E3 | lexical | `iter_workspace_files` with `limit: 0` | at most 1 hit (clamped to 1) |
+| E4 | lexical | `iter_workspace_files` with `limit: 1000` | at most 50 hits (clamped to 50) |
+| E5 | symbol | empty string | **ISS-8:** `found: true` with every symbol; record the count, not a failure |
+| E6 | symbol | `iter_workspace` | prefix `LIKE` fallback returns `iter_workspace_files` |
+| E7 | symbol | `main` | `found: true` `matches` envelope with several files |
+| E8 | semantic | empty string | `hits: []`, no embed call |
+| E9 | semantic | `zzzzzzzzzzzzzzzz` | no crash; nearest-chunk hits are allowed |
+| E10 | get_status | `{}` | full JSON, no error |
+
+`search_code`'s lexical path tokenizes to `\w+` before FTS5, so operator characters must never
+produce an SQL/FTS error. `symbol_lookup` falls back to a prefix `LIKE` when the exact name has
+no row — a prefix query can legitimately return many matches.
 
 Regenerating ground truth:
 
 ```powershell
-# lexical anchor exists?
-rg -n "iter_workspace_files" src
+# lexical anchor exists? (git grep is tracked-files-only; rg -n also works)
+git grep -n "iter_workspace_files" -- src
 # symbol definition site?
-rg -n "^(def|class) WorkspaceLock" src
+git grep -n -E "^(def|class) WorkspaceLock" -- src
 # semantic anchors: read the module and pick a distinctive behaviour, then confirm the file
 ```
 
@@ -566,7 +656,10 @@ INSTALL = r"C:\Users\<you>\AppData\Roaming\simple-code-indexer"
 params = StdioServerParameters(
     command="uv",
     args=["run", "--project", INSTALL, "--no-sync", "python", INSTALL + r"\run_server.py"],
-    env={"WORKSPACE_ROOT": r"<scratch workspace>"},
+    env={
+        "WORKSPACE_ROOT": r"<scratch workspace>",
+        "SIMPLE_CI_GIT_PULL": "0",  # test the installed working-tree snapshot
+    },
     cwd=r"<scratch workspace>",
 )
 
@@ -584,21 +677,25 @@ anyio.run(main)
 ```
 
 Important: send the child's stderr to a **file** (as above). A harness or probe that pipes
-stderr and never drains it will eventually block the server (ISS-2).
+stderr and never drains it will eventually block the server; redirect stderr to a file or drain
+it (`tests/mcp_probe.py` does the latter on a thread).
 
 ## Appendix C — known issues that affect this test
 
-Check `docs/ISSUES.md` before starting; these were open when this document was written:
+Check `docs/ISSUES.md` before starting. As of 2026-11-10 the old ISS-2/3/4/5 entries are fixed
+and removed; these were found by the current e2e process and are open:
 
-- **ISS-2** — probes that spawn the server with `stderr=PIPE` and never drain it hang the
-  server. Redirect stderr to a file or drain it.
-- **ISS-3 (resolved 2026-11-10)** — the server now watches its launch chain and exits when an
-  ancestor dies; closing the OpenCode desktop UI stopped it within ~2 s even though
-  `opencode-cli serve --service` survived and the stdin pipe stayed open. A service started from
-  a shell is detached and has no UI ancestor; check the `parent watchdog: watching` line.
-- **ISS-4** — `get_status` can report a complete index before FAISS vectors exist; semantic
-  queries can silently return zero. Wait/retry and record both attempts.
-- **ISS-5** — S1 (virtualenv pruning) is a known retrieval miss; keep it as a regression probe.
+- **ISS-8** — `symbol_lookup` with an empty symbol falls through to `LIKE '%'` and returns every
+  symbol. Record it in the edge suite (E5); do not treat it as a server failure.
+- **ISS-9** — the watcher logs its own `sci.log` writes and re-triggers itself; an idle server
+  grows its log continuously. Check for it in the watch/logging step.
+- **ISS-10** — the server can outlive the desktop UI when `opencode-cli serve --service` is
+  reused across UI sessions; the new UI is a sibling and the watchdog list stops at the service.
+
+The standing operational constraints live in `NOTES.md`: drain the child's stderr, watch the
+launch chain rather than assuming a detached service can see the UI, and check
+`pending_embeddings` while vectors catch up. If a run finds a new defect, add it to
+`docs/ISSUES.md` and reference it here.
 
 ## Appendix D — conventions
 

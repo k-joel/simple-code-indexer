@@ -35,16 +35,44 @@ class IgnoreRules:
         self._lock = threading.Lock()
 
     def is_ignored(self, rel: str, *, is_dir: bool = False) -> bool:
-        """Decide a workspace-relative POSIX path; deeper ignore files win."""
+        """Decide a workspace-relative POSIX path; deeper ignore files win.
+
+        Ancestors are checked before the path itself: git cannot re-include a
+        path whose parent directory is excluded, so a nested `!keep.py` must not
+        resurrect a file under an ignored tree.
+        """
         parts = [part for part in _fold(rel).split("/") if part and part != "."]
         if not parts:
             return False
+        specs = self._applicable_specs(parts)
+        for index in range(len(parts) - 1):
+            if self._decide(specs, parts, index, is_dir=True):
+                return True
+        return self._decide(specs, parts, len(parts) - 1, is_dir=is_dir)
+
+    def _applicable_specs(self, parts: list[str]) -> list[tuple[int, GitIgnoreSpec]]:
+        """Existing ignore files for the path, deepest first."""
+        specs: list[tuple[int, GitIgnoreSpec]] = []
         for depth in range(len(parts) - 1, -1, -1):
             spec = self._spec("/".join(parts[:depth]))
-            if spec is None:
+            if spec is not None:
+                specs.append((depth, spec))
+        return specs
+
+    @staticmethod
+    def _decide(
+        specs: list[tuple[int, GitIgnoreSpec]],
+        parts: list[str],
+        index: int,
+        *,
+        is_dir: bool,
+    ) -> bool:
+        """Match the entry at `parts[index]`; the deepest matching spec wins."""
+        for depth, spec in specs:
+            if depth > index:
                 continue
-            candidate = "/".join(parts[depth:])
-            if is_dir or depth < len(parts) - 1:
+            candidate = "/".join(parts[depth : index + 1])
+            if is_dir:
                 # A trailing slash tells pathspec the match target is a dir.
                 candidate += "/"
             decision = spec.check_file(candidate).include

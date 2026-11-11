@@ -5,14 +5,16 @@ Watchdog maps `recursive=True` to a single `ReadDirectoryChangesW` with
 `bWatchSubtree=TRUE` on Windows, so the whole tree is one emitter thread. The
 old one-watch-per-directory schedule created one thread per directory (ISS-7:
 3,227 threads on a Visual Studio workspace). Events under ignored paths
-(`config.IGNORE_DIRS` plus `.gitignore`) are dropped in the handler; watchdog
-walks a newly created directory to synthesize sub-events, and the sweep remains
-the backstop for anything missed.
+(`config.IGNORE_DIRS`, the active log file, and `.gitignore`) are dropped
+silently before any event logging, so the watcher can never log its own log
+writes; watchdog walks a newly created directory to synthesize sub-events, and
+the sweep remains the backstop for anything missed.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -22,6 +24,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 from watchdog.observers.api import BaseObserver
 
+from simple_code_indexer import logging_setup
 from simple_code_indexer.config import Settings, is_allowed, is_temp_name
 from simple_code_indexer.ignore import GITIGNORE_NAME, IgnoreRules
 from simple_code_indexer.indexer import (
@@ -41,6 +44,39 @@ def build_handler(settings: Settings, work_queue: WorkQueue) -> FileSystemEventH
     debounce_s = settings.debounce_ms / 1000.0
     logger.debug("watcher: debounce %.0f ms", settings.debounce_ms)
     rules = IgnoreRules(settings.workspace_root)
+
+    def is_log_file(path: Path) -> bool:
+        """The active log file and its rotation siblings (never log those)."""
+        log_file = logging_setup.active_log_file()
+        if log_file is None:
+            return False
+        try:
+            log_file = log_file.resolve()
+            path = path.resolve()
+        except OSError:
+            return False
+        if path.parent != log_file.parent:
+            return False
+        name = os.path.normcase(path.name)
+        target = os.path.normcase(log_file.name)
+        return name == target or name.startswith(target + ".")
+
+    def excluded(path: str, *, is_dir: bool = False) -> bool:
+        """Silent drop: outside the workspace, ignored dirs, log file, .gitignore.
+
+        This runs before any event logging. Logging a path inside the workspace
+        writes to `sci.log`, which is itself watched, so logging first would
+        schedule another event forever (ISS-9).
+        """
+        p = Path(path)
+        rel = relative_path(settings, p)
+        if rel is None:
+            return True
+        if any(part in settings.ignore_dirs for part in rel.split("/")):
+            return True
+        if is_log_file(p):
+            return True
+        return rules.is_ignored(rel, is_dir=is_dir)
 
     def workspace_relative(path: str) -> str | None:
         rel = relative_path(settings, Path(path))
@@ -112,48 +148,58 @@ def build_handler(settings: Settings, work_queue: WorkQueue) -> FileSystemEventH
             logger.debug("watcher: index queued for %s", path)
 
         def on_created(self, event: FileSystemEvent) -> None:
+            path = str(event.src_path)
+            if excluded(path, is_dir=event.is_directory):
+                return
             if event.is_directory:
                 # The recursive root watch already covers the new subtree.
-                logger.debug("watcher: directory created %s", event.src_path)
+                logger.debug("watcher: directory created %s", path)
                 return
-            logger.debug("watcher: file created %s", event.src_path)
-            if not gitignore_changed(str(event.src_path)):
-                self._schedule_index(str(event.src_path))
+            logger.debug("watcher: file created %s", path)
+            if not gitignore_changed(path):
+                self._schedule_index(path)
 
         def on_modified(self, event: FileSystemEvent) -> None:
+            path = str(event.src_path)
+            if excluded(path, is_dir=event.is_directory):
+                return
             if not event.is_directory:
-                logger.debug("watcher: file modified %s", event.src_path)
-                if not gitignore_changed(str(event.src_path)):
-                    self._schedule_index(str(event.src_path))
+                logger.debug("watcher: file modified %s", path)
+                if not gitignore_changed(path):
+                    self._schedule_index(path)
 
         def on_moved(self, event: FileSystemEvent) -> None:
+            src = str(event.src_path)
+            dest = str(event.dest_path)
+            src_excluded = excluded(src, is_dir=event.is_directory)
+            dest_excluded = excluded(dest, is_dir=event.is_directory)
+            if src_excluded and dest_excluded:
+                return
             if event.is_directory:
-                logger.debug(
-                    "watcher: directory moved %s -> %s",
-                    event.src_path,
-                    event.dest_path,
-                )
+                logger.debug("watcher: directory moved %s -> %s", src, dest)
                 return
-            logger.debug(
-                "watcher: file moved %s -> %s", event.src_path, event.dest_path
-            )
-            if gitignore_changed(str(event.src_path)) or gitignore_changed(
-                str(event.dest_path)
-            ):
+            logger.debug("watcher: file moved %s -> %s", src, dest)
+            if not src_excluded and gitignore_changed(src):
                 return
-            if interesting(str(event.src_path)):
-                enqueue(WorkItem(Path(str(event.src_path)), deleted=True))
-            self._schedule_index(str(event.dest_path))
+            if not dest_excluded and gitignore_changed(dest):
+                return
+            if not src_excluded and interesting(src):
+                enqueue(WorkItem(Path(src), deleted=True))
+            if not dest_excluded:
+                self._schedule_index(dest)
 
         def on_deleted(self, event: FileSystemEvent) -> None:
+            path = str(event.src_path)
+            if excluded(path, is_dir=event.is_directory):
+                return
             if event.is_directory:
-                logger.debug("watcher: directory deleted %s", event.src_path)
+                logger.debug("watcher: directory deleted %s", path)
                 return
-            if gitignore_changed(str(event.src_path)):
+            if gitignore_changed(path):
                 return
-            if interesting(str(event.src_path)):
-                logger.debug("watcher: file deleted %s", event.src_path)
-                enqueue(WorkItem(Path(str(event.src_path)), deleted=True))
+            if interesting(path):
+                logger.debug("watcher: file deleted %s", path)
+                enqueue(WorkItem(Path(path), deleted=True))
 
     return Handler()
 
