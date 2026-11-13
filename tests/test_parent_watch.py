@@ -24,6 +24,7 @@ _ENV_EXCLUDES = (
     "WORKSPACE_ROOT",
     "INDEX_DB",
     "SIMPLE_CI_CONFIG",
+    "SIMPLE_CI_MODE",
     "SIMPLE_CI_PARENT_WATCH",
 )
 
@@ -90,9 +91,114 @@ def test_can_be_disabled(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     assert not parent_watch.enabled()
 
 
-def test_ancestors_are_live_processes() -> None:
-    for process in parent_watch.ancestors():
-        assert process.alive(), process.describe()
+def test_harness_process_is_live_or_absent() -> None:
+    harness = parent_watch.harness_process()
+    if harness is not None:
+        try:
+            assert harness.alive(), harness.describe()
+        finally:
+            harness.close()
+
+
+def _table(*entries: tuple[int, int, str]) -> dict[int, tuple[int, str]]:
+    """(pid, parent pid, name) rows; include this test process as the root."""
+    return {pid: (parent, name) for pid, parent, name in entries}
+
+
+def _capture(
+    seen: list[int],
+) -> Callable[[int, str], parent_watch.ProcessRef | None]:
+    def watcher(pid: int, name: str) -> parent_watch.ProcessRef | None:
+        seen.append(pid)
+        return FakeProcess(pid)
+
+    return watcher
+
+
+def _lookup(
+    table: dict[int, tuple[int, str]],
+    seen: list[int],
+    trampolines: frozenset[int] = frozenset(),
+) -> parent_watch.ProcessRef | None:
+    return parent_watch.harness_process(
+        table,
+        _capture(seen),
+        trampoline=lambda pid: pid in trampolines,
+    )
+
+
+def test_harness_skips_uv_and_the_venv_trampoline() -> None:
+    """opencode-cli -> uv -> trampoline -> server: watch the cli only (ISS-10)."""
+    root = os.getpid()
+    table = _table(
+        (root, 90, "server"),
+        (90, 80, "python.exe"),  # venv trampoline, directly below uv
+        (80, 70, "uv.exe"),
+        (70, 60, "opencode-cli.exe"),
+        (60, 50, "OpenCode.exe"),  # UI above the harness: never watched
+    )
+    seen: list[int] = []
+    harness = _lookup(table, seen)
+    assert harness is not None
+    assert harness.pid == 70
+    assert seen == [70]
+
+
+def test_a_venv_trampoline_is_skipped_without_uv() -> None:
+    """A harness that spawns a venv python adds a launcher of its own."""
+    root = os.getpid()
+    table = _table(
+        (root, 90, "server"),
+        (90, 80, "python.exe"),  # venv trampoline spawned by the harness
+        (80, 70, "python.exe"),  # python harness
+        (70, 60, "pytest.exe"),
+    )
+    seen: list[int] = []
+    harness = _lookup(table, seen, frozenset({90}))
+    assert harness is not None
+    assert harness.pid == 80
+    assert seen == [80]
+
+
+def test_a_direct_harness_parent_is_watched() -> None:
+    root = os.getpid()
+    table = _table(
+        (root, 90, "server"),
+        (90, 80, "opencode-cli.exe"),
+        (80, 70, "OpenCode.exe"),
+    )
+    seen: list[int] = []
+    harness = _lookup(table, seen)
+    assert harness is not None
+    assert harness.pid == 90
+    assert seen == [90]
+
+
+def test_a_python_harness_is_not_mistaken_for_the_trampoline() -> None:
+    """The fake harness in the integration test is a python process."""
+    root = os.getpid()
+    table = _table(
+        (root, 90, "server"),
+        (90, 80, "python.exe"),
+        (80, 70, "python.exe"),
+    )
+    seen: list[int] = []
+    harness = _lookup(table, seen)
+    assert harness is not None
+    assert harness.pid == 90
+    assert seen == [90]
+
+
+def test_a_shell_launched_server_has_no_harness() -> None:
+    root = os.getpid()
+    table = _table(
+        (root, 90, "server"),
+        (90, 80, "pwsh.exe"),
+        (80, 70, "explorer.exe"),
+    )
+    seen: list[int] = []
+    assert _lookup(table, seen) is None
+    assert seen == []
 
 
 def test_watched_process_reports_exit() -> None:
@@ -127,6 +233,7 @@ def test_server_exits_when_the_harness_process_dies(tmp_path: Path) -> None:
         name: value for name, value in os.environ.items() if name not in _ENV_EXCLUDES
     }
     env["SIMPLE_CI_CONFIG"] = "none"
+    env["SIMPLE_CI_MODE"] = "embedded"
     env["VECTOR_STORE"] = "faiss"
     env["PREFETCH_GRAMMARS"] = "0"
     env["EMBED_BASE_URL"] = "http://127.0.0.1:9"
@@ -150,7 +257,7 @@ def test_server_exits_when_the_harness_process_dies(tmp_path: Path) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    log_file = workspace / ".simple-ci" / "log" / "sci.log"
+    log_file = workspace / ".simple-ci" / "log" / "embed.log"
     server_watch: parent_watch.WatchedProcess | None = None
     try:
         _wait_for(
@@ -181,6 +288,9 @@ def test_server_exits_when_the_harness_process_dies(tmp_path: Path) -> None:
         final = _read(log_file)
         assert "workspace lock released" in final
         assert "shutting down after" in final
+        assert final.index("shutting down after") < final.index(
+            "workspace lock released"
+        )
     finally:
         if server_watch is not None:
             server_watch.close()

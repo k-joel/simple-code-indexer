@@ -1,24 +1,21 @@
 """Two workspaces index into separate FAISS files and never see each other.
 
 Spawns the real server (real embeddings, local FAISS), so it is skipped when the
-embedding service is down (TDD §11.2 "integration, services when reachable").
+embedding service is down.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import queue
-import subprocess
-import sys
-import threading
-import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+from mcp_client import StdioServer
 
 EMBED_BASE_URL = os.environ.get("EMBED_BASE_URL", "http://localhost:8080")
 STEP_TIMEOUT_S = 60.0
@@ -32,6 +29,7 @@ _CHILD_ENV_EXCLUDES = (
     "QDRANT_URL",
     "QDRANT_COLLECTION",
     "SIMPLE_CI_CONFIG",
+    "SIMPLE_CI_MODE",
 )
 
 
@@ -42,6 +40,7 @@ def _child_env() -> dict[str, str]:
         if name not in _CHILD_ENV_EXCLUDES
     }
     env["SIMPLE_CI_CONFIG"] = "none"
+    env["SIMPLE_CI_MODE"] = "embedded"
     env["VECTOR_STORE"] = "faiss"
     return env
 
@@ -72,116 +71,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-class Server:
-    """Stdio client for a spawned server: deadlines, and stderr always drained.
-
-    An undrained stderr pipe can block the server on a log write, and a blocking
-    readline turns any server stall into a hung test — hence both.
-    """
-
-    def __init__(self, workspace: Path) -> None:
-        self._proc = subprocess.Popen(
-            [sys.executable, "-m", "simple_code_indexer.server"],
-            cwd=workspace,
-            env=_child_env(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-        )
-        self._lines: queue.Queue[tuple[str, str | None]] = queue.Queue()
-        self._stderr: list[str] = []
-        self._next_id = 1
-        for stream, kind in ((self._proc.stdout, "out"), (self._proc.stderr, "err")):
-            threading.Thread(
-                target=self._pump, args=(stream, kind), daemon=True
-            ).start()
-
-    def _pump(self, stream: Any, kind: str) -> None:
-        for line in stream:
-            self._lines.put((kind, line.rstrip()))
-
-    def _send(self, message: dict[str, Any]) -> None:
-        assert self._proc.stdin is not None
-        self._proc.stdin.write(json.dumps(message) + "\n")
-        self._proc.stdin.flush()
-
-    def _await(self, msg_id: int, timeout: float) -> dict[str, Any]:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                kind, line = self._lines.get(timeout=0.25)
-            except queue.Empty:
-                continue
-            if kind == "err":
-                self._stderr.append(line or "")
-                continue
-            if line is None:
-                raise AssertionError(f"server closed stdout; stderr: {self._tail()}")
-            if not line.startswith("{"):
-                continue
-            message = json.loads(line)
-            if message.get("id") == msg_id:
-                return message
-        raise AssertionError(f"no reply to id {msg_id} in {timeout}s; {self._tail()}")
-
-    def _tail(self) -> str:
-        return "stderr tail: " + " | ".join(self._stderr[-5:])
-
-    def start(self) -> None:
-        self._send(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {"name": "isolation-check", "version": "0"},
-                },
-            }
-        )
-        self._await(1, STEP_TIMEOUT_S)
-        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-
-    def call(
-        self, tool: str, args: dict[str, Any], timeout: float = STEP_TIMEOUT_S
-    ) -> Any:
-        msg_id = self._next_id
-        self._next_id += 1
-        self._send(
-            {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "method": "tools/call",
-                "params": {"name": tool, "arguments": args},
-            }
-        )
-        reply = self._await(msg_id, timeout)
-        return json.loads(reply["result"]["content"][0]["text"])
-
-    def poll(
-        self,
-        tool: str,
-        args: dict[str, Any],
-        ready: Any,
-        timeout: float = STEP_TIMEOUT_S,
-    ) -> Any:
-        deadline = time.monotonic() + timeout
-        while True:
-            payload = self.call(tool, args)
-            if ready(payload):
-                return payload
-            if time.monotonic() > deadline:
-                raise AssertionError(f"{tool}({args}) never became ready: {payload}")
-            time.sleep(0.5)
-
-    def close(self) -> None:
-        self._proc.kill()
-        self._proc.wait()
-
-
 def _observation_files(observed: dict[str, Any]) -> set[str]:
     """Every file the workspace's own search paths returned, semantic or lexical."""
     return {
@@ -193,7 +82,7 @@ def _observation_files(observed: dict[str, Any]) -> set[str]:
 
 def _observe(workspace: Path, own: str, other: str) -> dict[str, Any]:
     """Run the server inside `workspace` and report what its tools see."""
-    server = Server(workspace)
+    server = StdioServer(workspace, env=_child_env())
     try:
         server.start()
         status = server.poll(

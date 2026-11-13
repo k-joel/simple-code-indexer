@@ -8,7 +8,8 @@ old one-watch-per-directory schedule created one thread per directory (ISS-7:
 (`config.IGNORE_DIRS`, the active log file, and `.gitignore`) are dropped
 silently before any event logging, so the watcher can never log its own log
 writes; watchdog walks a newly created directory to synthesize sub-events, and
-the sweep remains the backstop for anything missed.
+the reconciliation sweep (when enabled) or the next startup pass remains the
+backstop for anything missed.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 from watchdog.observers.api import BaseObserver
 
-from simple_code_indexer import logging_setup
+from simple_code_indexer import indexer, logging_setup
 from simple_code_indexer.config import Settings, is_allowed, is_temp_name
 from simple_code_indexer.ignore import GITIGNORE_NAME, IgnoreRules
 from simple_code_indexer.indexer import (
@@ -65,8 +66,9 @@ def build_handler(settings: Settings, work_queue: WorkQueue) -> FileSystemEventH
         """Silent drop: outside the workspace, ignored dirs, log file, .gitignore.
 
         This runs before any event logging. Logging a path inside the workspace
-        writes to `sci.log`, which is itself watched, so logging first would
-        schedule another event forever (ISS-9).
+        writes to the active log file (`embed.log`, `writer.log`, or `reader.log`),
+        which is itself watched, so logging first would schedule another event
+        forever (ISS-9).
         """
         p = Path(path)
         rel = relative_path(settings, p)
@@ -105,8 +107,10 @@ def build_handler(settings: Settings, work_queue: WorkQueue) -> FileSystemEventH
         try:
             work_queue.put_nowait(item)
         except queue.Full:
-            # Writer is behind; the reconciliation sweep will cover it.
+            # Writer is behind; a later sweep or the next startup pass covers it.
             logger.warning("work queue full, dropping %s", item.path)
+        else:
+            indexer.note_watcher_event()
 
     def gitignore_changed(path: str) -> bool:
         """Reload is implicit (mtime cache); queue a sweep for the index."""
@@ -120,6 +124,7 @@ def build_handler(settings: Settings, work_queue: WorkQueue) -> FileSystemEventH
         except queue.Full:
             logger.warning("work queue full, dropping sweep for %s", rel)
         else:
+            indexer.note_watcher_event()
             logger.debug("watcher: %s changed; queued a sweep", rel)
         return True
 
@@ -237,6 +242,22 @@ def start_watcher(settings: Settings, work_queue: WorkQueue) -> BaseObserver:
 def wait_until_ready(timeout: float) -> bool:
     """Block until the observer has started (tests / diagnostics)."""
     return _READY.wait(timeout)
+
+
+def stop_watcher(observer: BaseObserver | None = None, timeout: float = 5.0) -> None:
+    """Stop the recursive watch and join its emitter thread; never raises."""
+    global _OBSERVER
+
+    target = observer if observer is not None else _OBSERVER
+    if target is not None:
+        try:
+            target.stop()
+            target.join(timeout)
+        except Exception:
+            logger.warning("watcher did not stop cleanly", exc_info=True)
+    if target is _OBSERVER:
+        _OBSERVER = None
+        _READY.clear()
 
 
 def is_alive() -> bool:

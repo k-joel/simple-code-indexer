@@ -104,6 +104,26 @@ def test_debounce_collapses_event_burst(tmp_path: Path) -> None:
     assert work_queue.qsize() == 1, "burst was not collapsed to one work item"
 
 
+def test_queued_events_are_watcher_activity(tmp_path: Path) -> None:
+    """The sweep backoff resets on real work, never on ignored events."""
+    settings = _settings(tmp_path, debounce_ms=50)
+    work_queue: indexer.WorkQueue = indexer.new_work_queue()
+    handler = watcher.build_handler(settings, work_queue)
+    from watchdog.events import FileCreatedEvent, FileModifiedEvent
+
+    before = indexer.watcher_activity()
+    handler.on_created(FileCreatedEvent(str(tmp_path / "activity.cpp")))
+    assert _wait_for(lambda: indexer.watcher_activity() > before, timeout=2.0), (
+        "a queued index event did not count as watcher activity"
+    )
+
+    ignored = indexer.watcher_activity()
+    handler.on_created(FileCreatedEvent(str(tmp_path / "notes.md")))
+    handler.on_modified(FileModifiedEvent(str(tmp_path / ".venv" / "x.py")))
+    time.sleep(0.2)
+    assert indexer.watcher_activity() == ignored
+
+
 def test_ignored_and_temp_events_are_dropped(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -131,7 +151,7 @@ def test_ignored_and_temp_events_are_dropped(
     time.sleep(0.3)
     assert work_queue.empty()
     # Ignored dirs/files must be dropped before any event logging: a logged
-    # event writes sci.log, which is itself watched (ISS-9 loop).
+    # event writes the active log file, which is itself watched (ISS-9 loop).
     assert [
         record
         for record in caplog.records
@@ -207,7 +227,7 @@ def test_idle_server_does_not_grow_its_own_log(
             record
             for record in caplog.records
             if record.name == "simple_code_indexer.watcher"
-            and "sci.log" in record.getMessage()
+            and log_file.name in record.getMessage()
         ]
     finally:
         observer.stop()

@@ -1,4 +1,4 @@
-"""Cross-process advisory lock: one index writer per workspace (ADR-0004)."""
+"""Cross-process advisory lock: one index writer per workspace (ADR-003)."""
 
 from __future__ import annotations
 
@@ -27,15 +27,15 @@ else:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-class WorkspaceLock:
-    """Non-blocking exclusive lease on `<index_db>.lock`.
+class FileLock:
+    """Non-blocking exclusive lease on an arbitrary lock file.
 
     The open handle *is* the lease: the OS releases it when the process exits,
-    so a killed session never leaves a stale lock behind (only the file stays).
+    so a killed process never leaves a stale lock behind (only the file stays).
     """
 
-    def __init__(self, index_db_path: Path) -> None:
-        self._path = index_db_path.with_name(index_db_path.name + ".lock")
+    def __init__(self, path: Path) -> None:
+        self._path = path
         self._handle: BinaryIO | None = None
 
     def acquire(self) -> bool:
@@ -61,3 +61,10 @@ class WorkspaceLock:
             _unlock(handle)
         finally:
             handle.close()
+
+
+class WorkspaceLock(FileLock):
+    """Exclusive writer lease on ``<index_db>.lock``."""
+
+    def __init__(self, index_db_path: Path) -> None:
+        super().__init__(index_db_path.with_name(index_db_path.name + ".lock"))

@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parent
 _GIT_TIMEOUT_S = 20.0
 _SYNC_TIMEOUT_S = 300.0
 _MAX_ERROR_CHARS = 500
+_CREATE_NO_WINDOW = 0x08000000
 
 
 def _run(argv: list[str], *, timeout: float) -> subprocess.CompletedProcess[str] | None:
@@ -35,6 +36,10 @@ def _run(argv: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]
             errors="replace",
             timeout=timeout,
             check=False,
+            # A harness that spawns us without a console would otherwise get a
+            # visible console window for every git/uv child (run_server.py is
+            # itself often launched with pythonw).
+            creationflags=_CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -63,8 +68,13 @@ def _head() -> str | None:
     return result.stdout.strip() or None
 
 
+def _pull_enabled() -> bool:
+    value = os.environ.get("SIMPLE_CI_GIT_PULL", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
 def _git_pull() -> None:
-    if os.environ.get("SIMPLE_CI_GIT_PULL", "1").lower() in {"0", "false", "no", "off"}:
+    if not _pull_enabled():
         return
     if shutil.which("git") is None:
         return
@@ -100,11 +110,13 @@ def _uv_sync() -> None:
 
 
 def main() -> int:
-    before = _head()
-    _git_pull()
-    after = _head()
-    if before != after:
-        _uv_sync()
+    # Two `git rev-parse` spawns per launch are pointless when pulling is off:
+    # HEAD cannot move between them.
+    if _pull_enabled():
+        before = _head()
+        _git_pull()
+        if before != _head():
+            _uv_sync()
     from simple_code_indexer.server import main as server_main
 
     server_main()

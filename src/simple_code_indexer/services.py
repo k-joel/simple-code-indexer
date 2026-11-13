@@ -37,6 +37,10 @@ _which = shutil.which
 _clock = time.monotonic
 _sleep = time.sleep
 
+# The writer usually runs without a console (sidecar/pythonw); a console child
+# would otherwise allocate a visible console window for every docker call.
+_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
 
 def ensure_managed_services(settings: Settings) -> None:
     """Ensure configured containers are up and answering, then record the state."""
@@ -157,7 +161,7 @@ def _start_docker_daemon() -> None:
     if not command:
         return
     try:
-        _popen(command)
+        _popen(command, creationflags=_CREATE_NO_WINDOW)
     except OSError:
         logger.warning("could not launch Docker", exc_info=True)
 
@@ -175,6 +179,7 @@ def _docker_output(*args: str, timeout: float = _DOCKER_TIMEOUT_S) -> tuple[bool
             text=True,
             timeout=timeout,
             check=False,
+            creationflags=_CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         logger.debug("docker %s could not run: %s", " ".join(args), exc)

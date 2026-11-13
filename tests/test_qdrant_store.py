@@ -135,6 +135,73 @@ def test_ensure_collection_tolerates_a_concurrent_create(monkeypatch) -> None:
     assert client.attempts == 1  # now cached, not retried
 
 
+def test_validate_collection_never_creates(monkeypatch) -> None:
+    client = _FakeClient()
+    monkeypatch.setattr(qdrant_store, "_client", lambda settings: client)
+    monkeypatch.setattr(qdrant_store, "_ensured_collections", set())
+
+    with pytest.raises(QdrantUnavailable, match="does not exist"):
+        qdrant_store.validate_collection(_settings())
+
+    assert client.created == []
+    assert client.attempts == 0
+
+
+def test_validate_collection_accepts_and_caches_an_existing_collection(
+    monkeypatch,
+) -> None:
+    client = _ExistingClient(vector_size=2560)
+    monkeypatch.setattr(qdrant_store, "_client", lambda settings: client)
+    monkeypatch.setattr(qdrant_store, "_ensured_collections", set())
+
+    qdrant_store.validate_collection(_settings())
+    qdrant_store.validate_collection(_settings())
+    assert qdrant_store.LAST_OK is True
+
+
+class _SearchClient(_ExistingClient):
+    def query_points(
+        self,
+        name: str,
+        *,
+        query: list[float],
+        limit: int,
+        with_payload: bool,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            points=[
+                SimpleNamespace(
+                    payload={"path": "src/a.cpp", "chunk_index": 0}, score=0.9
+                ),
+                SimpleNamespace(payload={}, score=0.5),
+            ]
+        )
+
+
+def test_readonly_search_validates_without_creating(monkeypatch) -> None:
+    client = _SearchClient()
+    monkeypatch.setattr(qdrant_store, "_client", lambda settings: client)
+    monkeypatch.setattr(qdrant_store, "_ensured_collections", set())
+
+    hits = qdrant_store.search_readonly(_settings(), [0.0] * 2560, 5)
+
+    assert [(hit.path, hit.chunk_index) for hit in hits] == [("src/a.cpp", 0)]
+    assert client.created == []
+    assert qdrant_store.LAST_OK is True
+
+
+def test_readonly_search_never_creates_a_missing_collection(monkeypatch) -> None:
+    client = _FakeClient()
+    monkeypatch.setattr(qdrant_store, "_client", lambda settings: client)
+    monkeypatch.setattr(qdrant_store, "_ensured_collections", set())
+
+    with pytest.raises(QdrantUnavailable, match="does not exist"):
+        qdrant_store.search_readonly(_settings(), [0.0] * 2560, 5)
+
+    assert client.created == []
+    assert client.attempts == 0
+
+
 def test_existing_collection_with_matching_size_is_accepted(monkeypatch) -> None:
     client = _ExistingClient(vector_size=2560)
     monkeypatch.setattr(qdrant_store, "_client", lambda settings: client)

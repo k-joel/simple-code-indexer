@@ -1,8 +1,8 @@
 """MCP stdio server: initialize / tools/list / tools/call for the harness.
 
 No outputSchema, no capabilities.tasks, no execution.taskSupport — the harness
-rejects them (ADR-0006). Logs go to stderr and <workspace>/.simple-ci/log/sci.log;
-stdout is the MCP channel.
+rejects them (ADR-005). Logs go to stderr and
+`<workspace>/.simple-ci/log/{reader,embed}.log`; stdout is the MCP channel.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import atexit
 import json
 import logging
 import os
-import threading
+import sqlite3
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -28,6 +28,7 @@ from simple_code_indexer import (
     indexer,
     logging_setup,
     parent_watch,
+    runtime,
     services,
     vector_store,
     watcher,
@@ -38,8 +39,10 @@ from simple_code_indexer.errors import (
     ConfigError,
     EmbedError,
     VectorStoreUnavailable,
+    WorkspaceBusy,
 )
-from simple_code_indexer.registry import get_registry, start_prefetch_thread
+from simple_code_indexer.registry import get_registry
+from simple_code_indexer.sidecar import ReaderSession
 
 logger = logging.getLogger("simple_code_indexer")
 
@@ -87,16 +90,43 @@ def _json_result(payload: dict[str, Any]) -> types.CallToolResult:
     )
 
 
-def _status_payload(settings: Settings) -> dict[str, Any]:
-    with db.connect(settings.index_db_path, readonly=True) as conn:
-        counts = db.stats(conn)
-        embedding = db.embedding_counts(conn)
+def _not_ready(source: str) -> dict[str, Any]:
+    return {
+        "hits": [],
+        "source": source,
+        "ready": False,
+        "pending_embeddings": 0,
+        "message": "index is not ready yet",
+    }
+
+
+def _status_payload(
+    settings: Settings,
+    *,
+    role: str = "writer",
+    session: ReaderSession | None = None,
+) -> dict[str, Any]:
+    try:
+        with db.try_connect_readonly(settings.index_db_path) as conn:
+            if conn is None:
+                counts = {"files": 0, "symbols": 0, "chunks": 0}
+                embedding = {"embedded": 0, "pending": 0}
+                index_ready = False
+            else:
+                counts = db.stats(conn)
+                embedding = db.embedding_counts(conn)
+                index_ready = True
+    except sqlite3.Error:
+        logger.debug("cannot read the index for get_status", exc_info=True)
+        counts = {"files": 0, "symbols": 0, "chunks": 0}
+        embedding = {"embedded": 0, "pending": 0}
+        index_ready = False
     registry = get_registry()
     from simple_code_indexer.parse import _parsers
 
     log_file = logging_setup.active_log_file()
     sweep_stats = indexer.LAST_SWEEP_STATS
-    return {
+    payload: dict[str, Any] = {
         "files_indexed": counts["files"],
         "symbols_indexed": counts["symbols"],
         "chunks_indexed": counts["chunks"],
@@ -104,6 +134,7 @@ def _status_payload(settings: Settings) -> dict[str, Any]:
         "pending_embeddings": embedding["pending"],
         "watcher_alive": watcher.is_alive(),
         "last_sweep": indexer.LAST_SWEEP,
+        "sweep_seconds": settings.sweep_seconds,
         "ignored_dirs": sweep_stats.ignored_dirs if sweep_stats else 0,
         "ignored_files": sweep_stats.ignored_files if sweep_stats else 0,
         "vector_store": vector_store.backend(settings),
@@ -119,12 +150,71 @@ def _status_payload(settings: Settings) -> dict[str, Any]:
         "log_file": str(log_file) if log_file else None,
         "log_level": settings.log_level,
         "services": dict(services.LAST_STATE),
+        "role": role,
+        "index_ready": index_ready,
+        "writer_pid": os.getpid() if role == "writer" else None,
+        "writer_ok": role == "writer",
+        "writer_heartbeat_age_s": 0.0 if role == "writer" else None,
+        "writer_log_file": str(log_file) if log_file else None,
+        "daemon_endpoint": None,
+        "sessions": 1 if role == "writer" else 0,
+        "harnesses": [],
+        "vector_index_age_s": runtime.vector_index_age(settings),
     }
+    if role != "reader":
+        return payload
+
+    status = session.status() if session is not None else None
+    if status is not None:
+        payload.update(
+            {
+                "writer_pid": status.get("writer_pid"),
+                "writer_ok": bool(status.get("writer_ok")),
+                "writer_heartbeat_age_s": status.get("writer_heartbeat_age_s"),
+                "writer_log_file": status.get("writer_log_file"),
+                "daemon_endpoint": status.get("endpoint"),
+                "sessions": int(status.get("sessions") or 0),
+                "harnesses": status.get("harnesses") or [],
+                "watcher_alive": bool(status.get("watcher_alive")),
+                "last_sweep": status.get("last_sweep"),
+                "ignored_dirs": int(status.get("ignored_dirs") or 0),
+                "ignored_files": int(status.get("ignored_files") or 0),
+                "vector_store_ok": status.get("vector_store_ok"),
+                "services": status.get("services") or {},
+                "vector_index_age_s": status.get("vector_index_age_s"),
+            }
+        )
+        return payload
+
+    state = runtime.writer_state(settings, stale_after_s=3.0 * settings.heartbeat_s)
+    payload.update(
+        {
+            "writer_pid": state["writer_pid"],
+            "writer_ok": state["writer_ok"],
+            "writer_heartbeat_age_s": state["writer_heartbeat_age_s"],
+            "writer_log_file": str(
+                logging_setup.log_path(settings, logging_setup.WRITER_LOG_FILENAME)
+            ),
+            "watcher_alive": False,
+            "sessions": 0,
+            "harnesses": [],
+            "daemon_endpoint": None,
+        }
+    )
+    return payload
 
 
-def _semantic_hits(settings: Settings, query: str, limit: int) -> dict[str, Any]:
-    with db.connect(settings.index_db_path, readonly=True) as conn:
-        embedding = db.embedding_counts(conn)
+def _semantic_hits(
+    settings: Settings, query: str, limit: int, *, readonly: bool = False
+) -> dict[str, Any]:
+    try:
+        with db.try_connect_readonly(settings.index_db_path) as conn:
+            if conn is None:
+                return _not_ready("semantic")
+            embedding = db.embedding_counts(conn)
+    except sqlite3.Error:
+        logger.debug("semantic search cannot read the index yet", exc_info=True)
+        return _not_ready("semantic")
     ready = embedding["pending"] == 0
     embed_started = time.perf_counter()
     try:
@@ -133,7 +223,10 @@ def _semantic_hits(settings: Settings, query: str, limit: int) -> dict[str, Any]
         search_started = time.perf_counter()
         # Over-fetch: adjacent chunks overlap, so the top `limit` vector hits
         # can collapse to fewer distinct spans after dedupe below.
-        vector_hits = vector_store.search(settings, vector, limit * 3)
+        if readonly:
+            vector_hits = vector_store.search_readonly(settings, vector, limit * 3)
+        else:
+            vector_hits = vector_store.search(settings, vector, limit * 3)
         search_ms = int((time.perf_counter() - search_started) * 1000)
     except (EmbedError, VectorStoreUnavailable) as exc:
         logger.warning(
@@ -153,7 +246,9 @@ def _semantic_hits(settings: Settings, query: str, limit: int) -> dict[str, Any]
     hits: list[dict[str, Any]] = []
     kept_spans: dict[str, list[tuple[int, int]]] = {}
     orphans = overlaps = 0
-    with db.connect(settings.index_db_path, readonly=True) as conn:
+    with db.try_connect_readonly(settings.index_db_path) as conn:
+        if conn is None:
+            return _not_ready("semantic")
         for vector_hit in vector_hits:
             span = db.get_chunk(conn, vector_hit.path, vector_hit.chunk_index)
             if span is None:
@@ -217,7 +312,9 @@ def _semantic_hits(settings: Settings, query: str, limit: int) -> dict[str, Any]
     return payload
 
 
-def _search_code(settings: Settings, args: dict[str, Any]) -> dict[str, Any]:
+def _search_code(
+    settings: Settings, args: dict[str, Any], *, readonly: bool = False
+) -> dict[str, Any]:
     started = time.perf_counter()
     query = str(args.get("query", ""))
     try:
@@ -230,9 +327,15 @@ def _search_code(settings: Settings, args: dict[str, Any]) -> dict[str, Any]:
         logger.debug("empty search query (semantic=%s)", semantic)
         return {"hits": [], "source": "semantic" if semantic else "lexical"}
     if semantic:
-        return _semantic_hits(settings, query, limit)
-    with db.connect(settings.index_db_path, readonly=True) as conn:
-        hits = db.fts_search(conn, query, limit)
+        return _semantic_hits(settings, query, limit, readonly=readonly)
+    try:
+        with db.try_connect_readonly(settings.index_db_path) as conn:
+            if conn is None:
+                return _not_ready("lexical")
+            hits = db.fts_search(conn, query, limit)
+    except sqlite3.Error:
+        logger.debug("lexical search cannot read the index yet", exc_info=True)
+        return _not_ready("lexical")
     logger.debug(
         "lexical search %.200r: %d hit(s) in %d ms",
         query,
@@ -257,8 +360,26 @@ def _search_code(settings: Settings, args: dict[str, Any]) -> dict[str, Any]:
 
 def _symbol_lookup(settings: Settings, args: dict[str, Any]) -> dict[str, Any]:
     name = str(args.get("symbol", ""))
-    with db.connect(settings.index_db_path, readonly=True) as conn:
-        symbols = db.symbol_lookup(conn, name)
+    try:
+        with db.try_connect_readonly(settings.index_db_path) as conn:
+            if conn is None:
+                return {
+                    "symbol": name,
+                    "found": False,
+                    "matches": [],
+                    "ready": False,
+                    "message": "index is not ready yet",
+                }
+            symbols = db.symbol_lookup(conn, name)
+    except sqlite3.Error:
+        logger.debug("symbol lookup cannot read the index yet", exc_info=True)
+        return {
+            "symbol": name,
+            "found": False,
+            "matches": [],
+            "ready": False,
+            "message": "index is not ready yet",
+        }
 
     def flat(s: Any) -> dict[str, Any]:
         return {
@@ -308,14 +429,19 @@ def _result_summary(name: str, payload: dict[str, Any]) -> str:
 
 
 def _call_tool(
-    settings: Settings, name: str, args: dict[str, Any]
+    settings: Settings,
+    name: str,
+    args: dict[str, Any],
+    *,
+    role: str = "writer",
+    session: ReaderSession | None = None,
 ) -> types.CallToolResult:
     started = time.perf_counter()
     try:
         if name == "get_status":
-            payload = _status_payload(settings)
+            payload = _status_payload(settings, role=role, session=session)
         elif name == "search_code":
-            payload = _search_code(settings, args)
+            payload = _search_code(settings, args, readonly=role == "reader")
         elif name == "symbol_lookup":
             payload = _symbol_lookup(settings, args)
         else:
@@ -339,46 +465,24 @@ def _call_tool(
     return _json_result(payload)
 
 
-def _build_server(settings: Settings) -> Server:
+def _build_server(
+    settings: Settings,
+    *,
+    role: str = "writer",
+    session: ReaderSession | None = None,
+) -> Server:
     async def on_call_tool(
         ctx: Any, params: types.CallToolRequestParams
     ) -> types.CallToolResult:
-        return _call_tool(settings, params.name, params.arguments or {})
+        return _call_tool(
+            settings, params.name, params.arguments or {}, role=role, session=session
+        )
 
     return Server(
         "simple-code-indexer",
         on_list_tools=_on_list_tools,
         on_call_tool=on_call_tool,
     )
-
-
-def _periodic_sweep(settings: Settings, work_queue: indexer.WorkQueue) -> None:
-    while True:
-        time.sleep(settings.sweep_seconds)
-        try:
-            work_queue.put(indexer.SWEEP_REQUEST)
-            logger.debug("periodic sweep requested")
-        except Exception:
-            # Keep the timer alive: one bad request must not stop all sweeps.
-            logger.exception("cannot request a periodic sweep")
-
-
-def _probe_services(settings: Settings) -> None:
-    """Warm vector store + embed endpoint off the serve path; feeds status flags."""
-    try:
-        vector_store.ensure_ready(settings)
-        logger.info(
-            "service probe: vector store ready (%s)", vector_store.describe(settings)
-        )
-    except Exception:
-        logger.exception("vector store probe failed")
-    try:
-        embed.embed_texts(settings, ["service probe"])
-        logger.info(
-            "service probe: embedding endpoint answered (%s)", settings.embed_base_url
-        )
-    except Exception:
-        logger.exception("embed probe failed")
 
 
 def _acquire_workspace_lock(index_db_path: Path) -> workspace_lock.WorkspaceLock:
@@ -392,21 +496,6 @@ def _acquire_workspace_lock(index_db_path: Path) -> workspace_lock.WorkspaceLock
         raise SystemExit(1)
     logger.info("workspace lock acquired: %s", index_db_path)
     return lock
-
-
-def _finalize(settings: Settings, started_at: float) -> None:
-    """atexit: record the shutdown, persist vectors, log the final counts."""
-    logger.info("shutting down after %.1fs", time.monotonic() - started_at)
-    try:
-        vector_store.flush(settings)
-        logger.info("vector store flushed (%s)", vector_store.describe(settings))
-    except Exception:
-        logger.warning("vector store flush failed at shutdown", exc_info=True)
-    try:
-        with db.connect(settings.index_db_path, readonly=True) as conn:
-            logger.info("final index: %s", db.stats(conn))
-    except Exception:
-        logger.debug("cannot read the final index stats", exc_info=True)
 
 
 async def _serve(
@@ -454,106 +543,80 @@ async def _serve(
 async def _run() -> None:
     started_at = time.monotonic()
     settings = load_settings()
-    watchdog = parent_watch.ParentWatchdog() if parent_watch.enabled() else None
-    log_file = logging_setup.configure_file(settings)
     logging_setup.install_excepthooks()
-    logging_setup.log_startup(settings, log_file)
-    lock = _acquire_workspace_lock(settings.index_db_path)
 
-    phase = time.monotonic()
-    services.ensure_managed_services(settings)
-    logger.info(
-        "startup: managed services in %d ms (%s)",
-        int((time.monotonic() - phase) * 1000),
-        dict(services.LAST_STATE),
-    )
-    start_prefetch_thread()
-    backend = vector_store.backend(settings)
-    phase = time.monotonic()
-    with db.connect(settings.index_db_path) as conn:
-        db.ensure_schema(conn)
-        with conn:
-            invalidated = db.ensure_index_identity(
-                conn,
-                backend=backend,
-                identity=vector_store.identity(settings),
-            )
-    logger.info(
-        "startup: schema + identity in %d ms (backend=%s, invalidated=%s)",
-        int((time.monotonic() - phase) * 1000),
-        backend,
-        invalidated,
-    )
-    if invalidated:
-        logger.warning(
-            "vector store %s changed — index cleared for a full re-index",
-            vector_store.describe(settings),
+    session: ReaderSession | None = None
+    if settings.mode == "embedded":
+        log_file = logging_setup.configure_file(
+            settings, filename=logging_setup.EMBED_LOG_FILENAME
         )
+        logging_setup.log_startup(settings, log_file, role="writer")
+        writer = runtime.WriterRuntime(settings, started_at=started_at)
         try:
-            vector_store.reset(settings)
-        except VectorStoreUnavailable:
-            logger.warning("cannot reset the vector index", exc_info=True)
-    phase = time.monotonic()
-    try:
-        vector_store.ensure_ready(settings)
-        flagged = vector_store.reconcile(settings)
-        if flagged:
-            logger.info("%d chunk(s) flagged for re-embedding", flagged)
-    except VectorStoreUnavailable:
-        logger.warning("vector store unavailable at startup", exc_info=True)
-    logger.info(
-        "startup: vector store in %d ms (%s)",
-        int((time.monotonic() - phase) * 1000),
-        vector_store.describe(settings),
-    )
-    atexit.register(_finalize, settings, started_at)
-    threading.Thread(
-        target=_probe_services, args=(settings,), name="service-probe", daemon=True
-    ).start()
-    # Single writer owns all index writes; startup reconcile goes through it.
-    work_queue = indexer.new_work_queue()
-    threading.Thread(
-        target=indexer.writer_loop,
-        args=(settings, work_queue),
-        name="index-writer",
-        daemon=True,
-    ).start()
-    work_queue.put(indexer.SWEEP_REQUEST)
-    watcher.start_watcher(settings, work_queue)
-    logger.info("startup: watcher started")
-    threading.Thread(
-        target=_periodic_sweep,
-        args=(settings, work_queue),
-        name="sweep-timer",
-        daemon=True,
-    ).start()
-    server = _build_server(settings)
-    logger.info(
-        "serving on stdio (startup %.0f ms)", (time.monotonic() - started_at) * 1000
-    )
-
-    def _watchdog_exit(description: str) -> NoReturn:
-        """Harness gone: stdio_server's reader thread cannot be cancelled, so
-        returning from the serve loop would hang on the open pipe. Finalize and
-        end the process instead."""
-        logger.warning(
-            "parent process %s is gone; shutting down so the server cannot "
-            "outlive the harness",
-            description,
+            writer.start()
+        except WorkspaceBusy:
+            logger.error(
+                "another simple-code-indexer already owns %s; refusing to start",
+                settings.index_db_path,
+            )
+            raise SystemExit(1) from None
+        role = "writer"
+        cleanup = writer.stop
+    else:
+        log_file = logging_setup.configure_file(
+            settings, filename=logging_setup.READER_LOG_FILENAME
         )
-        lock.release()
-        logger.info("workspace lock released")
-        if watchdog is not None:
-            watchdog.close()
-        _finalize(settings, started_at)
-        logging.shutdown()
-        os._exit(0)
+        logging_setup.log_startup(settings, log_file, role="reader")
+        session = ReaderSession(settings)
+        session.start()
+        role = "reader"
+        cleanup = session.close
+
+    finalized = False
+
+    def _cleanup_once() -> None:
+        """Stop the writer or unregister the reader exactly once."""
+        nonlocal finalized
+        if finalized:
+            return
+        finalized = True
+        atexit.unregister(_cleanup_once)
+        try:
+            cleanup()
+        except Exception:
+            logger.warning("shutdown cleanup failed", exc_info=True)
+
+    atexit.register(_cleanup_once)
+    watchdog = parent_watch.ParentWatchdog() if parent_watch.enabled() else None
 
     try:
+        server = _build_server(settings, role=role, session=session)
+        logger.info(
+            "serving on stdio (startup %.0f ms, role=%s)",
+            (time.monotonic() - started_at) * 1000,
+            role,
+        )
+
+        def _watchdog_exit(description: str) -> NoReturn:
+            """Harness gone: stdio_server's reader thread cannot be cancelled, so
+            returning from the serve loop would hang on the open pipe. Run the
+            role cleanup (flush + release, or unregister), then end the process."""
+            logger.warning(
+                "parent process %s is gone; shutting down so the server cannot "
+                "outlive the harness",
+                description,
+            )
+            try:
+                _cleanup_once()
+            finally:
+                if watchdog is not None:
+                    watchdog.close()
+                logging.shutdown()
+                os._exit(0)
+
         await _serve(server, watchdog, _watchdog_exit)
     finally:
-        lock.release()
-        logger.info("workspace lock released")
+        _cleanup_once()
 
 
 def main() -> None:

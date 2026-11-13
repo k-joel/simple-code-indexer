@@ -25,7 +25,7 @@ _GENERIC_SYMBOL_NODES: dict[str, str] = {
     "method_definition": "method",
 }
 
-# Fallback scan for languages without a loaded grammar (TDD §7.4).
+# Fallback scan for languages without a loaded grammar.
 _REGEX_SYMBOLS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"^\s*def\s+([A-Za-z_]\w*)"), "function"),
     (
@@ -103,7 +103,7 @@ def chunk_source(
 
 
 def _parser(lang: str) -> Any:
-    """Lazy parser load: keeps server startup <3 s (TDD §7.9)."""
+    """Lazy parser load: keeps server startup fast."""
     if lang not in _parsers:
         logger.debug("loading tree-sitter grammar %s", lang)
         from tree_sitter_language_pack import get_parser

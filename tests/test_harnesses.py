@@ -5,11 +5,13 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import yaml
 
 from simple_code_indexer import harnesses as harnesses_pkg
 from simple_code_indexer.harnesses import (
     _json,
     _toml,
+    _yaml,
     default_user_harness_dirs,
     load_harnesses,
 )
@@ -33,7 +35,7 @@ def test_builtin_harnesses_load() -> None:
     specs = load_harnesses(user_dirs=[])
     names = {spec.name for spec in specs}
 
-    assert len(specs) >= 10
+    assert len(specs) >= 12
     assert {
         "claude_code",
         "claude_desktop",
@@ -46,6 +48,8 @@ def test_builtin_harnesses_load() -> None:
         "zed",
         "commandcode",
         "mimo",
+        "goose",
+        "pi",
     } <= names
 
 
@@ -234,6 +238,8 @@ def test_opencode_entry_shape() -> None:
     assert entry["type"] == "local"
     assert entry["command"] == COMMAND
     assert entry["environment"] == {"K": "V"}
+    assert entry["codemode"] is False
+    assert "cwd" not in entry
     assert "enabled" not in entry
 
 
@@ -267,6 +273,96 @@ def test_zed_uses_context_servers_without_a_type() -> None:
 
     entry = json.loads(rendered)["context_servers"][NAME]
     assert entry == {"command": "uvx", "args": ["--from", "/repo", NAME]}
+
+
+def test_goose_entry_shape_and_yaml_merge() -> None:
+    spec = _spec("goose")
+    existing = (
+        "active_provider: anthropic\nextensions:\n  developer:\n    type: builtin\n"
+    )
+    rendered = spec.render(
+        existing,
+        name=NAME,
+        command=COMMAND,
+        env={"WORKSPACE_ROOT": "D:\\repo", "K": "V"},
+    )
+
+    document = yaml.safe_load(rendered)
+    assert document["active_provider"] == "anthropic"
+    assert document["extensions"]["developer"] == {"type": "builtin"}
+    entry = document["extensions"][NAME]
+    assert entry["type"] == "stdio"
+    assert entry["name"] == NAME
+    assert entry["cmd"] == "uvx"
+    assert entry["args"] == ["--from", "/repo", NAME]
+    assert entry["envs"] == {"WORKSPACE_ROOT": "D:\\repo", "K": "V"}
+    assert "cwd" not in entry
+    assert entry["enabled"] is True
+    assert entry["timeout"] == 300
+
+
+def test_goose_remove_round_trips_yaml() -> None:
+    spec = _spec("goose")
+    existing = "active_provider: anthropic\n"
+    installed = spec.render(existing, name=NAME, command=COMMAND, env={})
+    removed = spec.remove(installed, name=NAME)
+
+    assert removed is not None
+    assert yaml.safe_load(removed) == {"active_provider": "anthropic"}
+    assert spec.remove(removed, name=NAME) is None
+
+
+def test_yaml_upsert_is_idempotent_and_rejects_bad_documents() -> None:
+    once = _yaml.upsert(
+        "extensions: {}\n", root_key="extensions", name=NAME, entry={"type": "stdio"}
+    )
+    twice = _yaml.upsert(
+        once, root_key="extensions", name=NAME, entry={"type": "stdio"}
+    )
+    assert once == twice
+
+    with pytest.raises(_yaml.ParseError):
+        _yaml.upsert("- not\n- a map\n", root_key="extensions", name=NAME, entry={})
+
+
+def test_pi_entry_exposes_tools_directly() -> None:
+    spec = _spec("pi")
+    rendered = spec.render(
+        '{"mcpServers": {"other": {"command": "x"}}}',
+        name=NAME,
+        command=COMMAND,
+        env={"K": "V"},
+    )
+
+    document = json.loads(rendered)
+    assert document["mcpServers"]["other"] == {"command": "x"}
+    entry = document["mcpServers"][NAME]
+    assert entry["command"] == "uvx"
+    assert entry["args"] == ["--from", "/repo", NAME]
+    assert entry["env"] == {"K": "V"}
+    assert entry["exposure"] == "direct"
+    assert entry["timeout"] == 120
+    assert "cwd" not in entry
+
+
+def test_no_harness_entry_emits_a_cwd() -> None:
+    """ADR-015: a plugin must never turn an env pin into an entry `cwd`."""
+    workspace = "D:\\Projects\\Python\\simple-code-indexer"
+    for spec in load_harnesses(user_dirs=[]):
+        rendered = spec.render(
+            "", name=NAME, command=COMMAND, env={"WORKSPACE_ROOT": workspace}
+        )
+        assert '"cwd"' not in rendered, spec.name
+
+
+def test_wizard_entries_carry_no_workspace_path() -> None:
+    """ADR-015: the wizard writes install-scoped entries only (`env={}`)."""
+    workspace = "D:\\Projects\\Python\\simple-code-indexer"
+    for spec in load_harnesses(user_dirs=[]):
+        rendered = spec.render("", name=NAME, command=COMMAND, env={})
+        assert workspace not in rendered, spec.name
+        assert workspace.replace("\\", "\\\\") not in rendered, spec.name
+        assert "WORKSPACE_ROOT" not in rendered, spec.name
 
 
 def test_commandcode_marks_the_stdio_transport() -> None:

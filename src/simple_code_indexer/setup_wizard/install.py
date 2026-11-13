@@ -42,10 +42,21 @@ class InstallResult:
     root: Path
     launcher: Path
     uv: str = "uv"
+    platform: str = sys.platform
 
     @property
     def server_command(self) -> list[str]:
-        """Launch the installed copy through uv, preserving the caller's cwd."""
+        """Launch the installed copy, preserving the caller's cwd.
+
+        On Windows the venv ``pythonw.exe`` is used directly: ``uv.exe`` and
+        ``python.exe`` are console applications, and a GUI harness that spawns
+        one without ``CREATE_NO_WINDOW`` gets a visible console window that
+        lives as long as the server. ``pythonw`` is windowless and still speaks
+        MCP over the inherited stdio pipes.
+        """
+        if self.platform == "win32":
+            pythonw = self.root / ".venv" / "Scripts" / "pythonw.exe"
+            return [str(pythonw), str(self.launcher)]
         return [
             self.uv,
             "run",

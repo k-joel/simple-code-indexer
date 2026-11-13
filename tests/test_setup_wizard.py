@@ -759,13 +759,14 @@ def test_global_config_write_creates_only_one_file(tmp_path: Path) -> None:
     project, home, repo = _workspace(tmp_path)
     wizard = Wizard(cwd=project, home=home, repo_root=repo)
 
-    paths = wizard._write_global_config(_embedding(), "faiss", None)
+    paths = wizard._write_global_config(_embedding(), "faiss", None, 0)
 
     assert paths == (home / ".simple-ci" / "config.yaml",)
     document = _yaml(paths[0])
     assert document["embedding"]["model"] == "embeddinggemma-2"
     assert document["setup"]["gpu"] == "cpu"
     assert document["vector_store"] == "faiss"
+    assert document["sweep_seconds"] == 0
     assert "qdrant" not in document
     assert not (project / ".simple-ci" / "config.yaml").exists()
 
@@ -775,13 +776,80 @@ def test_explicit_config_writes_one_combined_file(tmp_path: Path) -> None:
     target = tmp_path / "custom.yaml"
     wizard = Wizard(cwd=project, home=home, repo_root=repo, config_path=target)
 
-    paths = wizard._write_global_config(_embedding(), "faiss", None)
+    paths = wizard._write_global_config(_embedding(), "faiss", None, 90)
 
     assert paths == (target,)
     document = _yaml(target)
     assert document["embedding"]["model"] == "embeddinggemma-2"
     assert document["vector_store"] == "faiss"
+    assert document["sweep_seconds"] == 90
     assert not (home / ".simple-ci" / "config.yaml").exists()
+
+
+def test_sweep_is_off_by_default_and_can_be_enabled(tmp_path: Path) -> None:
+    project, home, repo = _workspace(tmp_path)
+
+    defaults = Wizard(
+        cwd=project, home=home, repo_root=repo, prompts=ScriptedPrompter()
+    )
+    assert defaults._step_sweep() == 0.0
+
+    enabled = Wizard(
+        cwd=project,
+        home=home,
+        repo_root=repo,
+        prompts=ScriptedPrompter(yes=[True]),
+    )
+    assert enabled._step_sweep() == 45.0
+
+    custom = Wizard(
+        cwd=project,
+        home=home,
+        repo_root=repo,
+        prompts=ScriptedPrompter(yes=[True], texts=["90"]),
+    )
+    assert custom._step_sweep() == 90.0
+
+
+def test_existing_sweep_interval_is_reused(tmp_path: Path) -> None:
+    project, home, repo = _workspace(tmp_path)
+    path = home / ".simple-ci" / "config.yaml"
+    configfile.write_config({"sweep_seconds": 30}, path)
+
+    wizard = Wizard(
+        cwd=project,
+        home=home,
+        repo_root=repo,
+        prompts=ScriptedPrompter(),
+        config_path=path,
+    )
+
+    assert wizard._step_sweep() == 30.0
+
+
+def test_sweep_seconds_option_reaches_the_config(tmp_path: Path) -> None:
+    wizard, _project, home = _wizard(
+        tmp_path,
+        prompts=ScriptedPrompter(),
+        runner=FakeRunner(),
+        embedding_url=EMBED_URL,
+        vector_store="faiss",
+        sweep_seconds=90,
+    )
+
+    assert wizard.run() == 0
+
+    assert _global(home)["sweep_seconds"] == 90
+
+
+def test_negative_sweep_seconds_flag_is_rejected(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        wizard_run(["--sweep-seconds", "-1"])
+
+    assert exc.value.code == 2
+    assert "--sweep-seconds" in capsys.readouterr().err
 
 
 def test_scope_flag_is_rejected(capsys: pytest.CaptureFixture[str]) -> None:
@@ -909,12 +977,7 @@ def test_install_copies_repo_and_points_entries_at_the_install(
     assert not (install_dir / "__pycache__").exists()
     assert result.root == install_dir
     assert result.server_command == [
-        "/usr/bin/uv",
-        "run",
-        "--project",
-        str(install_dir),
-        "--no-sync",
-        "python",
+        str(install_dir / ".venv" / "Scripts" / "pythonw.exe"),
         str(install_dir / "run_server.py"),
     ]
     assert synced == [install_dir]
@@ -992,6 +1055,198 @@ def test_install_only_rejects_setup_flags() -> None:
         wizard_run(["--install-only", "--uninstall"])
 
 
+def test_no_git_pull_writes_the_env_pin_into_every_entry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(harnesses_pkg, "_which", lambda _name: None)
+    project, home, repo = _workspace(tmp_path)
+    (home / ".cursor").mkdir()
+    specs = load_harnesses(user_dirs=[])
+    cursor_index = next(
+        index for index, spec in enumerate(specs) if spec.name == "cursor"
+    )
+    wizard = Wizard(
+        cwd=project,
+        home=home,
+        repo_root=repo,
+        prompts=ScriptedPrompter(multis=[[cursor_index]]),
+        runner=FakeRunner(),
+        no_install=True,
+        no_git_pull=True,
+    )
+    result = install_mod.InstallResult(
+        root=repo,
+        launcher=repo / "run_server.py",
+        uv="/usr/bin/uv",
+        platform="linux",
+    )
+
+    wizard._step_harnesses(result)
+
+    entry = json.loads((home / ".cursor" / "mcp.json").read_text(encoding="utf-8"))[
+        "mcpServers"
+    ]["simple-code-indexer"]
+    assert entry["env"] == {"SIMPLE_CI_GIT_PULL": "0"}
+
+
+def test_without_no_git_pull_the_entry_carries_no_env(tmp_path: Path) -> None:
+    project, home, repo = _workspace(tmp_path)
+    wizard = Wizard(
+        cwd=project,
+        home=home,
+        repo_root=repo,
+        prompts=ScriptedPrompter(),
+        runner=FakeRunner(),
+        no_install=True,
+        harnesses="cursor",
+    )
+    result = install_mod.InstallResult(
+        root=repo,
+        launcher=repo / "run_server.py",
+        uv="/usr/bin/uv",
+        platform="linux",
+    )
+
+    wizard._step_harnesses(result)
+
+    entry = json.loads((home / ".cursor" / "mcp.json").read_text(encoding="utf-8"))[
+        "mcpServers"
+    ]["simple-code-indexer"]
+    assert "env" not in entry
+
+
+def test_install_only_no_git_pull_refreshes_the_recorded_entries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _project, home, repo = _workspace(tmp_path)
+    target = tmp_path / "install"
+    target.mkdir()
+    (target / install_mod.LAUNCHER_FILENAME).write_text("# launcher\n", encoding="utf-8")
+    config = home / ".simple-ci" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    cursor_config = home / ".cursor" / "mcp.json"
+    cursor_config.parent.mkdir(parents=True)
+    cursor_config.write_text(
+        '{"mcpServers": {"other": {"command": "x"}}}', encoding="utf-8"
+    )
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "setup": {
+                    "install_root": str(target),
+                    "harnesses": [{"name": "cursor", "config": str(cursor_config)}],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(configfile, "global_config_path", lambda home=None: config)
+
+    code = wizard_run(
+        [
+            "--install-only",
+            "--no-git-pull",
+            "--repo-root",
+            str(repo),
+            "--install-dir",
+            str(target),
+        ]
+    )
+
+    assert code == 0
+    document = json.loads(cursor_config.read_text(encoding="utf-8"))
+    assert document["mcpServers"]["other"] == {"command": "x"}
+    entry = document["mcpServers"]["simple-code-indexer"]
+    assert entry["env"] == {"SIMPLE_CI_GIT_PULL": "0"}
+    assert str(target / install_mod.LAUNCHER_FILENAME) in entry["args"]
+
+
+def test_install_only_no_git_pull_is_idempotent(tmp_path: Path, monkeypatch) -> None:
+    _project, home, repo = _workspace(tmp_path)
+    target = tmp_path / "install"
+    target.mkdir()
+    (target / install_mod.LAUNCHER_FILENAME).write_text("# launcher\n", encoding="utf-8")
+    config = home / ".simple-ci" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    cursor_config = home / ".cursor" / "mcp.json"
+    cursor_config.parent.mkdir(parents=True)
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "setup": {
+                    "install_root": str(target),
+                    "harnesses": [{"name": "cursor", "config": str(cursor_config)}],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(configfile, "global_config_path", lambda home=None: config)
+    argv = [
+        "--install-only",
+        "--no-git-pull",
+        "--repo-root",
+        str(repo),
+        "--install-dir",
+        str(target),
+    ]
+
+    assert wizard_run(argv) == 0
+    first = cursor_config.read_text(encoding="utf-8")
+    assert not list(cursor_config.parent.glob("mcp.json.bak.*"))
+    assert wizard_run(argv) == 0
+    assert cursor_config.read_text(encoding="utf-8") == first
+
+
+def test_install_only_no_git_pull_reports_the_recorded_install(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _project, home, repo = _workspace(tmp_path)
+    recorded = tmp_path / "recorded"
+    target = tmp_path / "install"
+    target.mkdir()
+    (target / install_mod.LAUNCHER_FILENAME).write_text("# launcher\n", encoding="utf-8")
+    config = home / ".simple-ci" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    cursor_config = home / ".cursor" / "mcp.json"
+    cursor_config.parent.mkdir(parents=True)
+    cursor_config.write_text("{}", encoding="utf-8")
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "setup": {
+                    "install_root": str(recorded),
+                    "harnesses": [{"name": "cursor", "config": str(cursor_config)}],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(configfile, "global_config_path", lambda home=None: config)
+
+    assert (
+        wizard_run(
+            [
+                "--install-only",
+                "--no-git-pull",
+                "--repo-root",
+                str(repo),
+                "--install-dir",
+                str(target),
+            ]
+        )
+        == 0
+    )
+
+    entry = json.loads(cursor_config.read_text(encoding="utf-8"))["mcpServers"][
+        "simple-code-indexer"
+    ]
+    assert str(recorded / install_mod.LAUNCHER_FILENAME) in entry["args"]
+
+
 def test_harness_install_merges_and_backs_up(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(harnesses_pkg, "_which", lambda _name: None)
     project, home, repo = _workspace(tmp_path)
@@ -1017,6 +1272,7 @@ def test_harness_install_merges_and_backs_up(tmp_path: Path, monkeypatch) -> Non
         root=repo,
         launcher=repo / "run_server.py",
         uv="/usr/bin/uv",
+        platform="linux",
     )
 
     wizard._step_harnesses(result)
@@ -1239,6 +1495,7 @@ def test_a_recorded_harness_path_that_moved_is_cleaned_up(
         root=repo,
         launcher=repo / "run_server.py",
         uv="/usr/bin/uv",
+        platform="linux",
     )
 
     wizard._step_harnesses(result)
@@ -1323,15 +1580,21 @@ def test_no_install_entries_point_at_the_checkout(tmp_path: Path) -> None:
     target = home / ".cursor" / "mcp.json"
     document = json.loads(target.read_text(encoding="utf-8"))
     entry = document["mcpServers"]["simple-code-indexer"]
-    assert entry["command"] == "/usr/bin/uv"
-    assert entry["args"] == [
-        "run",
-        "--project",
-        str(wizard.repo_root),
-        "--no-sync",
-        "python",
-        str(wizard.repo_root / "run_server.py"),
-    ]
+    if sys.platform == "win32":
+        assert entry["command"] == str(
+            wizard.repo_root / ".venv" / "Scripts" / "pythonw.exe"
+        )
+        assert entry["args"] == [str(wizard.repo_root / "run_server.py")]
+    else:
+        assert entry["command"] == "/usr/bin/uv"
+        assert entry["args"] == [
+            "run",
+            "--project",
+            str(wizard.repo_root),
+            "--no-sync",
+            "python",
+            str(wizard.repo_root / "run_server.py"),
+        ]
 
 
 def test_legacy_models_directory_is_migrated(tmp_path: Path) -> None:

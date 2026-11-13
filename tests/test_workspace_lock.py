@@ -3,7 +3,27 @@ from pathlib import Path
 import pytest
 
 from simple_code_indexer import server
-from simple_code_indexer.workspace_lock import WorkspaceLock
+from simple_code_indexer.workspace_lock import FileLock, WorkspaceLock
+
+
+def test_file_lock_is_exclusive_until_released(tmp_path: Path) -> None:
+    first = FileLock(tmp_path / "custom.lock")
+    second = FileLock(tmp_path / "custom.lock")
+
+    assert first.acquire() is True
+    assert second.acquire() is False
+    first.release()
+    assert second.acquire() is True
+    second.release()
+
+
+def test_file_lock_acquire_is_idempotent_and_release_is_safe(tmp_path: Path) -> None:
+    lock = FileLock(tmp_path / "custom.lock")
+    lock.release()
+    assert lock.acquire() is True
+    assert lock.acquire() is True
+    lock.release()
+    lock.release()
 
 
 def test_lock_is_exclusive_until_released(tmp_path: Path) -> None:

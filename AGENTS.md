@@ -16,12 +16,15 @@ This project has four dedicated folders for non-production files. Pick the right
 ## Project Docs
 
 Read the relevant doc before planning or reporting work:
+- [docs/ARCH.md](docs/ARCH.md) — the live architecture overview (topology, data flow, domain/data model, component design, testing). **Important:** update it whenever the project's structure, runtime topology, interfaces, schema, or behaviour changes; when the document and the code disagree, the code wins.
+- [docs/GLOSSARY.md](docs/GLOSSARY.md) — canonical domain terms; use its vocabulary in code, docs, and summaries.
 - [docs/ISSUES.md](docs/ISSUES.md) — the ongoing issue tracker. **Add every issue, bug or defect flagged during an LLM session here — even if it is only mentioned in passing in the summary — and delete the entry once it is fixed.**
 - [docs/ARCH_ISSUES.md](docs/ARCH_ISSUES.md) — architectural debt and code smells. **Add every structural anti-pattern, code duplication, or AI-induced code smell spotted during a session here, and delete the entry once refactored.**
 - [docs/NOTES.md](docs/NOTES.md) — gotchas, watch-outs and oddities. **Add anything a future session needs to know that is not an open issue here.**
 - [docs/CHANGELOG.md](docs/CHANGELOG.md) — the user-facing, curated history of notable changes. **It must be updated after every agent session**; follow [ref-docs/changelog-best-practices.md](agent-docs/changelog-best-practices.md).
 - [docs/TOOLS.md](docs/TOOLS.md) — the inventory of development scripts in [tools/](tools/). **Check it before writing any new tool, and update it whenever a tool is created or modified.**
 - [docs/HANDOFF.md](docs/HANDOFF.md) — active session context and state. **Update with incomplete work, pending multi-step tasks, and exact next steps at the end of every session, and delete entries once the work is fully completed.**
+- [docs/DECISIONS.md](docs/DECISIONS.md) — architecture decision records (ADRs) in compressed form: the "why" behind structural, architectural, and dependency choices. **Read the relevant entry before changing behaviour that looks unusual, and add an entry for every new architectural decision; superseded entries are deleted, not kept.**
 
 ## Toolchain (verified)
 
@@ -75,7 +78,9 @@ pyproject.toml             # deps + ruff / pyright / pytest config
 
 ## Runtime / external services
 
-Host-spawned MCP process (no container in this repo — [ADR-0008](docs/adr/0008-host-spawned-cwd-per-repo-collections.md)):
+Host-spawned MCP **reader** processes + one detached per-workspace **sidecar writer**
+([ADR-014](docs/DECISIONS.md#adr-014-per-workspace-sidecar-writer--read-only-mcp-sessions); host process per
+[ADR-007](docs/DECISIONS.md#adr-007-host-spawned-mcp-process-workspace--cwd)):
 
 | Service | Endpoint / value |
 |---|---|
@@ -84,24 +89,34 @@ Host-spawned MCP process (no container in this repo — [ADR-0008](docs/adr/0008
 | Qdrant (opt-in) | `http://localhost:6333` (no auth) — one derived collection per workspace |
 | Workspace | the MCP process cwd (`WORKSPACE_ROOT` overrides); index at `$WORKSPACE_ROOT/.simple-ci/index.db` |
 | Config | `~/.simple-ci/config.yaml` only (global); project-local configs are migrated by the wizard and never read; env vars win (`SIMPLE_CI_CONFIG=none` disables discovery) |
-| Logs | `<workspace>/.simple-ci/log/sci.log` (DEBUG, rotated 5 MB × 3; `log.level` / `LOG_LEVEL` controls the file) plus the INFO summary on stderr; stdout stays pure MCP |
-| Lifecycle | the server exits with its stdio session and when a launch-chain ancestor dies (`parent_watch.py`, uv launcher and venv trampoline included; `SIMPLE_CI_PARENT_WATCH=0` disables). A harness service started outside the UI (detached) has no UI ancestor and is not visible; the desktop-UI-started OpenCode service is covered |
-| Install | `%APPDATA%\simple-code-indexer` (Windows), `~/Library/Application Support/...` (macOS), `$XDG_DATA_HOME/...` (Linux); harness entries run `uv run --project <install> --no-sync python run_server.py` |
+| Mode | `mode: sidecar` (default) or `embedded`; env `SIMPLE_CI_MODE`. Readers never take the writer lease; `embedded` is the all-in-one fallback |
+| Sidecar writer | one daemon per workspace owns the lease, watcher, writer thread, sweep timer, vector stores, and managed services; exits after the last registered session + `idle_grace_s` (60 s); respawned on demand |
+| Sidecar IPC | `<workspace>/.simple-ci/run/daemon.json` + `daemon.token` (0600); Windows named pipe / POSIX AF_UNIX; `multiprocessing.connection` authkey + JSON bodies; `daemon.spawn.lock` serializes first spawns |
+| Sidecar lifetime | live control connection is the primary lease; `heartbeat_s` (5 s) reaped after 3 intervals; `server_pid` liveness via `parent_watch.watch_process`; harness pid is metadata (the reader's own watchdog handles the harness) |
+| Sweep | off by default (`sweep_seconds: 0`, watcher only); opt-in periodic reconcile with idle backoff (cap `SWEEP_BACKOFF_MAX_S` = 10 min) and temporary sweeps while chunks are pending; `get_status.sweep_seconds` reports it |
+| Logs | sidecar writer: `writer.log`; readers: `reader.log`; embedded: `embed.log` (all under `<workspace>/.simple-ci/log/`, same `log.max_bytes`/`log.backups` rotation; `log.level` / `LOG_LEVEL` controls them). `reader.log` is shared by readers, so its rotation is best-effort. INFO stays on stderr; stdout stays pure MCP |
+| Lifecycle | a reader exits with its stdio session and when the harness process dies (`parent_watch.py` skips `uv`/`uvx` and the venv trampoline; `SIMPLE_CI_PARENT_WATCH=0` disables). A reused `opencode-cli serve --service` *is* the harness, so the reader lives as long as it does; stop it with `opencode service stop`. The daemon never watches the harness |
+| Install | `%APPDATA%\simple-code-indexer` (Windows), `~/Library/Application Support/...` (macOS), `$XDG_DATA_HOME/...` (Linux); harness entries run `uv run --project <install> --no-sync python run_server.py` on POSIX and the venv's windowless `<install>/.venv/Scripts/pythonw.exe run_server.py` on Windows (no console window) |
 | Install record | `setup.install_root` + `setup.harnesses` in `~/.simple-ci/config.yaml`; used by re-runs to remove deselected entries and by `--uninstall` |
 
 Config comes from the YAML file first, then env (e.g. `VECTOR_STORE`, `FAISS_PATH`,
-`QDRANT_URL`, `EMBED_BASE_URL`, `EMBED_API_KEY`) — never hardcode secrets or local URLs in
-committed code. A `service` block makes the server start that Docker container at boot
-(fail-soft); a `qdrant.service` is ignored on the FAISS backend.
+`QDRANT_URL`, `EMBED_BASE_URL`, `EMBED_API_KEY`, `SIMPLE_CI_MODE`, `IDLE_GRACE_S`,
+`HEARTBEAT_S`) — never hardcode secrets or local URLs in committed code. A `service` block
+makes the writer start that Docker container at boot (fail-soft); a `qdrant.service` is
+ignored on the FAISS backend.
 Probe the services with `uv run python tests/service_probe.py` before a live-model session.
 
 ## Conventions
 
 - Prefer stdlib where it matters: **SQLite + FTS5** for lexical index (stdlib `sqlite3`).
 - Semantic path: embed with the same endpoint used for queries; store through `vector_store.py` (FAISS by default, Qdrant opt-in) so call sites stay backend-agnostic.
-- File-watcher / MCP surface should stay small: `search_code`, `symbol_lookup`, `get_status` (optional `reindex`).
+- **Sidecar is the default** (`mode: sidecar`): `server._run` starts either `runtime.WriterRuntime` (embedded) or `sidecar.ReaderSession` (sidecar), never both. Readers must use `db.try_connect_readonly`, `faiss_store.search_readonly`, and `qdrant_store.search_readonly`; never call `ensure_schema`, `flush`, `reset`, `reconcile`, `upsert_chunks`, or a delete path from a reader.
+- **Writer lifecycle**: `runtime.WriterRuntime.start()` acquires `index.db.lock`; `stop()` stops the watcher + writer/sweep/heartbeat threads, flushes vectors and clears dirty flags **while the lease is held**, then releases it last. The daemon clears `.simple-ci/run/daemon.json`/`daemon.token` before releasing the lease so a new daemon cannot publish into a file the old one deletes.
+- **Daemon spawn**: `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` (plus `CREATE_BREAKAWAY_FROM_JOB` with fallback; POSIX `start_new_session=True`), stdio redirected, own `writer.log`, and no `ParentWatchdog` (it must outlive the spawner). Never use `DETACHED_PROCESS` here: the venv `python.exe` redirector spawns the real interpreter without creation flags, and that child then allocates a visible console window. The control channel is `multiprocessing.connection` with a token `authkey` and JSON string bodies, never pickle.
+- File-watcher / MCP surface should stay small: `search_code`, `symbol_lookup`, `get_status` (optional `reindex`). The watcher is the primary index path; the periodic reconciliation sweep is opt-in (`sweep_seconds: 0` = off) and must stay a backstop, with idle backoff.
 - MCP config for the harness lives in `.mimocode/mimocode.json` (gitignored); changes need a session restart to reload. It points at the installed `run_server.py`, which pulls the repo and runs the server in the harness cwd. `python setup.py` writes the same entry for other harnesses (global scope, no per-location prompt).
 - Harness support is a plugin folder (`src/simple_code_indexer/harnesses/`); bad plugins are skipped, never fatal, and user drop-ins override builtins by `NAME`.
-- Tests must set `SIMPLE_CI_CONFIG=none` (the autouse fixture in `tests/conftest.py` does this) so a developer's global config cannot change defaults.
-- The watchdog path finalizes by hand and calls `os._exit(0)`: `stdio_server`'s stdin reader blocks in a non-cancellable worker thread, so returning from the serve loop would hang on the open pipe. Keep the vector flush + lock release before the exit.
+- **Harness entries are global-only and workspace-free** ([ADR-015](docs/DECISIONS.md#adr-015-harness-entries-are-global-only-no-per-project-data)): never write a project path into an entry — no `WORKSPACE_ROOT`, no `cwd`, no `INDEX_DB`/`FAISS_PATH`. The workspace comes from the harness spawn cwd (ADR-007); `get_status.workspace` confirms it. Pin only while debugging, and remove the pin before finishing (re-running `python setup.py --harnesses <name>` rewrites a clean entry).
+- Tests must set `SIMPLE_CI_CONFIG=none` (the autouse fixture in `tests/conftest.py` does this) so a developer's global config cannot change defaults. The same fixture sets `SIMPLE_CI_MODE=embedded`; sidecar tests override it explicitly and must kill spawned daemons by the pid in `.simple-ci/run/daemon.json` in `finally`.
+- The watchdog watches **only the harness process** (`parent_watch.harness_process` skips `uv`/`uvx` and the venv trampoline) and finalizes by hand with `os._exit(0)`: `stdio_server`'s stdin reader blocks in a non-cancellable worker thread, so returning from the serve loop would hang on the open pipe. A reader unregisters its sidecar lease in the cleanup; a writer flushes and releases the lease. Keep the cleanup before the exit.
 - No migrations/codegen tool yet — note them here when added.

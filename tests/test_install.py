@@ -92,11 +92,26 @@ def test_sync_env_runs_uv_sync_for_the_target(tmp_path: Path) -> None:
     assert install.sync_env(runner, tmp_path, messages.append) is False
 
 
-def test_server_command_launches_through_uv() -> None:
+def test_server_command_uses_pythonw_on_windows() -> None:
     result = install.InstallResult(
         root=Path("C:/install"),
         launcher=Path("C:/install/run_server.py"),
         uv="/uv",
+        platform="win32",
+    )
+
+    assert result.server_command == [
+        str(Path("C:/install") / ".venv" / "Scripts" / "pythonw.exe"),
+        str(Path("C:/install/run_server.py")),
+    ]
+
+
+def test_server_command_launches_through_uv_on_posix() -> None:
+    result = install.InstallResult(
+        root=Path("C:/install"),
+        launcher=Path("C:/install/run_server.py"),
+        uv="/uv",
+        platform="linux",
     )
 
     assert result.server_command == [

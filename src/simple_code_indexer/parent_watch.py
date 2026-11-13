@@ -1,11 +1,17 @@
-"""Exit when the harness that launched this server is gone (ISS-3).
+"""Exit when the harness that owns this MCP session is gone (ISS-3, ISS-10).
 
 Some MCP clients keep the child's stdin open after their UI closes, so
 ``stdio_server`` never sees EOF and the server keeps sweeping forever. The
-watchdog snapshots the ancestor processes that launched this server — on
-Windows a uv venv ``python.exe`` is a trampoline between the harness and the
-interpreter, so the harness is the grandparent — and stops the serve loop as
-soon as one of them disappears.
+watchdog snapshots the harness process — the one that owns the stdio session —
+and stops the serve loop as soon as it disappears.
+
+Only the harness is watched. The launch plumbing between the harness and the
+interpreter (``uv``/``uvx`` and the venv ``python.exe`` trampoline they spawn)
+is skipped, and nothing above the harness is watched. That matters for OpenCode:
+the desktop UI starts ``opencode-cli serve --service`` once and later sessions
+*reuse* that service as a sibling, so the UI is not an ancestor of a reused
+service. Watching the harness keeps the server alive exactly as long as the
+service that owns it, which is the accepted trade-off (ISS-10).
 
 Processes that merely happened to start the harness (shells, terminal hosts,
 ``explorer.exe``) are deliberately not watched: closing a terminal must not
@@ -20,7 +26,7 @@ import logging
 import os
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -30,6 +36,11 @@ logger = logging.getLogger("simple_code_indexer")
 CHECK_INTERVAL_S = 2.0
 _MAX_DEPTH = 8
 _ENV_DISABLE = "SIMPLE_CI_PARENT_WATCH"
+
+# Our own launch plumbing. `uv run` puts uv.exe above a venv `python.exe`
+# trampoline, so the harness is normally two processes further up.
+_LAUNCHER_NAMES = frozenset({"uv", "uv.exe", "uvx", "uvx.exe", "uvw", "uvw.exe"})
+_PYTHON_NAMES = frozenset({"python", "python3", "pythonw", "py"})
 
 if sys.platform == "win32":
     _BOUNDARY_NAMES = frozenset(
@@ -172,6 +183,13 @@ if sys.platform == "win32":
     _KERNEL32.WaitForSingleObject.restype = wintypes.DWORD
     _KERNEL32.CloseHandle.argtypes = [wintypes.HANDLE]
     _KERNEL32.CloseHandle.restype = wintypes.BOOL
+    _KERNEL32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    _KERNEL32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 
     def _process_table() -> dict[int, tuple[int, str]]:
         """pid -> (parent pid, executable name) from one Toolhelp snapshot."""
@@ -207,6 +225,22 @@ if sys.platform == "win32":
 
     def _start_marker(pid: int) -> str | None:
         return None
+
+    def _image_path(pid: int) -> str | None:
+        """Full executable path, when the process is still queryable."""
+        handle = _KERNEL32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return None
+        try:
+            size = wintypes.DWORD(32768)
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if not _KERNEL32.QueryFullProcessImageNameW(
+                handle, 0, buffer, ctypes.byref(size)
+            ):
+                return None
+            return buffer.value
+        finally:
+            _KERNEL32.CloseHandle(handle)
 
     def _close_handle(handle: int) -> None:
         _KERNEL32.CloseHandle(handle)
@@ -247,6 +281,10 @@ else:
         fields = stat.rpartition(")")[2].split()
         return fields[19] if len(fields) > 19 else None
 
+    def _image_path(pid: int) -> str | None:
+        # uv typically execs the venv interpreter on POSIX: no trampoline.
+        return None
+
     def _open_handle(pid: int) -> None:
         return None
 
@@ -276,6 +314,24 @@ def _is_boundary(name: str) -> bool:
     return _basename(name) in _BOUNDARY_NAMES
 
 
+def _is_launcher(name: str) -> bool:
+    """`uv` and friends: our own launch plumbing, never the harness."""
+    return _basename(name) in _LAUNCHER_NAMES
+
+
+def _is_python(name: str) -> bool:
+    base = _basename(name).removesuffix(".exe")
+    return base in _PYTHON_NAMES or base.startswith("python3.")
+
+
+def _is_trampoline(pid: int) -> bool:
+    """True for a venv `python.exe` redirector (uv spawns one on Windows)."""
+    path = _image_path(pid)
+    if path is None:
+        return False
+    return "\\scripts\\python" in path.replace("/", "\\").lower()
+
+
 def watch_process(pid: int, name: str = "") -> WatchedProcess | None:
     """Snapshot one process for liveness polling; None when already gone."""
     process = WatchedProcess(
@@ -287,10 +343,9 @@ def watch_process(pid: int, name: str = "") -> WatchedProcess | None:
     return process if process.alive() else None
 
 
-def ancestors() -> list[WatchedProcess]:
-    """Live launch-chain processes, nearest first, up to a shell/system root."""
-    table = _process_table()
-    watched: list[WatchedProcess] = []
+def _launch_chain(table: dict[int, tuple[int, str]]) -> list[tuple[int, str]]:
+    """Live ancestors, nearest first, up to a shell/system root."""
+    chain: list[tuple[int, str]] = []
     pid = os.getpid()
     seen = {pid}
     for _ in range(_MAX_DEPTH):
@@ -306,12 +361,38 @@ def ancestors() -> list[WatchedProcess]:
         name = parent[1]
         if _is_boundary(name):
             break
-        process = watch_process(parent_pid, name)
-        if process is not None:
-            watched.append(process)
+        chain.append((parent_pid, name))
         seen.add(parent_pid)
         pid = parent_pid
-    return watched
+    return chain
+
+
+def harness_process(
+    table: dict[int, tuple[int, str]] | None = None,
+    watcher: Callable[[int, str], ProcessRef | None] = watch_process,
+    trampoline: Callable[[int], bool] = _is_trampoline,
+) -> ProcessRef | None:
+    """Snapshot the one process that owns this MCP session, or None.
+
+    Walks up past our own launch plumbing: `uv`/`uvx` and any venv `python.exe`
+    trampoline (recognized by image path on Windows, or by sitting directly
+    below a launcher). The first remaining ancestor is the harness; nothing
+    above it is watched (ISS-10).
+    """
+    table = _process_table() if table is None else table
+    chain = _launch_chain(table)
+    logger.debug(
+        "harness lookup: chain=%s",
+        ", ".join(f"{pid} ({name})" for pid, name in chain) or "none",
+    )
+    for index, (pid, name) in enumerate(chain):
+        if _is_launcher(name):
+            continue
+        parent_name = chain[index + 1][1] if index + 1 < len(chain) else ""
+        if _is_python(name) and (_is_launcher(parent_name) or trampoline(pid)):
+            continue  # venv trampoline, whichever process spawned it
+        return watcher(pid, name)
+    return None
 
 
 def enabled() -> bool:
@@ -322,7 +403,7 @@ def enabled() -> bool:
 
 
 class ParentWatchdog:
-    """Poll the launch chain; ``wait`` returns when an ancestor is gone."""
+    """Poll the harness process; ``wait`` returns when it is gone."""
 
     def __init__(
         self,
@@ -330,9 +411,11 @@ class ParentWatchdog:
         processes: Sequence[ProcessRef] | None = None,
     ) -> None:
         self._interval_s = interval_s
-        self._processes: list[ProcessRef] = (
-            list(processes) if processes is not None else list(ancestors())
-        )
+        if processes is None:
+            harness = harness_process()
+            self._processes: list[ProcessRef] = [harness] if harness is not None else []
+        else:
+            self._processes = list(processes)
 
     @property
     def processes(self) -> tuple[ProcessRef, ...]:

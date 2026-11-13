@@ -52,7 +52,7 @@ def _read(path: Path) -> str:
 
 def test_log_file_is_created_next_to_the_index(tmp_path: Path) -> None:
     path = logging_setup.configure_file(_settings(tmp_path))
-    assert path == tmp_path / ".simple-ci" / "log" / "sci.log"
+    assert path == tmp_path / ".simple-ci" / "log" / "embed.log"
     assert path is not None
     assert path.is_file()
     assert logging_setup.active_log_file() == path
@@ -123,11 +123,34 @@ def test_the_log_rotates(tmp_path: Path) -> None:
     for _ in range(20):
         log.info("x" * 100)
     assert path.is_file()
-    assert path.with_name("sci.log.1").is_file()
+    assert path.with_name(path.name + ".1").is_file()
 
 
-def test_rotation_parameters_and_encoding(tmp_path: Path) -> None:
-    path = logging_setup.configure_file(_settings(tmp_path))
+@pytest.mark.parametrize(
+    "filename",
+    [
+        logging_setup.EMBED_LOG_FILENAME,
+        logging_setup.WRITER_LOG_FILENAME,
+        logging_setup.READER_LOG_FILENAME,
+    ],
+)
+def test_each_role_has_its_own_file(tmp_path: Path, filename: str) -> None:
+    path = logging_setup.configure_file(_settings(tmp_path), filename=filename)
+    assert path == tmp_path / ".simple-ci" / "log" / filename
+    assert path is not None
+    assert path.is_file()
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        logging_setup.EMBED_LOG_FILENAME,
+        logging_setup.WRITER_LOG_FILENAME,
+        logging_setup.READER_LOG_FILENAME,
+    ],
+)
+def test_rotation_parameters_and_encoding(tmp_path: Path, filename: str) -> None:
+    path = logging_setup.configure_file(_settings(tmp_path), filename=filename)
     assert path is not None
     target = str(path.resolve())
     handler = next(

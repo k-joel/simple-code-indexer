@@ -270,3 +270,35 @@ def test_sweep_indexes_drift_and_removes_deleted(tmp_path: Path) -> None:
             h.path == "a.cpp" for h in db.fts_search(conn, "return", limit=10)
         )
         assert db.symbol_lookup(conn, "b") == []
+
+
+def test_next_sweep_delay_doubles_while_idle_and_caps() -> None:
+    assert indexer.next_sweep_delay(45.0, 45.0, idle=False) == 45.0
+    assert indexer.next_sweep_delay(45.0, 45.0, idle=True) == 90.0
+    assert indexer.next_sweep_delay(45.0, 360.0, idle=True) == 600.0
+    assert indexer.next_sweep_delay(45.0, 600.0, idle=True) == 600.0
+    # A base above the cap is never shortened.
+    assert indexer.next_sweep_delay(1200.0, 1200.0, idle=True) == 1200.0
+
+
+def test_pending_embedding_count_is_zero_without_an_index(tmp_path: Path) -> None:
+    assert indexer.pending_embedding_count(_settings(tmp_path)) == 0
+
+
+def test_pending_embedding_count_counts_unembedded_chunks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(qdrant_store, "upsert_chunks", _ids)
+    source = tmp_path / "a.cpp"
+    source.write_text("int a() { return 1; }", encoding="utf-8")
+    indexer.index_one_file(settings, source)
+
+    assert indexer.pending_embedding_count(settings) > 0
+
+
+def test_sweep_generation_advances(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    before = indexer.SWEEP_GENERATION
+    indexer.sweep(settings)
+    assert indexer.SWEEP_GENERATION == before + 1

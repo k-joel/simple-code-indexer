@@ -29,7 +29,9 @@ def entry(command: list[str], env: dict[str, str]) -> dict[str, Any]:
     value: dict[str, Any] = {
         "type": "local",
         "command": command,
+        # A three-tool server is clearer on the native tool list than in Code Mode.
+        "codemode": False,
     }
     if env:
-        value["environment"] = env
+        value["environment"] = dict(env)
     return value

@@ -113,7 +113,7 @@ def test_local_state_env_isolates_settings(tmp_path: Path, monkeypatch) -> None:
 
     assert isolated.index_db_path == local.resolve() / "index.db"
     assert faiss_index_path(isolated) == local.resolve() / "vectors.faiss"
-    assert logging_setup.log_path(isolated) == local.resolve() / "log" / "sci.log"
+    assert logging_setup.log_path(isolated) == local.resolve() / "log" / "embed.log"
 
 
 def test_env_overrides_still_win_when_no_local_path_is_passed(

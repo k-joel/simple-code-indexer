@@ -86,6 +86,15 @@ def search(settings: Settings, vector: list[float], limit: int) -> list[VectorHi
     return _faiss_store().search(settings, vector, limit)
 
 
+def search_readonly(
+    settings: Settings, vector: list[float], limit: int
+) -> list[VectorHit]:
+    """Query without creating or mutating store state (MCP reader role)."""
+    if backend(settings) == "qdrant":
+        return qdrant_store.search_readonly(settings, vector, limit)
+    return _faiss_store().search_readonly(settings, vector, limit)
+
+
 def reconcile(settings: Settings) -> int:
     if backend(settings) == "qdrant":
         return 0

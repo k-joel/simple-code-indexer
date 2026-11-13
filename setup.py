@@ -33,6 +33,7 @@ Usage: python setup.py [--dry-run] [--yes] [--model KEY] [--model-url URL]
                        [--gpu auto|nvidia|amd|intel|cpu]
 
        python setup.py --install-only [--install-dir PATH] [--dry-run]
+                        [--no-git-pull]
 
        python setup.py --uninstall [--keep-models] [--dry-run] [--yes]
                        [--install-dir PATH] [--config PATH]
@@ -52,6 +53,9 @@ Usage: python setup.py [--dry-run] [--yes] [--model KEY] [--model-url URL]
                    exit; no config, services, harness entries, or uv sync of
                    the copy
   --no-install     point harness entries at this checkout
+  --no-git-pull    debug: write SIMPLE_CI_GIT_PULL=0 into every installed
+                   harness entry so the launcher skips `git pull` (the
+                   installer copy still launches normally)
   --config         write one explicit config file (advanced/testing)
   --gpu            override GPU detection for the container image
 

@@ -8,8 +8,8 @@ Contract (same as `builtin/` language plugins — plain module globals):
     BINARIES        optional CLI names that also count as "installed"
     GLOBAL_CONFIGS  user-scope config files (``~``, ``%APPDATA%`` supported)
     LOCAL_CONFIGS   project-scope config files, relative to the workspace
-    FORMAT          "json" (default) or "toml"
-    ROOT_KEY        JSON root key ("mcpServers", "servers", "mcp", ...)
+    FORMAT          "json" (default), "toml" or "yaml"
+    ROOT_KEY        config root key ("mcpServers", "servers", "mcp", ...)
     entry(...)      optional: build the per-harness server entry
     render(...)     optional: full override for merging into existing text
     remove(...)     optional: strip the server entry (None = nothing to remove)
@@ -17,6 +17,12 @@ Contract (same as `builtin/` language plugins — plain module globals):
 Search order (later wins): builtin package → ``<repo>/harnesses`` →
 ``<workspace>/harnesses``. A user plugin overrides a builtin by NAME; bad
 plugins are logged and skipped.
+
+Entries are global-only (ADR-015): a plugin must never put per-project data in
+the entry it builds — no ``cwd`` derived from ``env``, no ``WORKSPACE_ROOT``,
+``INDEX_DB`` or ``FAISS_PATH``. The wizard passes an empty ``env`` unless
+``--no-git-pull`` (debug) adds ``SIMPLE_CI_GIT_PULL=0``, and the
+server infers the workspace from its process cwd at runtime (ADR-007).
 """
 
 from __future__ import annotations
@@ -33,7 +39,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, cast
 
-from simple_code_indexer.harnesses import _json, _toml
+from simple_code_indexer.harnesses import _json, _toml, _yaml
 
 logger = logging.getLogger(__name__)
 
@@ -202,8 +208,8 @@ def _spec_from_module(module: ModuleType, path: Path) -> HarnessSpec | None:
         logger.warning("harness plugin %s entry must be callable", path)
         return None
     fmt = getattr(module, "FORMAT", "json")
-    if fmt not in {"json", "toml"}:
-        logger.warning("harness plugin %s FORMAT must be json or toml", path)
+    if fmt not in {"json", "toml", "yaml"}:
+        logger.warning("harness plugin %s FORMAT must be json, toml or yaml", path)
         return None
     try:
         resolved_entry = cast(EntryFn, entry) if entry is not None else _default_entry
@@ -243,8 +249,9 @@ def _build_render(module: ModuleType, path: Path, fmt: str) -> RenderFn:
         )
     root_key = getattr(module, "ROOT_KEY", None)
     if not isinstance(root_key, str) or not root_key:
-        raise ValueError("ROOT_KEY is required for JSON harness plugins")
-    return lambda existing, *, name, command, env: _json.upsert(
+        raise ValueError("ROOT_KEY is required for JSON and YAML harness plugins")
+    merge = _yaml.upsert if fmt == "yaml" else _json.upsert
+    return lambda existing, *, name, command, env: merge(
         existing,
         root_key=root_key,
         name=name,
@@ -257,10 +264,9 @@ def _build_remove(module: ModuleType, path: Path, fmt: str) -> RemoveFn:
         return lambda existing, *, name: _toml.remove(existing, name=name)
     root_key = getattr(module, "ROOT_KEY", None)
     if not isinstance(root_key, str) or not root_key:
-        raise ValueError("ROOT_KEY is required for JSON harness plugins")
-    return lambda existing, *, name: _json.remove(
-        existing, root_key=root_key, name=name
-    )
+        raise ValueError("ROOT_KEY is required for JSON and YAML harness plugins")
+    remove = _yaml.remove if fmt == "yaml" else _json.remove
+    return lambda existing, *, name: remove(existing, root_key=root_key, name=name)
 
 
 def _default_entry(command: list[str], env: dict[str, str]) -> dict[str, Any]:

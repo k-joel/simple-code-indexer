@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # Outcome of the most recent embed attempt; read by get_status.
 LAST_OK: bool | None = None
 
-_ATTEMPTS = 3  # initial + 2 retries (TDD §7.5)
+_ATTEMPTS = 3  # initial + 2 retries
 # 512 tokens of Qwen tokenizer over dense code stays under ~1300 chars;
 # 1200 leaves margin. Pieces are mean-pooled back to one vector per text.
 _SAFE_CHARS = 1200

@@ -38,6 +38,9 @@ def test_defaults_come_from_the_process_cwd(monkeypatch) -> None:
         "LOG_LEVEL",
         "LOG_MAX_BYTES",
         "LOG_BACKUPS",
+        "SIMPLE_CI_MODE",
+        "IDLE_GRACE_S",
+        "HEARTBEAT_S",
     ):
         monkeypatch.delenv(name, raising=False)
     cwd = Path.cwd().resolve()
@@ -55,11 +58,15 @@ def test_defaults_come_from_the_process_cwd(monkeypatch) -> None:
     assert settings.embedding_service is None
     assert settings.qdrant_service is None
     assert settings.config_source is None
-    assert settings.sweep_seconds == 45.0
+    assert settings.sweep_seconds == 0.0
+    assert not settings.sweep_enabled
     assert settings.debounce_ms == 400
     assert settings.log_level == "debug"
     assert settings.log_max_bytes == 5_000_000
     assert settings.log_backups == 3
+    assert settings.mode == "sidecar"
+    assert settings.idle_grace_s == 60.0
+    assert settings.heartbeat_s == 5.0
     assert settings.qdrant_collection.startswith("code_index_")
     assert f"_{settings.embed_dim}_" in settings.qdrant_collection
     assert settings.qdrant_collection.endswith(settings.embed_fingerprint)
@@ -100,10 +107,22 @@ def test_env_overrides(monkeypatch) -> None:
     assert settings.workspace_root == Path("/data").resolve()
     assert settings.index_db_path == Path("/data").resolve() / ".simple-ci" / "index.db"
     assert settings.sweep_seconds == 10.0
+    assert settings.sweep_enabled
     # Collection follows the overridden workspace, not the process cwd.
     assert "_data_" in settings.qdrant_collection
     assert f"_{settings.embed_dim}_" in settings.qdrant_collection
     assert settings.qdrant_collection.endswith(settings.embed_fingerprint)
+
+
+def test_negative_sweep_seconds_are_rejected(tmp_path: Path, monkeypatch) -> None:
+    _config(tmp_path, monkeypatch, "sweep_seconds: -5\n")
+    with pytest.raises(ConfigError, match="sweep_seconds"):
+        load_settings()
+
+    _config(tmp_path, monkeypatch, "sweep_seconds: 0\n")
+    monkeypatch.setenv("SWEEP_SECONDS", "-1")
+    with pytest.raises(ConfigError, match="sweep_seconds"):
+        load_settings()
 
 
 def test_collection_env_override_wins(monkeypatch) -> None:
@@ -291,4 +310,41 @@ def test_invalid_log_levels_raise(tmp_path: Path, monkeypatch) -> None:
     _config(tmp_path, monkeypatch, "log:\n  level: debug\n")
     monkeypatch.setenv("LOG_LEVEL", "verbose")
     with pytest.raises(ConfigError, match="LOG_LEVEL"):
+        load_settings()
+
+
+def test_sidecar_settings_come_from_config_and_env(tmp_path: Path, monkeypatch) -> None:
+    for name in ("SIMPLE_CI_MODE", "IDLE_GRACE_S", "HEARTBEAT_S"):
+        monkeypatch.delenv(name, raising=False)
+    _config(
+        tmp_path,
+        monkeypatch,
+        "mode: embedded\nidle_grace_s: 12.5\nheartbeat_s: 1.5\n",
+    )
+    settings = load_settings()
+    assert settings.mode == "embedded"
+    assert settings.idle_grace_s == 12.5
+    assert settings.heartbeat_s == 1.5
+
+    monkeypatch.setenv("SIMPLE_CI_MODE", "SIDECAR")
+    monkeypatch.setenv("IDLE_GRACE_S", "0")
+    monkeypatch.setenv("HEARTBEAT_S", "2.5")
+    settings = load_settings()
+    assert settings.mode == "sidecar"
+    assert settings.idle_grace_s == 0.0
+    assert settings.heartbeat_s == 2.5
+
+
+def test_invalid_sidecar_settings_raise(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("SIMPLE_CI_MODE", raising=False)
+    _config(tmp_path, monkeypatch, "mode: daemon\n")
+    with pytest.raises(ConfigError, match="SIMPLE_CI_MODE|mode"):
+        load_settings()
+
+    _config(tmp_path, monkeypatch, "idle_grace_s: -1\n")
+    with pytest.raises(ConfigError, match="idle_grace_s"):
+        load_settings()
+
+    _config(tmp_path, monkeypatch, "heartbeat_s: 0\n")
+    with pytest.raises(ConfigError, match="heartbeat_s"):
         load_settings()

@@ -1,8 +1,13 @@
-"""Runtime logging: INFO on stderr, DEBUG detail in <workspace>/.simple-ci/log/sci.log.
+"""Runtime logging: INFO on stderr, DEBUG detail in `<workspace>/.simple-ci/log/`.
 
-The file lives inside the gitignored, index-ignored `.simple-ci/` directory, so
-writing it can never trigger the watcher or feed the index. Only the single
-workspace writer (ADR-0004) opens it, so rotation needs no cross-process lock.
+The files live inside the gitignored, index-ignored `.simple-ci/` directory, so
+writing them can never trigger the watcher or feed the index. Each role has its
+own file: `embed.log` for the all-in-one embedded server, `writer.log` for the
+sidecar daemon, and `reader.log` for sidecar MCP readers. All three use the same
+`log.max_bytes` / `log.backups` rotation settings.
+
+`reader.log` is shared by every reader in the workspace, so rotation is
+best-effort there; the writer-owned files always have exactly one process.
 
 stdout is the MCP JSON-RPC channel and must stay untouched.
 """
@@ -22,7 +27,10 @@ from types import TracebackType
 from simple_code_indexer.config import Settings
 
 LOG_DIRNAME = "log"
-LOG_FILENAME = "sci.log"
+EMBED_LOG_FILENAME = "embed.log"
+WRITER_LOG_FILENAME = "writer.log"
+READER_LOG_FILENAME = "reader.log"
+LOG_FILENAME = EMBED_LOG_FILENAME
 FORMAT = "%(asctime)s %(levelname)-8s [%(threadName)s] %(name)s: %(message)s"
 PACKAGE = "simple_code_indexer"
 
@@ -32,9 +40,9 @@ _ACTIVE: Path | None = None
 _HOOKS_INSTALLED = False
 
 
-def log_path(settings: Settings) -> Path:
-    """`<workspace>/.simple-ci/log/sci.log` (follows an INDEX_DB override)."""
-    return settings.index_db_path.parent / LOG_DIRNAME / LOG_FILENAME
+def log_path(settings: Settings, filename: str = LOG_FILENAME) -> Path:
+    """`<workspace>/.simple-ci/log/<filename>` (follows an INDEX_DB override)."""
+    return settings.index_db_path.parent / LOG_DIRNAME / filename
 
 
 def active_log_file() -> Path | None:
@@ -77,11 +85,11 @@ class _FileFilter(logging.Filter):
         return record.levelno >= logging.WARNING or record.name.startswith(PACKAGE)
 
 
-def configure_file(settings: Settings) -> Path | None:
+def configure_file(settings: Settings, *, filename: str = LOG_FILENAME) -> Path | None:
     """Attach the rotating file handler; fail soft so the server still serves."""
     global _FILE_HANDLER, _ACTIVE
 
-    path = log_path(settings)
+    path = log_path(settings, filename)
     if _FILE_HANDLER is not None and Path(_FILE_HANDLER.baseFilename) == Path(
         os.path.abspath(path)
     ):
@@ -169,7 +177,9 @@ def install_excepthooks() -> None:
     _HOOKS_INSTALLED = True
 
 
-def log_startup(settings: Settings, log_file: Path | None) -> None:
+def log_startup(
+    settings: Settings, log_file: Path | None, *, role: str = "writer"
+) -> None:
     """Banner with everything needed to interpret the rest of the session."""
     from simple_code_indexer import vector_store
 
@@ -180,6 +190,7 @@ def log_startup(settings: Settings, log_file: Path | None) -> None:
         os.getpid(),
         sys.version.split()[0],
     )
+    log.info("role=%s mode=%s", role, settings.mode)
     log.info(
         "workspace=%s index_db=%s vector_store=%s (%s)",
         settings.workspace_root,
@@ -195,9 +206,9 @@ def log_startup(settings: Settings, log_file: Path | None) -> None:
         settings.embed_fingerprint or "-",
     )
     log.info(
-        "config=%s sweep_seconds=%.0f debounce_ms=%d",
+        "config=%s sweep=%s debounce_ms=%d",
         [str(path) for path in settings.config_sources] or "defaults",
-        settings.sweep_seconds,
+        "off" if not settings.sweep_enabled else f"{settings.sweep_seconds:.0f}s",
         settings.debounce_ms,
     )
     log.info(

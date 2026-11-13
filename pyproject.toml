@@ -39,7 +39,7 @@ build-backend = "uv_build"
 line-length = 88
 target-version = "py312"
 src = ["src", "tests"]
-extend-exclude = ["*.md"]  # docs are the build contract; ruff must not rewrite them
+extend-exclude = ["*.md"]  # documentation code blocks are illustrative; ruff must not rewrite them
 
 [tool.ruff.lint]
 extend-select = [

@@ -37,6 +37,13 @@ _index_dim: int | None = None
 _dirty = False
 _reset_on_load = False
 
+# Reader-side cache: never written, reloaded when the writer replaces the file.
+_read_lock = threading.Lock()
+_read_index: Any | None = None
+_read_path: Path | None = None
+_read_dim: int | None = None
+_read_signature: tuple[int, int] | None = None
+
 
 def _faiss() -> Any:
     """Lazy import: the Qdrant backend must never pay for (or fail on) faiss."""
@@ -55,6 +62,15 @@ def _reset_state() -> None:
     _index_dim = None
     _dirty = False
     _reset_on_load = False
+
+
+def _reset_read_state() -> None:
+    """Drop the reader cache (tests, and a missing/replaced file)."""
+    global _read_index, _read_path, _read_dim, _read_signature
+    _read_index = None
+    _read_path = None
+    _read_dim = None
+    _read_signature = None
 
 
 def _write_locked(path: Path, index: Any) -> None:
@@ -248,57 +264,74 @@ def delete_by_path(settings: Settings, path: str) -> None:
     LAST_OK = True
 
 
-def search(settings: Settings, vector: list[float], limit: int) -> list[VectorHit]:
-    """Nearest chunks by cosine similarity; orphan ids are dropped."""
-    global LAST_OK
+def _hits_from_index(
+    settings: Settings, index: Any, query: Any, limit: int
+) -> tuple[list[VectorHit], int, int]:
+    """Search one loaded index and map labels through the read-only SQLite view."""
+    ntotal = int(index.ntotal)
+    k = 0
+    pairs: list[tuple[int, float]] = []
+    hits: list[VectorHit] = []
+    if ntotal:
+        k = max(1, min(int(limit), ntotal))
+        scores, labels = index.search(query, k)
+        pairs = [
+            (int(label), float(score))
+            for label, score in zip(labels[0], scores[0], strict=True)
+            if int(label) != -1
+        ]
+        if pairs:
+            with db.try_connect_readonly(settings.index_db_path) as conn:
+                mapping = (
+                    db.vector_paths_for_labels(conn, [label for label, _ in pairs])
+                    if conn is not None
+                    else {}
+                )
+            for label, score in pairs:
+                mapped = mapping.get(label)
+                if mapped is not None:
+                    hits.append(
+                        VectorHit(
+                            path=mapped[0],
+                            chunk_index=mapped[1],
+                            score=score,
+                        )
+                    )
+    return hits, ntotal, k
 
+
+def _query_vector(settings: Settings, vector: list[float]) -> Any:
     query = np.asarray([vector], dtype="float32")
     if query.ndim != 2 or query.shape[1] != settings.embed_dim:
-        LAST_OK = False
         width = query.shape[1] if query.ndim == 2 else "ragged"
         raise VectorStoreUnavailable(
             f"query width {width}, expected {settings.embed_dim}"
         )
-    query = query / np.maximum(np.linalg.norm(query, axis=1, keepdims=True), 1e-12)
+    return query / np.maximum(np.linalg.norm(query, axis=1, keepdims=True), 1e-12)
+
+
+def search(settings: Settings, vector: list[float], limit: int) -> list[VectorHit]:
+    """Nearest chunks by cosine similarity; orphan ids are dropped."""
+    global LAST_OK
+
+    try:
+        query = _query_vector(settings, vector)
+    except VectorStoreUnavailable:
+        LAST_OK = False
+        raise
 
     with _lock:
         _ensure_locked(settings)
         try:
             assert _index is not None
             started = time.perf_counter()
-            ntotal = int(_index.ntotal)
-            k = 0
-            pairs: list[tuple[int, float]] = []
-            hits: list[VectorHit] = []
-            if ntotal:
-                k = max(1, min(int(limit), ntotal))
-                scores, labels = _index.search(query, k)
-                pairs = [
-                    (int(label), float(score))
-                    for label, score in zip(labels[0], scores[0], strict=True)
-                    if int(label) != -1
-                ]
-                if pairs:
-                    with db.connect(settings.index_db_path, readonly=True) as conn:
-                        mapping = db.vector_paths_for_labels(
-                            conn, [label for label, _ in pairs]
-                        )
-                    for label, score in pairs:
-                        mapped = mapping.get(label)
-                        if mapped is not None:
-                            hits.append(
-                                VectorHit(
-                                    path=mapped[0],
-                                    chunk_index=mapped[1],
-                                    score=score,
-                                )
-                            )
+            hits, ntotal, k = _hits_from_index(settings, _index, query, limit)
             logger.debug(
                 "faiss search: ntotal=%d k=%d hits=%d dropped=%d in %d ms",
                 ntotal,
                 k,
                 len(hits),
-                len(pairs) - len(hits),
+                int(k) - len(hits),
                 int((time.perf_counter() - started) * 1000),
             )
         except VectorStoreUnavailable:
@@ -309,6 +342,103 @@ def search(settings: Settings, vector: list[float], limit: int) -> list[VectorHi
             raise VectorStoreUnavailable(f"search failed: {exc}") from exc
     LAST_OK = True
     return hits
+
+
+def _ensure_read_locked(settings: Settings) -> Any:
+    """Load the published file without ever creating or mutating it."""
+    global _read_index, _read_path, _read_dim, _read_signature
+
+    path = faiss_index_path(settings)
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        _reset_read_state()
+        raise VectorStoreUnavailable(
+            f"semantic index is not ready: {path} is missing"
+        ) from exc
+    signature = (stat.st_mtime_ns, stat.st_size)
+    if (
+        _read_index is not None
+        and _read_path == path
+        and _read_dim == settings.embed_dim
+        and _read_signature == signature
+    ):
+        return _read_index
+    faiss = _faiss()
+    try:
+        loaded = faiss.read_index(str(path))
+    except (OSError, RuntimeError, ValueError) as exc:
+        _reset_read_state()
+        raise VectorStoreUnavailable(
+            f"cannot read the semantic index {path}: {exc}"
+        ) from exc
+    if not isinstance(loaded, faiss.IndexIDMap2):
+        _reset_read_state()
+        raise VectorStoreUnavailable(f"{path} is not a FAISS IndexIDMap2")
+    if int(loaded.d) != settings.embed_dim:
+        _reset_read_state()
+        raise VectorStoreUnavailable(
+            f"{path} has dimension {loaded.d}, expected {settings.embed_dim}"
+        )
+    _read_index = loaded
+    _read_path = path
+    _read_dim = settings.embed_dim
+    _read_signature = signature
+    logger.info(
+        "loaded FAISS index for reading %s: %d vector(s), dim %d",
+        path,
+        int(loaded.ntotal),
+        settings.embed_dim,
+    )
+    return loaded
+
+
+def search_readonly(
+    settings: Settings, vector: list[float], limit: int
+) -> list[VectorHit]:
+    """Query the published FAISS file; reload it when the writer replaced it.
+
+    This path is for reader processes: it never calls `_write_locked`, `flush`,
+    `reset`, `reconcile`, `upsert_chunks`, or `delete_by_path`.
+    """
+    global LAST_OK
+
+    try:
+        query = _query_vector(settings, vector)
+    except VectorStoreUnavailable:
+        LAST_OK = False
+        raise
+
+    with _read_lock:
+        try:
+            index = _ensure_read_locked(settings)
+            started = time.perf_counter()
+            hits, ntotal, k = _hits_from_index(settings, index, query, limit)
+            logger.debug(
+                "faiss read-only search: ntotal=%d k=%d hits=%d dropped=%d in %d ms",
+                ntotal,
+                k,
+                len(hits),
+                int(k) - len(hits),
+                int((time.perf_counter() - started) * 1000),
+            )
+        except VectorStoreUnavailable:
+            LAST_OK = False
+            raise
+        except Exception as exc:
+            LAST_OK = False
+            raise VectorStoreUnavailable(f"read-only search failed: {exc}") from exc
+    LAST_OK = True
+    return hits
+
+
+def vector_index_age_s(settings: Settings) -> float | None:
+    """Seconds since the FAISS file was last written, or None when absent."""
+    try:
+        stat = faiss_index_path(settings).stat()
+    except OSError:
+        return None
+    return max(0.0, time.time() - stat.st_mtime)
 
 
 def reconcile(settings: Settings) -> int:

@@ -17,9 +17,11 @@ PATH = "src/a.cpp"
 @pytest.fixture(autouse=True)
 def _fresh_store():
     faiss_store._reset_state()
+    faiss_store._reset_read_state()
     faiss_store.LAST_OK = None
     yield
     faiss_store._reset_state()
+    faiss_store._reset_read_state()
     faiss_store.LAST_OK = None
 
 
@@ -252,6 +254,52 @@ def test_search_drops_orphan_labels(tmp_path: Path) -> None:
         db.delete_vector_labels(conn, PATH, [0])
 
     assert faiss_store.search(settings, _unit(0), 5) == []
+
+
+def test_readonly_search_requires_a_published_file(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    with pytest.raises(VectorStoreUnavailable, match="not ready"):
+        faiss_store.search_readonly(settings, _unit(0), 5)
+    assert not faiss_index_path(settings).exists()
+
+
+def test_readonly_search_reloads_after_the_writer_flushes(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    faiss_store.upsert_chunks(settings, PATH, [(_chunk(0), _unit(0))])
+    faiss_store.flush(settings)
+
+    first = faiss_store.search_readonly(settings, _unit(0), 5)
+    assert [hit.path for hit in first] == [PATH]
+
+    other = "src/b.cpp"
+    faiss_store.upsert_chunks(settings, other, [(_chunk(0), _unit(1))])
+    faiss_store.flush(settings)
+
+    hits = faiss_store.search_readonly(settings, _unit(1), 1)
+    assert [hit.path for hit in hits] == [other]
+
+
+def test_readonly_search_never_writes_the_file(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    faiss_store.upsert_chunks(settings, PATH, [(_chunk(0), _unit(0))])
+    faiss_store.flush(settings)
+    path = faiss_index_path(settings)
+    before = path.stat()
+
+    faiss_store.search_readonly(settings, _unit(0), 5)
+
+    after = path.stat()
+    assert (after.st_mtime_ns, after.st_size) == (before.st_mtime_ns, before.st_size)
+
+
+def test_readonly_search_drops_orphan_labels(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    faiss_store.upsert_chunks(settings, PATH, [(_chunk(0), _unit(0))])
+    faiss_store.flush(settings)
+    with db.connect(settings.index_db_path) as conn, conn:
+        db.delete_vector_labels(conn, PATH, [0])
+
+    assert faiss_store.search_readonly(settings, _unit(0), 5) == []
 
 
 def test_concurrent_search_and_upsert_do_not_corrupt_the_index(

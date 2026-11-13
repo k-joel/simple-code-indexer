@@ -1,4 +1,4 @@
-"""Small exception hierarchy (TDD §10) — catch at process boundaries only."""
+"""Small exception hierarchy — catch at process boundaries only."""
 
 
 class IndexerError(Exception):
@@ -23,3 +23,7 @@ class QdrantUnavailable(VectorStoreUnavailable):
 
 class ConfigError(IndexerError):
     """A config file or config-derived value is invalid."""
+
+
+class WorkspaceBusy(IndexerError):
+    """Another live process already owns the workspace writer lease."""

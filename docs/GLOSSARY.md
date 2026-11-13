@@ -49,15 +49,17 @@ _Avoid_: database, catalog, store
 
 **Index directory**:
 The gitignored `.simple-ci/` directory in a workspace. Holds `index.db` (plus WAL and lock
-files), `vectors.faiss` for the FAISS backend, and, when the project uses a local config,
-`config.yaml`.
+files), `vectors.faiss` for the FAISS backend, `run/` for sidecar discovery, and `log/` for
+role-specific logs. Configuration lives globally, not here.
 _Avoid_: data directory, cache folder, `.index` (the retired name)
 
 **Config file**:
-Optional `config.yaml` read at server startup: `<workspace>/.simple-ci/config.yaml` first,
-then `~/.simple-ci/config.yaml`. Environment variables override both. Records the vector
-store backend, the embedding endpoint/model/dimension, either the FAISS path or the Qdrant
-URL, and any Docker services the server should start.
+The single global `~/.simple-ci/config.yaml` read at server startup (or the explicit
+`SIMPLE_CI_CONFIG` file; `none` disables discovery). Project-local
+`<workspace>/.simple-ci/config.yaml` files are legacy, migrated by the setup wizard and never
+read. Environment variables override individual file values. Records the vector-store
+backend, the embedding endpoint/model/dimension, either the FAISS path or the Qdrant URL, the
+runtime mode, and any Docker services the server should start.
 _Avoid_: settings, preferences, env file
 
 **Managed service**:
@@ -74,8 +76,9 @@ _Avoid_: installer, bootstrap, setup script (as a noun for the logic)
 
 **Collection name**:
 The Qdrant collection holding one workspace's vectors (Qdrant backend only):
-`code_index_{folder_slug}_{sha256(path)[:8]}_{embed_dim}`, derived from the workspace so
-projects never share vectors. Overridable with `QDRANT_COLLECTION`.
+`code_index_{folder_slug}_{sha256(path)[:8]}_{embed_dim}`, with `_{embedding_fingerprint}`
+appended when the fingerprint is non-empty. Derived from the workspace so projects never share
+vectors. Overridable with `QDRANT_COLLECTION`.
 _Avoid_: namespace, index name, vector store name
 
 **Index on save**:
@@ -127,8 +130,16 @@ _Avoid_: vector hit, embedding match
 ## Process
 
 **Index writer**:
-The single process (or thread) allowed to write the SQLite index and the vector store.
+The one process per workspace allowed to write the SQLite index and the vector store: the embedded server or the sidecar daemon.
 _Avoid_: indexer process, writer, mutator
+
+**Reader**:
+An MCP server in sidecar mode. It queries SQLite/FAISS/Qdrant read-only and registers with the workspace daemon for lifetime and status.
+_Avoid_: query process, read-only server, slave
+
+**Session lease**:
+One reader's registration with the daemon, keyed by session id. The live control connection is the primary signal; heartbeats and the server pid are backstops.
+_Avoid_: client record, registration, heartbeat
 
 **MCP server**:
 The stdio process implementing initialize / tools/list / tools/call for the harness.
@@ -143,9 +154,9 @@ Short delay (300–500 ms) that collapses editor temp+rename bursts into one ind
 _Avoid_: throttle, delay, cooldown
 
 **All-in-one topology**:
-One host process per harness session hosts both the MCP stdio server and the watcher/writer. Shipped default.
+One host process per harness session hosts both the MCP stdio server and the watcher/writer. Selected with `mode: embedded`.
 _Avoid_: embedded mode, combined mode
 
 **Sidecar topology**:
-Always-on watcher/indexer service with a separate read-only MCP query process. Post-MVP option.
+One detached writer daemon per workspace plus read-only MCP query processes. The default; the daemon exits after the last session plus `idle_grace_s`.
 _Avoid_: daemon mode, split mode, background mode

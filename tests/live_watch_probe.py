@@ -1,4 +1,4 @@
-"""Index-on-save probe (TDD Phase 3): create a file, find it via MCP in <5 s.
+"""Index-on-save probe: create a file, find it via MCP in <5 s.
 
 Runs on the host: spawns the MCP server as a subprocess, creates a temp .cpp in
 the workspace (the process cwd, or `WORKSPACE_ROOT`), polls symbol_lookup until

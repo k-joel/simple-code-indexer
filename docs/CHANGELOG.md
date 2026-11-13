@@ -13,6 +13,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-workspace sidecar writer daemon (ADR-014). Every harness still spawns its own
+  stdio MCP server, but those servers are now **readers**: one detached daemon owns
+  `index.db`, `vectors.faiss`, the Qdrant collection, the watcher, the writer thread,
+  the sweep timer, and the managed Docker services. Multiple harnesses in one workspace
+  all get working tools. The daemon exits after the last registered session plus
+  `idle_grace_s` (default 60 s) and is respawned by the next session.
+- `mode` (`sidecar` by default, or `embedded`), `idle_grace_s`, and `heartbeat_s` in
+  `config.yaml`; `SIMPLE_CI_MODE`, `IDLE_GRACE_S`, and `HEARTBEAT_S` override them.
+  `mode: embedded` restores the old single-process writer.
+- `get_status` now reports `role` (`reader`/`writer`), `index_ready`, `writer_pid`,
+  `writer_ok`, `writer_heartbeat_age_s`, `writer_log_file`, `daemon_endpoint`,
+  `sessions`, `harnesses`, and `vector_index_age_s`.
+- The sidecar daemon logs to `<workspace>/.simple-ci/log/writer.log` and reader sessions
+  to `reader.log`; `mode: embedded` uses `embed.log`. All three use the same
+  `log.max_bytes` / `log.backups` rotation. `reader.log` is shared by readers, so its
+  rotation is best-effort.
+- Harness plugins for **Goose** and **Pi**. Goose is written to its YAML
+  `%APPDATA%\Block\goose\config\config.yaml` (or `~/.config/goose/config.yaml`) under
+  `extensions.<name>` with `type: stdio`, `cmd`, `args`, `envs`; Pi is written to
+  `~/.pi/agent/mcp.json` (or `.pi/mcp.json`) under `mcpServers` with `exposure: direct` so the
+  three tools are declared to the model. Harness plugins can now use `FORMAT = "yaml"` in
+  addition to JSON and TOML.
+- OpenCode entries now set `codemode: false`, so the three tools are exposed directly instead
+  of through Code Mode.
+- Sidecar lifecycle logging: the daemon logs each client hello (`sidecar client connected`), each
+  `REGISTER`/disconnect with the live session and harness list, the configured idle grace and
+  heartbeat, and `sidecar stopped`; readers log their session id, workspace, harness process,
+  registration, unregistration, and close. `reader.log` remains shared by every reader in the
+  workspace.
+- `setup.py` asks whether to run a periodic reconciliation sweep (default: no) and accepts
+  `--sweep-seconds N` for non-interactive runs. `get_status` reports the configured interval as
+  `sweep_seconds` (0 = sweeps off).
+- `setup.py --no-git-pull` (debug): write `SIMPLE_CI_GIT_PULL=0` into the harness
+  entries so the installed launcher skips its `git pull`, for testing the installed
+  snapshot. With `--install-only` it also rewrites the entries already recorded in
+  `setup.harnesses`.
 - `setup.py --install-only`: copy this checkout to the per-user install directory and exit,
   without prompts, config, services, harness entries, or an environment sync of the copy.
   `--install-dir` and `--dry-run` are honored.
@@ -32,6 +68,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Documentation: `docs/ARCH.md` is now the live architecture overview — topology, data flow,
+  domain/data model, component design, and testing — replacing the retired technical-design
+  document.
+  Individual decisions stay in `docs/DECISIONS.md` and structural debt in
+  `docs/ARCH_ISSUES.md`. The domain glossary moved to `docs/GLOSSARY.md`, and all references
+  were updated.
+- Architecture decision records are consolidated into a single
+  [docs/DECISIONS.md](DECISIONS.md), compressed to Context / Decision / Consequences. The
+  `docs/adr/` folder is gone; the superseded all-in-one-process entry was folded into the
+  sidecar decision and the rest renumbered 001–014.
+- Runtime logs are split by role: `embed.log` (`mode: embedded`), `writer.log` (sidecar
+  daemon), and `reader.log` (sidecar MCP readers), all with the same rotation settings.
+  The old `sci.log*` files are no longer written or rotated; delete them by hand.
+- The default runtime is now the sidecar topology: the MCP server is a read-only query
+  process, and one daemon per workspace performs all indexing. Closing one harness no
+  longer affects another, and the index stays fresh while any session is attached.
+  Set `SIMPLE_CI_MODE=embedded` (or `mode: embedded`) to keep the old all-in-one process.
+- Readers reload the published FAISS file when its mtime/size changes and validate (but
+  never create) the Qdrant collection. A reader that starts before the index exists
+  returns empty results with `ready: false` instead of crashing.
+- The periodic reconciliation sweep is now opt-in and **off by default** (`sweep_seconds: 0`).
+  The file watcher is the primary index path; the startup reconcile still runs once at server
+  start. When enabled, the interval doubles while the workspace is idle — no watcher events or
+  an empty sweep — up to 10 minutes, and resets on activity. With sweeps off, a dormant timer
+  temporarily runs them only while chunks are waiting for embeddings, stopping again once none
+  are pending, so a transient embedding outage still heals without a full walk every minute.
 - Chunks are now 30-line windows with 15-line overlap instead of 80-line blocks. The
   embedding model mean-pools each input, so focused windows retrieve markedly better:
   on the 42-query benchmark R@1 rose 0.667 → 0.786, R@5 0.952 → 1.000, R@10 0.976 → 1.000,
@@ -47,11 +109,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Harness entries no longer contain per-project paths. The OpenCode, Goose, and Pi plugins used to
+  turn a `WORKSPACE_ROOT` value into an entry `cwd`, and debugging sessions hand-pinned
+  `WORKSPACE_ROOT` into global entries — so one project's absolute path became the workspace for
+  every project opened afterwards. Entries are now install-scoped only ([ADR-015](DECISIONS.md#adr-015-harness-entries-are-global-only-no-per-project-data));
+  the workspace comes from the harness spawn cwd as before.
+- Windows no longer opens stray console windows when a harness starts the MCP server. Recent
+  harness entries launched `uv.exe`, and the sidecar daemon was spawned with `DETACHED_PROCESS`;
+  both left console-subsystem children to allocate a visible window that stayed for the life of
+  the process. On Windows the entry now runs the venv's windowless `pythonw.exe` directly, the
+  daemon uses `CREATE_NO_WINDOW`, and `run_server.py`/Docker child processes are spawned with the
+  same flag. A reader also waits for the daemon it just started instead of spawning duplicates
+  during a slow startup, which was the source of the extra windows that flashed and closed.
+- **ISS-11:** a second harness in the same workspace no longer exits with
+  `another simple-code-indexer already owns …`. Its MCP server runs as a reader, attaches
+  to the workspace daemon (or spawns it), and keeps all tools available when another
+  harness closes.
+- Shutdown now flushes the vector store while the workspace writer lease is still held, and
+  finalization is idempotent. A server starting immediately after another exits can no longer
+  race the old process's FAISS write and dirty-flag clear, which could silently drop vectors.
+  A failure during startup after the lease is acquired also releases the lease.
+- The lifecycle watchdog now watches only the harness process that owns the stdio session,
+  skipping the `uv` launcher and venv `python.exe` trampoline. A reused
+  `opencode-cli serve --service` — started by an earlier UI and shared by the next one — *is*
+  the harness, so the server no longer depends on a UI ancestor that may be missing: it exits
+  with the service instead of outliving it. `SIMPLE_CI_PARENT_WATCH=0` still disables the
+  watchdog.
 - `symbol_lookup` with an empty or whitespace-only `symbol` returns no matches instead of
   treating it as a wildcard and returning every indexed symbol.
 - The watcher no longer logs events from ignored directories or its own log file, so an idle
-  server no longer grows `sci.log` in a self-triggering loop. Ignored paths (including the
-  active log file) are dropped before any event logging.
+  server no longer grows the active log file in a self-triggering loop. Ignored paths (including
+  the active log file) are dropped before any event logging.
 - The watcher and `index_one_file` now honor ignored **directories** for nested paths: every
   ancestor directory is checked before the path itself, so a deeper `.gitignore` negation
   (`!keep.py`) cannot re-include a file under a root-ignored tree such as `artifacts/`.

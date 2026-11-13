@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -11,6 +12,7 @@ from simple_code_indexer.config import IGNORE_DIRS, Settings
 from simple_code_indexer.errors import EmbedError
 from simple_code_indexer.models import Chunk, FileRecord, VectorHit
 from simple_code_indexer.registry import get_registry
+from simple_code_indexer.sidecar import ReaderSession
 
 
 def _settings(workspace: Path) -> Settings:
@@ -85,6 +87,7 @@ def test_status_payload_reports_embedding_progress(tmp_path: Path) -> None:
 
     assert payload["vectors_indexed"] == 1
     assert payload["pending_embeddings"] == 1
+    assert payload["sweep_seconds"] == 45.0
 
 
 def test_semantic_search_collapses_overlapping_chunks(
@@ -189,3 +192,99 @@ def test_semantic_search_reports_unavailable_without_raising(
     assert payload["ready"] is False
     assert payload["pending_embeddings"] == 0
     assert payload["message"].startswith("semantic search unavailable:")
+
+
+class _FakeSession:
+    def __init__(self, status: dict[str, Any] | None) -> None:
+        self._status = status
+
+    def status(self, timeout: float = 3.0) -> dict[str, Any] | None:
+        return self._status
+
+
+def test_status_payload_merges_the_daemon_status_in_reader_mode(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    _seed(settings, ["ok"])
+    status = {
+        "type": "status",
+        "writer_pid": 999,
+        "writer_ok": True,
+        "writer_heartbeat_age_s": 0.5,
+        "writer_log_file": "writer.log",
+        "endpoint": "pipe",
+        "sessions": 2,
+        "harnesses": [{"pid": 1, "name": "opencode-cli.exe"}],
+        "watcher_alive": True,
+        "last_sweep": "2026-01-01T00:00:00+00:00",
+        "ignored_dirs": 3,
+        "ignored_files": 4,
+        "vector_store_ok": True,
+        "services": {"embedding": "running"},
+        "vector_index_age_s": 5.0,
+    }
+    session = cast(ReaderSession, _FakeSession(status))
+
+    payload = server._status_payload(settings, role="reader", session=session)
+
+    assert payload["role"] == "reader"
+    assert payload["index_ready"] is True
+    assert payload["writer_pid"] == 999
+    assert payload["writer_ok"] is True
+    assert payload["writer_heartbeat_age_s"] == 0.5
+    assert payload["writer_log_file"] == "writer.log"
+    assert payload["daemon_endpoint"] == "pipe"
+    assert payload["sessions"] == 2
+    assert payload["harnesses"] == [{"pid": 1, "name": "opencode-cli.exe"}]
+    assert payload["watcher_alive"] is True
+    assert payload["last_sweep"] == "2026-01-01T00:00:00+00:00"
+    assert payload["ignored_dirs"] == 3
+    assert payload["ignored_files"] == 4
+    assert payload["vector_index_age_s"] == 5.0
+    assert payload["vectors_indexed"] == 1
+
+
+def test_status_payload_reports_a_missing_index(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+
+    payload = server._status_payload(settings)
+
+    assert payload["role"] == "writer"
+    assert payload["index_ready"] is False
+    assert payload["files_indexed"] == 0
+    assert payload["symbols_indexed"] == 0
+    assert payload["chunks_indexed"] == 0
+    assert payload["writer_ok"] is True
+
+
+def test_status_payload_reader_without_a_daemon_falls_back_to_meta(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    session = cast(ReaderSession, _FakeSession(None))
+
+    payload = server._status_payload(settings, role="reader", session=session)
+
+    assert payload["role"] == "reader"
+    assert payload["index_ready"] is False
+    assert payload["writer_pid"] is None
+    assert payload["writer_ok"] is False
+    assert payload["sessions"] == 0
+    assert payload["watcher_alive"] is False
+    assert payload["writer_log_file"].endswith("writer.log")
+
+
+def test_search_and_symbol_lookup_are_soft_when_the_index_is_missing(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+
+    lexical = server._search_code(settings, {"query": "anything"})
+    symbols = server._symbol_lookup(settings, {"symbol": "anything"})
+
+    assert lexical["hits"] == []
+    assert lexical["ready"] is False
+    assert symbols["found"] is False
+    assert symbols["ready"] is False
+    assert not settings.index_db_path.exists()

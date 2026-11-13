@@ -37,6 +37,8 @@ DEFAULT_EMBED_URL = "http://localhost:8080"
 DEFAULT_EMBED_MODEL = "Qwen3-Embedding-4B-Q6_K"
 DEFAULT_EMBED_DIM = 2560
 DEFAULT_STARTUP_TIMEOUT_S = 120.0
+DEFAULT_SWEEP_SECONDS = 45.0
+GIT_PULL_ENV = "SIMPLE_CI_GIT_PULL"
 
 
 class SetupAborted(Exception):
@@ -93,6 +95,8 @@ class Wizard:
         harnesses: str | None = None,
         install_dir: Path | None = None,
         no_install: bool = False,
+        no_git_pull: bool = False,
+        sweep_seconds: float | None = None,
     ) -> None:
         self.cwd = (cwd or Path.cwd()).resolve()
         self.home = (home or Path.home()).resolve()
@@ -115,6 +119,9 @@ class Wizard:
         self.harnesses = harnesses
         self.install_dir = install_dir
         self.no_install = no_install
+        self.no_git_pull = no_git_pull
+        self.harness_env = {GIT_PULL_ENV: "0"} if no_git_pull else {}
+        self.sweep_seconds = sweep_seconds
         self._docker_checked: bool | None = None
         self._written_harnesses: list[tuple[HarnessSpec, Path]] = []
         self._record_install_root: Path | None = None
@@ -138,8 +145,18 @@ class Wizard:
                 qdrant = reused.qdrant
             install_result = self._step_install()
             self._step_harnesses(install_result)
-            config_paths = self._write_global_config(embedding, backend, qdrant)
-            self._summary(embedding, backend, qdrant, config_paths, install_result)
+            sweep_seconds = self._step_sweep()
+            config_paths = self._write_global_config(
+                embedding, backend, qdrant, sweep_seconds
+            )
+            self._summary(
+                embedding,
+                backend,
+                qdrant,
+                config_paths,
+                install_result,
+                sweep_seconds,
+            )
             return 0
         except SetupAborted as exc:
             self.prompts.say(f"\nSetup aborted: {exc}")
@@ -1049,6 +1066,48 @@ class Wizard:
 
     # -- config ----------------------------------------------------------
 
+    def _existing_sweep_seconds(self) -> float:
+        """The interval an existing config requests; 0 when absent/disabled."""
+        paths = (
+            (self.config_path,)
+            if self.config_path is not None
+            else configfile.config_paths(self.cwd, self.home)
+        )
+        if not paths:
+            return 0.0
+        try:
+            raw = configfile.load_layered_config(paths)
+        except ConfigError:
+            return 0.0
+        value = raw.get("sweep_seconds")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 0.0
+        return max(0.0, float(value))
+
+    def _step_sweep(self) -> float:
+        """Ask about the periodic reconciliation sweep; 0 means watcher only."""
+        if self.sweep_seconds is not None:
+            return self.sweep_seconds
+        existing = self._existing_sweep_seconds()
+        if not self._ask_yes_no(
+            "Run a periodic background reconciliation sweep as a safety net "
+            "for missed file events?",
+            default=existing > 0,
+        ):
+            return 0.0
+        default = existing if existing > 0 else DEFAULT_SWEEP_SECONDS
+        while True:
+            raw = self._ask_text("Sweep interval in seconds", default=f"{default:.0f}")
+            try:
+                value = float(raw)
+            except ValueError:
+                self.prompts.say("Enter a number of seconds.")
+                continue
+            if value <= 0:
+                self.prompts.say("The interval must be greater than zero.")
+                continue
+            return value
+
     def _load_install_record(self) -> None:
         """Remember what an earlier run installed, so a re-run can undo it."""
         path = self.config_path or self._global_config_path()
@@ -1080,6 +1139,7 @@ class Wizard:
         embedding: dict[str, Any],
         backend: str,
         qdrant: dict[str, Any] | None,
+        sweep_seconds: float,
     ) -> tuple[Path, ...]:
         embedding_section: dict[str, Any] = {
             "base_url": embedding["base_url"],
@@ -1095,7 +1155,9 @@ class Wizard:
         document: dict[str, Any] = {
             "version": configfile.CONFIG_VERSION,
             "vector_store": backend,
-            "sweep_seconds": 45,
+            "sweep_seconds": (
+                int(sweep_seconds) if sweep_seconds.is_integer() else sweep_seconds
+            ),
             "debounce_ms": 400,
             "embedding": embedding_section,
         }
@@ -1137,6 +1199,7 @@ class Wizard:
                 root=self.repo_root,
                 launcher=self.repo_root / install.LAUNCHER_FILENAME,
                 uv=uv,
+                platform=self.platform,
             )
             self.prompts.say(f"Using the source checkout: {self.repo_root}")
             return result
@@ -1149,6 +1212,7 @@ class Wizard:
                 root=target,
                 launcher=target / install.LAUNCHER_FILENAME,
                 uv=uv,
+                platform=self.platform,
             )
         self.prompts.say(f"Installing to {target} ...")
         if self.dry_run:
@@ -1163,6 +1227,7 @@ class Wizard:
             root=target,
             launcher=target / install.LAUNCHER_FILENAME,
             uv=uv,
+            platform=self.platform,
         )
         self._record_install_root = target
         self.prompts.say(f"Installed: {target}")
@@ -1265,16 +1330,18 @@ class Wizard:
                 kept[spec.name] = str(target)
                 continue
             if self.dry_run:
-                snippet = write.render(spec, SERVER_NAME, command, {})
+                snippet = write.render(spec, SERVER_NAME, command, self.harness_env)
                 self.prompts.say(f"Would update {target}:\n{snippet}")
             else:
                 try:
-                    write.install(spec, target, SERVER_NAME, command, {})
+                    write.install(
+                        spec, target, SERVER_NAME, command, self.harness_env
+                    )
                 except (TypeError, ValueError, OSError) as exc:
                     self.prompts.say(f"Could not update {target}: {exc}")
                     self.prompts.say(
                         "Add this entry manually:\n"
-                        + write.render(spec, SERVER_NAME, command, {})
+                        + write.render(spec, SERVER_NAME, command, self.harness_env)
                     )
                     if previous is not None and previous.resolve() == resolved:
                         kept[spec.name] = str(previous)
@@ -1332,6 +1399,7 @@ class Wizard:
         qdrant: dict[str, Any] | None,
         config_paths: tuple[Path, ...],
         install_result: install.InstallResult,
+        sweep_seconds: float,
     ) -> None:
         dim = int(embedding["dim"])
         self.prompts.say()
@@ -1343,6 +1411,14 @@ class Wizard:
             f"(model={embedding['model']}, dim={dim})"
         )
         self.prompts.say(f"  vector store: {backend}")
+        self.prompts.say(
+            "  sweep:        "
+            + (
+                "disabled (watcher only)"
+                if sweep_seconds <= 0
+                else f"every {sweep_seconds:.0f} s"
+            )
+        )
         self.prompts.say(f"  install:      {install_result.root}")
         self.prompts.say(f"  compose:      {provision.compose_path(self.home)}")
         self.prompts.say(f"  models:       {provision.model_dir(self.home)}")
@@ -1373,13 +1449,65 @@ def _install_only(args: argparse.Namespace) -> int:
     prompts = Prompter()
     if target == repo_root:
         prompts.say(f"Already running from the install directory: {target}")
-        return 0
-    if args.dry_run:
+    elif args.dry_run:
         prompts.say(f"Would copy {repo_root} to {target}")
+    else:
+        install.copy_repo(repo_root, target)
+        prompts.say(f"Copied {repo_root} to {target}")
+    if not args.no_git_pull:
         return 0
-    install.copy_repo(repo_root, target)
-    prompts.say(f"Copied {repo_root} to {target}")
-    return 0
+    return _repin_recorded_harnesses(target, prompts, dry_run=args.dry_run)
+
+
+def _repin_recorded_harnesses(
+    target: Path, prompts: Prompter, *, dry_run: bool
+) -> int:
+    """Rewrite the recorded entries with the pull pin; returns a failure count."""
+    config_path = configfile.global_config_path()
+    record = uninstall.read_record(config_path)
+    if not record.harnesses:
+        prompts.say(f"No harness entries recorded in {config_path}; nothing to update.")
+        return 0
+    # The record names the install the entries already launch; never repoint them
+    # at a target this run merely copied to unless that is the same directory.
+    root = record.install_root or target
+    if root != target:
+        prompts.say(
+            f"Note: the entries keep launching the recorded install at {root}; "
+            f"run the full setup to move them to {target}."
+        )
+    result = install.InstallResult(
+        root=root,
+        launcher=root / install.LAUNCHER_FILENAME,
+        uv=shutil.which("uv") or "uv",
+        platform=sys.platform,
+    )
+    env = {GIT_PULL_ENV: "0"}
+    specs = {spec.name: spec for spec in load_harnesses()}
+    failures = 0
+    for item in record.harnesses:
+        spec = specs.get(item.name)
+        if spec is None:
+            prompts.say(
+                f"{item.name}: the harness plugin is gone; leaving {item.config} alone."
+            )
+            failures += 1
+            continue
+        command = result.server_command
+        if dry_run:
+            prompts.say(
+                f"Would update {item.config}:\n"
+                + write.render(spec, SERVER_NAME, command, env)
+            )
+            continue
+        try:
+            write.install(spec, item.config, SERVER_NAME, command, env)
+        except (TypeError, ValueError, OSError) as exc:
+            prompts.say(f"Could not update {item.config}: {exc}")
+            failures += 1
+            continue
+        prompts.say(f"Updated {item.config}")
+    return 1 if failures else 0
 
 
 def run(argv: list[str] | None = None) -> int:
@@ -1439,6 +1567,14 @@ def run(argv: list[str] | None = None) -> int:
         help="answer the existing-global-config prompt",
     )
     parser.add_argument(
+        "--sweep-seconds",
+        type=float,
+        default=None,
+        help=(
+            "periodic reconciliation sweep interval; 0 disables it (default: ask, off)"
+        ),
+    )
+    parser.add_argument(
         "--harnesses",
         default=None,
         help="'all', 'none', or a comma-separated list of harness names",
@@ -1460,6 +1596,11 @@ def run(argv: list[str] | None = None) -> int:
         help="point harness entries at this checkout instead of copying it",
     )
     parser.add_argument(
+        "--no-git-pull",
+        action="store_true",
+        help="write SIMPLE_CI_GIT_PULL=0 into the harness entries (debug)",
+    )
+    parser.add_argument(
         "--uninstall",
         action="store_true",
         help="remove the install copy, config, services, models and MCP entries",
@@ -1475,6 +1616,8 @@ def run(argv: list[str] | None = None) -> int:
             "--scope was removed: configuration is always global "
             "(~/.simple-ci/config.yaml)"
         )
+    if args.sweep_seconds is not None and args.sweep_seconds < 0:
+        parser.error("--sweep-seconds must be 0 (disabled) or a positive number")
     install_flags = {
         "--model": args.model,
         "--model-url": args.model_url,
@@ -1485,6 +1628,7 @@ def run(argv: list[str] | None = None) -> int:
         "--gpu": args.gpu,
         "--harnesses": args.harnesses,
         "--config-mode": args.config_mode,
+        "--sweep-seconds": args.sweep_seconds,
     }
     if args.keep_models and not args.uninstall:
         parser.error("--keep-models requires --uninstall")
@@ -1494,6 +1638,8 @@ def run(argv: list[str] | None = None) -> int:
         conflicts = [name for name, value in install_flags.items() if value is not None]
         if args.no_install:
             conflicts.append("--no-install")
+        if args.no_git_pull:
+            conflicts.append("--no-git-pull")
         if conflicts:
             parser.error("--uninstall does not accept " + ", ".join(conflicts))
         return uninstall.Uninstaller(
@@ -1535,6 +1681,8 @@ def run(argv: list[str] | None = None) -> int:
         harnesses=args.harnesses,
         install_dir=args.install_dir,
         no_install=args.no_install,
+        no_git_pull=args.no_git_pull,
+        sweep_seconds=args.sweep_seconds,
     )
     return wizard.run()
 

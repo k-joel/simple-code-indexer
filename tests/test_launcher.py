@@ -16,6 +16,7 @@ _SPEC.loader.exec_module(launcher)
 
 
 def test_main_syncs_only_when_head_moved(monkeypatch) -> None:
+    monkeypatch.delenv("SIMPLE_CI_GIT_PULL", raising=False)
     heads = iter(["aaa", "aaa"])
     monkeypatch.setattr(launcher, "_head", lambda: next(heads))
     monkeypatch.setattr(launcher, "_git_pull", lambda: None)
@@ -35,6 +36,21 @@ def test_main_syncs_only_when_head_moved(monkeypatch) -> None:
     assert launcher.main() == 0
     assert synced == [True]
     assert called == [True, True]
+
+
+def test_main_skips_head_checks_when_pull_is_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("SIMPLE_CI_GIT_PULL", "0")
+    monkeypatch.setattr(launcher, "_head", lambda: pytest.fail("_head should not run"))
+    synced: list[bool] = []
+    monkeypatch.setattr(launcher, "_uv_sync", lambda: synced.append(True))
+    called: list[bool] = []
+    import simple_code_indexer.server as server_mod
+
+    monkeypatch.setattr(server_mod, "main", lambda: called.append(True))
+
+    assert launcher.main() == 0
+    assert synced == []
+    assert called == [True]
 
 
 def test_git_pull_is_skipped_when_disabled(monkeypatch) -> None:

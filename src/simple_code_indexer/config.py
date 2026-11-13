@@ -19,7 +19,7 @@ IGNORE_DIRS: frozenset[str] = frozenset(
 
 
 def is_temp_name(name: str) -> bool:
-    """Editor temp files (TDD §7.8): .#*, *~, *.tmp, *.swp, *.swx, *.part."""
+    """Editor temp files: .#*, *~, *.tmp, *.swp, *.swx, *.part."""
     return name.startswith(".#") or name.endswith(
         ("~", ".tmp", ".swp", ".swx", ".part")
     )
@@ -63,9 +63,18 @@ class Settings:
     log_level: str = "debug"
     log_max_bytes: int = 5_000_000
     log_backups: int = 3
+    mode: str = "sidecar"
+    idle_grace_s: float = 60.0
+    heartbeat_s: float = 5.0
+
+    @property
+    def sweep_enabled(self) -> bool:
+        """True when the periodic reconciliation sweep is configured."""
+        return self.sweep_seconds > 0
 
 
 VECTOR_STORES: frozenset[str] = frozenset({"faiss", "qdrant"})
+MODES: frozenset[str] = frozenset({"embedded", "sidecar"})
 LOG_LEVELS: frozenset[str] = frozenset(
     {"debug", "info", "warning", "error", "critical"}
 )
@@ -278,6 +287,18 @@ def _faiss_path(raw_path: str | None, workspace_root: Path) -> Path | None:
     return candidate.resolve()
 
 
+def _mode(file_value: str | None, env_value: str | None) -> str:
+    """SIMPLE_CI_MODE > `mode` > sidecar; an unknown name is a config error."""
+    for name, value in (("SIMPLE_CI_MODE", env_value), ("mode", file_value)):
+        if value is None:
+            continue
+        normalized = value.strip().lower()
+        if normalized not in MODES:
+            raise ConfigError(f"{name} must be one of {sorted(MODES)}, got {value!r}")
+        return normalized
+    return "sidecar"
+
+
 def _log_level(file_value: str | None, env_value: str | None) -> str:
     """LOG_LEVEL > `log.level` > debug; an unknown name is a config error."""
     for name, value in (("LOG_LEVEL", env_value), ("log.level", file_value)):
@@ -354,6 +375,37 @@ def load_settings() -> Settings:
     api_key = os.environ.get("EMBED_API_KEY")
     if api_key is None:
         api_key = configfile.get_str(embedding, "api_key", where="embedding")
+    sweep_seconds = _pick_float(
+        "SWEEP_SECONDS",
+        configfile.get_float(raw, "sweep_seconds", where="config"),
+        0.0,
+    )
+    if sweep_seconds < 0:
+        raise ConfigError(
+            "sweep_seconds must be 0 to disable the periodic reconciliation "
+            "sweep or a positive number of seconds"
+        )
+    env_mode = os.environ.get("SIMPLE_CI_MODE")
+    file_mode = (
+        None
+        if env_mode is not None
+        else configfile.get_str(raw, "mode", where="config")
+    )
+    mode = _mode(file_mode, env_mode)
+    idle_grace_s = _pick_float(
+        "IDLE_GRACE_S",
+        configfile.get_float(raw, "idle_grace_s", where="config"),
+        60.0,
+    )
+    if idle_grace_s < 0:
+        raise ConfigError("idle_grace_s must be zero or a positive number of seconds")
+    heartbeat_s = _pick_float(
+        "HEARTBEAT_S",
+        configfile.get_float(raw, "heartbeat_s", where="config"),
+        5.0,
+    )
+    if heartbeat_s <= 0:
+        raise ConfigError("heartbeat_s must be a positive number of seconds")
     return Settings(
         workspace_root=workspace_root,
         index_db_path=index_db,
@@ -377,11 +429,7 @@ def load_settings() -> Settings:
             configfile.get_float(embedding, "timeout_s", where="embedding"),
             15.0,
         ),
-        sweep_seconds=_pick_float(
-            "SWEEP_SECONDS",
-            configfile.get_float(raw, "sweep_seconds", where="config"),
-            45.0,
-        ),
+        sweep_seconds=sweep_seconds,
         debounce_ms=_pick_int(
             "DEBOUNCE_MS", configfile.get_int(raw, "debounce_ms", where="config"), 400
         ),
@@ -407,4 +455,7 @@ def load_settings() -> Settings:
         log_backups=_pick_int(
             "LOG_BACKUPS", configfile.get_int(log, "backups", where="log"), 3
         ),
+        mode=mode,
+        idle_grace_s=idle_grace_s,
+        heartbeat_s=heartbeat_s,
     )

@@ -130,6 +130,19 @@ def connect(db_path: Path, *, readonly: bool = False) -> Iterator[sqlite3.Connec
             logger.debug("slow db session: %s took %d ms", db_path.name, elapsed_ms)
 
 
+@contextmanager
+def try_connect_readonly(
+    db_path: Path,
+) -> Iterator[sqlite3.Connection | None]:
+    """Yield None when the index has not been created yet (a reader may start
+    before the first writer). Errors other than a missing file still propagate."""
+    if not db_path.is_file():
+        yield None
+        return
+    with connect(db_path, readonly=True) as conn:
+        yield conn
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     started = time.perf_counter()
     conn.executescript(_SCHEMA)
@@ -340,7 +353,7 @@ def chunk_ids_for_path(conn: sqlite3.Connection, path: str) -> list[tuple[int, i
 def record_embedding_state(
     conn: sqlite3.Connection, rows: list[tuple[int, str, str]]
 ) -> None:
-    """Upsert (chunk_id, vector_id, status) observability rows (TDD §7.5)."""
+    """Upsert (chunk_id, vector_id, status) observability rows."""
     conn.executemany(
         """
         INSERT INTO embedding_state (chunk_id, vector_id, status, updated_at)
@@ -396,6 +409,11 @@ _BACKEND_KEY = "vector_backend"
 _FAISS_PATH_KEY = "faiss_path"
 _FAISS_DIM_KEY = "faiss_dim"
 _LABEL_SEQ_KEY = "vector_label_seq"
+
+# Writer liveness, updated by the writer runtime and read by readers without an RPC.
+WRITER_PID_KEY = "writer_pid"
+WRITER_HEARTBEAT_KEY = "writer_heartbeat"
+WRITER_STARTED_AT_KEY = "writer_started_at"
 
 _IDENTITY_KEYS = {
     "qdrant": (_QDRANT_URL_KEY, _COLLECTION_KEY),

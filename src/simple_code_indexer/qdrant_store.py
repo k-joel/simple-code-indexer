@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 # Outcome of the most recent Qdrant operation; read by get_status.
 LAST_OK: bool | None = None
 
-# Fixed namespace so point IDs are stable across processes (TDD §6.2).
+# Fixed namespace so point IDs are stable across processes.
 POINT_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "simple-code-indexer")
 
 _ensured_collections: set[tuple[str, str]] = set()
@@ -115,6 +115,37 @@ def ensure_collection(settings: Settings) -> None:
             raise QdrantUnavailable(f"cannot ensure collection: {exc}") from exc
 
 
+def validate_collection(settings: Settings) -> None:
+    """Validate an existing collection without creating it (reader role)."""
+    global LAST_OK
+    cache_key = (settings.qdrant_url, settings.qdrant_collection)
+    if cache_key in _ensured_collections:
+        return
+    with _ensure_lock:
+        if cache_key in _ensured_collections:
+            return
+        try:
+            client = _client(settings)
+            if not client.collection_exists(settings.qdrant_collection):
+                raise QdrantUnavailable(
+                    f"collection {settings.qdrant_collection} does not exist yet"
+                )
+            _validate_collection_config(client, settings)
+            _ensured_collections.add(cache_key)
+            LAST_OK = True
+            logger.debug(
+                "qdrant collection %s validated (size=%d)",
+                settings.qdrant_collection,
+                settings.embed_dim,
+            )
+        except QdrantUnavailable:
+            LAST_OK = False
+            raise
+        except Exception as exc:
+            LAST_OK = False
+            raise QdrantUnavailable(f"cannot validate collection: {exc}") from exc
+
+
 def upsert_chunks(
     settings: Settings, path: str, items: list[tuple[Chunk, list[float]]]
 ) -> list[str]:
@@ -152,7 +183,7 @@ def upsert_chunks(
 
 
 def delete_by_path(settings: Settings, path: str) -> None:
-    """Drop every point of a deleted file (TDD §6.2)."""
+    """Drop every point of a deleted file."""
     global LAST_OK
     from qdrant_client.models import FieldCondition, Filter, MatchValue
 
@@ -174,24 +205,18 @@ def delete_by_path(settings: Settings, path: str) -> None:
         raise QdrantUnavailable(f"delete failed for {path}: {exc}") from exc
 
 
-def search(settings: Settings, vector: list[float], limit: int) -> list[VectorHit]:
-    """Nearest-chunk search; payload maps hits back to (path, chunk_index)."""
+def _query_points(
+    settings: Settings, vector: list[float], limit: int
+) -> list[VectorHit]:
+    """Query an ensured/validated collection and map payloads to hits."""
     global LAST_OK
     started = time.perf_counter()
-    try:
-        ensure_collection(settings)
-        response = _client(settings).query_points(
-            settings.qdrant_collection,
-            query=vector,
-            limit=limit,
-            with_payload=True,
-        )
-        LAST_OK = True
-    except QdrantUnavailable:
-        raise
-    except Exception as exc:
-        LAST_OK = False
-        raise QdrantUnavailable(f"search failed: {exc}") from exc
+    response = _client(settings).query_points(
+        settings.qdrant_collection,
+        query=vector,
+        limit=limit,
+        with_payload=True,
+    )
     hits: list[VectorHit] = []
     skipped = 0
     for point in response.points:
@@ -206,6 +231,7 @@ def search(settings: Settings, vector: list[float], limit: int) -> list[VectorHi
                 score=float(point.score),
             )
         )
+    LAST_OK = True
     logger.debug(
         "qdrant search: %d point(s), %d hit(s), %d malformed in %d ms",
         len(response.points),
@@ -214,3 +240,31 @@ def search(settings: Settings, vector: list[float], limit: int) -> list[VectorHi
         int((time.perf_counter() - started) * 1000),
     )
     return hits
+
+
+def search(settings: Settings, vector: list[float], limit: int) -> list[VectorHit]:
+    """Nearest-chunk search; payload maps hits back to (path, chunk_index)."""
+    global LAST_OK
+    try:
+        ensure_collection(settings)
+        return _query_points(settings, vector, limit)
+    except QdrantUnavailable:
+        raise
+    except Exception as exc:
+        LAST_OK = False
+        raise QdrantUnavailable(f"search failed: {exc}") from exc
+
+
+def search_readonly(
+    settings: Settings, vector: list[float], limit: int
+) -> list[VectorHit]:
+    """Reader-side search: validate the collection, never create it."""
+    global LAST_OK
+    try:
+        validate_collection(settings)
+        return _query_points(settings, vector, limit)
+    except QdrantUnavailable:
+        raise
+    except Exception as exc:
+        LAST_OK = False
+        raise QdrantUnavailable(f"read-only search failed: {exc}") from exc

@@ -9,6 +9,8 @@ import time
 import tomllib
 from pathlib import Path
 
+import yaml
+
 from simple_code_indexer.harnesses import HarnessSpec
 
 _BACKUP_STAMP = re.compile(r"\.bak\.\d{8}-\d{6}$")
@@ -94,6 +96,11 @@ def remove_backups(target: Path) -> list[Path]:
 def _validate(fmt: str, text: str) -> None:
     if fmt == "toml":
         tomllib.loads(text)
+        return
+    if fmt == "yaml":
+        parsed = yaml.safe_load(text)
+        if parsed is not None and not isinstance(parsed, dict):
+            raise TypeError("rendered config is not a YAML mapping")
         return
     parsed = json.loads(text)
     if not isinstance(parsed, dict):

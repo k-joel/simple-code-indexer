@@ -8,6 +8,7 @@ import logging
 import os
 import queue
 import sqlite3
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -26,8 +27,41 @@ logger = logging.getLogger(__name__)
 # Last successful sweep completion (UTC ISO); read by get_status.
 LAST_SWEEP: str | None = None
 
+# Completed sweeps since process start; the sweep timer uses it to tell whether
+# the request it queued has run yet.
+SWEEP_GENERATION = 0
+
 # Minimum idle spacing between drain-triggered vector flushes.
 FLUSH_DEBOUNCE_S = 30.0
+
+# Sweep pacing: an enabled periodic sweep doubles its interval while the
+# workspace stays idle, up to this cap. With sweeps disabled a dormant timer
+# polls this often and temporarily re-enables sweeps while chunks are pending.
+SWEEP_BACKOFF_MAX_S = 600.0
+DORMANT_POLL_S = 60.0
+
+_activity_lock = threading.Lock()
+_watcher_events = 0
+
+
+def note_watcher_event() -> None:
+    """Record one queued watcher event (the sweep backoff's activity signal)."""
+    global _watcher_events
+    with _activity_lock:
+        _watcher_events += 1
+
+
+def watcher_activity() -> int:
+    """Count of watcher events queued since process start."""
+    with _activity_lock:
+        return _watcher_events
+
+
+def next_sweep_delay(base_s: float, current_s: float, *, idle: bool) -> float:
+    """Double the sweep interval while idle, then clamp to the backoff cap."""
+    if not idle:
+        return base_s
+    return min(max(current_s, base_s) * 2, max(SWEEP_BACKOFF_MAX_S, base_s))
 
 
 class IndexOutcome(NamedTuple):
@@ -214,7 +248,7 @@ def index_one_file(
 
 
 def _embed_and_store(settings: Settings, rel: str, chunks: list[Chunk]) -> bool:
-    """Embed + upsert vectors; fail soft and record embedding_state (TDD §7.5).
+    """Embed + upsert vectors; fail soft and record embedding_state.
 
     Returns True when every chunk got a vector, so retry callers can stop at the
     first failure instead of hammering a service that is down.
@@ -266,6 +300,15 @@ def _embed_and_store(settings: Settings, rel: str, chunks: list[Chunk]) -> bool:
     return status == "ok"
 
 
+def pending_embedding_count(settings: Settings) -> int:
+    """Chunks still waiting for a vector; 0 when the index is unreadable."""
+    try:
+        with db.connect(settings.index_db_path, readonly=True) as conn:
+            return db.embedding_counts(conn)["pending"]
+    except (OSError, sqlite3.Error):
+        return 0
+
+
 def reembed_pending(settings: Settings) -> int:
     """Re-embed chunks that have no vector; unaffected by hash/mtime skips.
 
@@ -301,8 +344,8 @@ def reembed_pending(settings: Settings) -> int:
 
 
 def sweep(settings: Settings, rules: IgnoreRules | None = None) -> SweepStats:
-    """Walk the workspace; re-index drift, drop deleted paths (TDD §4.3)."""
-    global LAST_SWEEP, LAST_SWEEP_STATS
+    """Walk the workspace; re-index drift, drop deleted paths."""
+    global LAST_SWEEP, LAST_SWEEP_STATS, SWEEP_GENERATION
     started = time.perf_counter()
     rules = rules or IgnoreRules(settings.workspace_root)
 
@@ -369,6 +412,7 @@ def sweep(settings: Settings, rules: IgnoreRules | None = None) -> SweepStats:
         ignored_files=walk.ignored_files,
     )
     LAST_SWEEP_STATS = stats
+    SWEEP_GENERATION += 1
     logger.info(
         "sweep: checked=%d indexed=%d unchanged=%d filtered=%d removed=%d "
         "errors=%d ignored_dirs=%d ignored_files=%d in %d ms",
@@ -404,16 +448,27 @@ def remove_file(settings: Settings, path: Path) -> None:
     logger.debug("removed %s from the index", rel)
 
 
-def writer_loop(settings: Settings, work_queue: WorkQueue) -> None:
+def writer_loop(
+    settings: Settings,
+    work_queue: WorkQueue,
+    stop_event: threading.Event | None = None,
+) -> None:
     """Single index writer: consumes paths, tombstones and sweep requests.
 
     When the queue drains, the in-memory FAISS index is persisted, at most once
-    per FLUSH_DEBOUNCE_S. A sweep already flushes at its end.
+    per FLUSH_DEBOUNCE_S. A sweep already flushes at its end. A stop event lets
+    the owning runtime end the thread without losing the process; queued items
+    left behind are recovered by the next startup sweep.
     """
     last_flush = 0.0
     rules = IgnoreRules(settings.workspace_root)
     while True:
-        item = work_queue.get()
+        if stop_event is not None and stop_event.is_set():
+            break
+        try:
+            item = work_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
         logger.debug(
             "index queue: %s (%d waiting)",
             "sweep" if isinstance(item, SweepRequest) else item,
