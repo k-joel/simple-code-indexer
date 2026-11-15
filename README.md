@@ -368,6 +368,7 @@ Select-String -Path .simple-ci/log/writer.log,.simple-ci/log/reader.log -Pattern
 |---|---|
 | [docs/ARCH.md](docs/ARCH.md) | Live architecture overview — topology, data flow, domain/data model, component design, testing |
 | [docs/GLOSSARY.md](docs/GLOSSARY.md) | Domain language |
+| [docs/RUNBOOK.md](docs/RUNBOOK.md) | Numbered operator procedures (`RUN-001` upward) and the maintenance contract |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Architecture decision records |
 | [docs/ARCH_ISSUES.md](docs/ARCH_ISSUES.md) | Open structural debt |
 

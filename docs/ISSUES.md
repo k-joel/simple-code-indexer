@@ -14,5 +14,13 @@ repo — by humans or by LLM sessions.
 
 ## Open
 
-_No open issues._
+### ISS-12: `ruff format --check` fails on two committed files
+
+- **Symptom**: `uv run ruff format --check .` reports `2 files would be reformatted`.
+- **Where flagged**: 2026-11-15, while running the quality gate before adding `docs/RUNBOOK.md`.
+- **Cause**: `src/simple_code_indexer/setup_wizard/__init__.py:1337` and
+  `tests/test_setup_wizard.py:1124`, `:1170`, `:1213` are committed without `ruff format`.
+- **Suggested fix**: run
+  `uv run ruff format src/simple_code_indexer/setup_wizard/__init__.py tests/test_setup_wizard.py`,
+  then re-run `uv run ruff format --check .` and the quality gate.
 

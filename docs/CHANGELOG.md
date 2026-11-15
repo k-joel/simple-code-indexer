@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `docs/RUNBOOK.md`: numbered operator procedures (`RUN-001` upward) for service probes, the
+  quality gate, live MCP verification, index rebuilds, sidecar shutdown, and log reading. The
+  file header carries the maintenance contract and the evidence rules for new entries.
 - Per-workspace sidecar writer daemon (ADR-014). Every harness still spawns its own
   stdio MCP server, but those servers are now **readers**: one detached daemon owns
   `index.db`, `vectors.faiss`, the Qdrant collection, the watcher, the writer thread,
