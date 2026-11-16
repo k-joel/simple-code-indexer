@@ -1,18 +1,273 @@
-# Architecture — simple-code-indexer
+# Architecture
 
-`simple-code-indexer` is a local code-index service exposed as a small MCP tool
-surface. It watches one workspace, indexes files as they are saved into a
-SQLite/FTS5 lexical index, and maintains chunk embeddings in a local FAISS index
-(Qdrant is optional). A harness spawns the MCP server over stdio; in the default
-topology that server is a read-only **reader** backed by one detached **writer
-daemon** per workspace.
+This is the live, as-built architecture reference. It describes the code as it
+exists today, not planned or historical designs. When this document and the code
+disagree, the code wins — update this document in the same change. Canonical
+terms live in [`GLOSSARY.md`](GLOSSARY.md), rationale in
+[`DECISIONS.md`](DECISIONS.md), open defects in [`ISSUES.md`](ISSUES.md),
+structural debt in [`ARCH_ISSUES.md`](ARCH_ISSUES.md), and operational gotchas
+in [`NOTES.md`](NOTES.md).
 
-This is the live architecture overview. It describes the code as it exists, not
-the plan that produced it. When this document and the code disagree, the code
-wins — update this document in the same change. Domain vocabulary lives in
-[`GLOSSARY.md`](GLOSSARY.md), rationale in [`DECISIONS.md`](DECISIONS.md), open
-defects in [`ISSUES.md`](ISSUES.md), and structural debt in
-[`ARCH_ISSUES.md`](ARCH_ISSUES.md).
+<!--
+ARCH.md MAINTENANCE GUIDE (FOR AGENTS & CONTRIBUTORS)
+
+PURPOSE & SCOPE
+- Audience: Engineers and LLM agents needing an accurate map of the codebase.
+- Purpose: Authoritative as-built reference of system structure, boundaries,
+  runtime topology, data/control flows, schemas, contracts, cross-cutting
+  mechanisms, extension points, deployment, and test/quality gates.
+- Code-First Rule: Derive every claim directly from source, config, build, and
+  CI files (package manifests, entry points, schemas, routes, tests). Never
+  document theoretical patterns or unimplemented plans.
+
+UPDATE TRIGGERS
+Update docs/ARCH.md whenever a change alters any of the following:
+- Process/runtime topology, concurrency model, or lifecycle ownership.
+- External API, CLI, RPC, or MCP tool surface and payload contracts.
+- Configuration sources, discovery precedence, or environment overrides.
+- Database schemas, migrations, identity/invalidation keys, or vector/cache layouts.
+- Core data, ingestion, or query/read-path pipelines.
+- Cross-cutting boundaries (auth, error handling, logging, security, OS behavior).
+- Plugin/extension contracts, deployment/install layout, or test/CI quality gates.
+- Any spotted mismatch between this file and actual code.
+
+INCLUSION / EXCLUSION CRITERIA
+- INCLUDE:
+  - Verified stack, architectural style/hybrids, and explicit In-Scope vs.
+    Out-of-Scope boundaries.
+  - Runtime topology, process/thread ownership, and dependency direction rules.
+  - Component inventory, internal abstractions, interaction protocols, and
+    concrete extension mechanisms.
+  - Data architecture: domain entities, relationships, actual DDL/schemas,
+    consistency/caching/invalidation rules, and filesystem layout.
+  - Cross-cutting implementation patterns (auth/secrets, error/retry/fallback,
+    logging/observability, input validation, config precedence).
+  - Deployment/install topology and test layers + runnable quality-gate commands.
+- EXCLUDE (ROUTE ELSEWHERE OR OMIT):
+  - Why a choice was made / alternatives considered -> DECISIONS.md
+  - Functional bugs or regressions -> ISSUES.md
+  - Structural debt, layer violations, or smells -> ARCH_ISSUES.md
+  - Operational quirks or debugging tips -> NOTES.md
+  - Standalone term definitions -> GLOSSARY.md
+  - Speculative roadmaps, exhaustive line-by-line code dumps, or boilerplate
+    sections for technology stacks not detected in the codebase.
+
+STRUCTURE & FORMATTING
+- Top-level sections: Numbered H2 headings (`1. Purpose and scope` .. `13. ...`)
+  separated by `---` horizontal rules on their own lines.
+- Subsections: Numbered H3 headings (`2.1 ...`, `6.1 ...`). Omit unused optional
+  subsections; never leave empty "TBD" sections.
+- Canonical section order (adapt domain-specific titles to the codebase):
+  1. Purpose and scope
+  2. Runtime topology
+  3. Primary write / ingestion data flow
+  4. Primary read / query paths
+  5. Domain model
+  6. Data architecture
+  7. Component design
+  8. External interface / API contracts
+  9. Cross-cutting concerns
+  10. Extension points
+  11. Install and launch architecture
+  12. Testing architecture
+  13. Maintaining this document
+- Tables: Use compact Markdown tables for inventories, configs, and schemas.
+- Diagrams: Use fenced ASCII diagrams with Unicode arrows (`→`, `──►`, `▼`).
+  Never use `-->` inside HTML comments or diagrams that could break parsers.
+- Code blocks: Always specify a language tag (`sql`, `json`, `bash`, `text`).
+
+QUALITY & STYLE RULES
+- Tense & Tone: Present tense, declarative, terse, and high-signal. No filler.
+- Verification: Inspect actual files before writing; cite exact module paths,
+  symbol names, config keys, and CLI commands in backticks.
+- Consistency: Match canonical vocabulary in GLOSSARY.md and link ADRs inline
+  (e.g., `(ADR-005)` or `[ADR-015](DECISIONS.md#...)`) without duplicating rationale.
+- Privacy/Safety: Never embed real secrets, tokens, or personal local paths in
+  examples; use placeholders (`<workspace>`, `~/.app/`).
+
+LIFECYCLE & WORKFLOW
+1. Inspect diff/codebase: Detect active stack, entry points, schemas, and configs.
+2. Add: Insert new components/endpoints/tables into the matching numbered section.
+3. Modify: Update flows, config tables, and schemas in place to match the code.
+4. Retire: Delete removed components, flags, and endpoints from ARCH.md (history
+   belongs in git and DECISIONS.md, not stale sections here).
+5. Reconcile: If an existing section contradicts the code, fix ARCH.md immediately.
+
+ANTI-PATTERNS
+- Documenting planned features, aspirational clean layers, or unverified memory.
+- Mixing ADRs, bug lists, or tech-debt commentary into ARCH.md.
+- Leaving stale DDL, obsolete CLI flags, or dead module names after refactors.
+- Including framework sections (e.g., React/Java/.NET) not present in the repo.
+- Using vague qualifiers ("probably", "usually", "various helpers").
+
+EXAMPLE LAYOUT (4-SPACE INDENTED)
+
+    ---
+
+    ## 1. Purpose and scope
+
+    | In scope | Out of scope |
+    |---|---|
+    | `<core capability>` | `<explicit boundary>` |
+
+    ---
+
+    ## 2. Runtime topology
+
+    ### 2.1 Default mode (`mode: <name>`)
+
+    ```text
+    caller ──► <entry-point> ──► <worker/store>
+    ```
+
+    | Process / thread | Role | Owns |
+    |---|---|---|
+    | `<process>` | `<role>` | `<resources>` |
+
+    ---
+
+    ## 3. <Write / ingestion> data flow
+
+    ```text
+    input event → filter/debounce → bounded queue → <unit_of_work>() → store
+    ```
+
+    ### 3.1 Reconciliation backstops
+
+    1. **Startup reconcile** — `<initial catch-up behavior>`.
+
+    ---
+
+    ## 4. <Read / query> paths
+
+    ### 4.1 <Query path name>
+
+    1. `<Step 1: parse/validate>`
+    2. `<Step 2: query store and rank/merge>`
+
+    ---
+
+    ## 5. Domain model
+
+    | Entity | Identity | Key attributes |
+    |---|---|---|
+    | **<Entity>** | `<unique key>` | `<core fields>` |
+
+    Relationships: `<EntityA> 1—* <EntityB>`.
+
+    ---
+
+    ## 6. Data architecture
+
+    ### 6.1 Primary store (`<path-or-engine>`)
+
+    ```sql
+    CREATE TABLE <entity> (id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE);
+    ```
+
+    ### 6.2 Secondary / index store
+
+    - `<Engine>`: `<key structure, consistency, and identity binding rules>`.
+
+    ### 6.3 Filesystem layout
+
+    ```text
+    <root>/
+      <data-dir>/
+        <db-file>
+        log/<role>.log
+    ```
+
+    ---
+
+    ## 7. Component design
+
+    | Module | Responsibility |
+    |---|---|
+    | `src/<pkg>/<mod>.py` | `<single-sentence role>` |
+
+    ### 7.1 Configuration
+
+    | Config key | Environment | Default |
+    |---|---|---|
+    | `<section.key>` | `<ENV_VAR>` | `<default>` |
+
+    ---
+
+    ## 8. <Interface / API> surface
+
+    ### 8.1 `<operation_name>`
+
+    | Input | Type | Default | Notes |
+    |---|---|---|---|
+    | `<param>` | string | required | `<constraint>` |
+
+    ```json
+    {"status": "ok", "results": []}
+    ```
+
+    ---
+
+    ## 9. Cross-cutting concerns
+
+    ### 9.1 Error handling
+    `<Exception hierarchy and fail-soft vs. fatal boundaries.>`
+
+    ### 9.2 Concurrency and consistency
+    `<Locks, leases, read-only isolation, and ordering guarantees.>`
+
+    ### 9.3 Logging and observability
+    `<Log destinations, levels, redaction rules, and status signals.>`
+
+    ### 9.4 Security boundaries
+    `<Auth tokens, file permissions, and non-sandbox boundaries.>`
+
+    ### 9.5 Platform behavior
+    `<OS-specific watchers, locks, sockets/pipes, or process flags.>`
+
+    ---
+
+    ## 10. Extension points
+
+    | Extension | Mechanism | Rules |
+    |---|---|---|
+    | `<plugin type>` | `<discovery path>` | `<override/validation rules>` |
+
+    ---
+
+    ## 11. Install and launch architecture
+
+    ```text
+    source ──<installer>──► runtime copy ──► <launcher> ──► entrypoint
+    ```
+
+    ---
+
+    ## 12. Testing architecture
+
+    ### 12.1 Test isolation
+    `<Env overrides and fixtures isolating tests from user/global state.>`
+
+    ### 12.2 Test layers
+
+    | Layer | What it covers |
+    |---|---|
+    | Unit | `<isolated modules>` |
+    | Integration | `<end-to-end flows with real/stubbed boundaries>` |
+
+    ### 12.3 Quality gates
+
+    ```bash
+    <lint / typecheck / test commands>
+    ```
+
+    ---
+
+    ## 13. Maintaining this document
+
+    Update triggers and companion-doc split (`ARCH.md`, `DECISIONS.md`,
+    `ISSUES.md`, `ARCH_ISSUES.md`, `NOTES.md`, `GLOSSARY.md`).
+-->
 
 ---
 

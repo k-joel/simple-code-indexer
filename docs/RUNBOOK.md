@@ -1,51 +1,108 @@
-# Runbook maintenance
+# Runbook
 
-Use this file for repeatable procedures that an operator or agent has run. Keep each entry focused on one task.
+Repeatable operational procedures for this repository, executed by operators or agents under time pressure. Each entry covers one verified task; see [Entries](#entries) below to locate a procedure.
 
-- Assign each new entry the next free three-digit `RUN-NNN` ID. Never renumber entries or reuse retired IDs.
-- Put the risk in the entry heading and combine tags when needed. Use `SAFE` for reads or disposable writes, `OPERATOR` for recoverable state changes, `MANUAL` for actions outside the terminal, and `DESTRUCTIVE` for deletion.
-- Record only steps and failure modes confirmed by a real run. Mark untested procedures or branches as drafts.
-- Make commands copy-pasteable. Use `[bracketed placeholders]` for unknown values and explain how to obtain them.
-- Use one numbered step per action. Include the expected result when it helps confirm success.
-- Update entries when their commands or behavior change. Remove obsolete steps and entries.
-- Give each troubleshooting item the verbatim symptom, its cause, and the exact fix. Order diagnostics from cheapest to most expensive.
+**Risk legend:** `SAFE` (reads or disposable writes) · `OPERATOR` (recoverable state changes) · `MANUAL` (actions outside the terminal) · `DESTRUCTIVE` (deletion or irreversible change).
 
-## Entry template
+<!--
+RUNBOOK MAINTENANCE GUIDE (FOR AGENTS & CONTRIBUTORS)
 
-````markdown
-## RUN-NNN (<risk>): <imperative task>
+PURPOSE & SCOPE
+- Repeatable, ordered operational procedures executed under time pressure (setup, probes, recovery, cleanup, release).
+- Intended reader: an operator or agent executing a task mid-incident or mid-workflow.
+- NOT for design rationale, architecture docs, API/config reference, or changelogs.
 
-<Describe what the procedure does.>
+UPDATE TRIGGERS
+Update this file before ending a session whenever you:
+- Add a new repeatable operational workflow.
+- Change commands, flags, paths, config keys, or expected output for an existing entry.
+- Execute a [DRAFT] entry or branch in a real run (confirm steps and remove [DRAFT], or record observed failures).
+- Confirm a new failure mode and its fix during a real run.
+- Retire an obsolete workflow or step.
 
-1. <Perform one action>:
+INCLUSION / EXCLUSION CRITERIA
+- Include: one focused, repeatable task per entry; only steps and failures confirmed by a real run (or marked [DRAFT] if untested).
+- Exclude: imagined procedures not marked [DRAFT], one-off commands, background prose, design rationale, and non-executable reference material.
 
-   ```
-   <command>
-   ```
+STRUCTURE & FORMATTING
+- Single H1: Keep `# Runbook` as the only H1 in the file.
+- Summary Index Table: Maintain `| RUN | Procedure |` under `## Entries` in ascending numeric order. Every row must link to its section anchor (`[NNN](#run-nnn-risk-kebab-case-title)`).
+- File order: visible preamble -> this comment -> `## Entries` index table -> `## RUN-NNN ...` sections in ascending ID order.
+- IDs: sequential 3-digit zero-padded IDs (`RUN-NNN`, starting at 001). Assign the next free ID. Never renumber entries or reuse retired IDs.
+- Entry heading: `## RUN-NNN (<RISK>): <imperative task>` (append `[DRAFT]` if untested).
+- Risk tags: `SAFE`, `OPERATOR`, `MANUAL`, `DESTRUCTIVE`. Combine with `, ` when multiple apply (e.g., `OPERATOR, MANUAL`).
+- Summary paragraph (required): 1-2 sentences right under the heading stating what the procedure does and what it does NOT cover.
+- Steps (required): numbered ordinal steps (`1.`, `2.`, ...), one action per step, copy-pasteable code block, and `Expected: <observable result>.` when it helps confirm success.
+- Troubleshooting (optional; omit heading if no confirmed failures exist): `**Troubleshooting**`, followed by symptom-first bullets ordered from cheapest to most expensive diagnostic: ``- **`<verbatim symptom>`**: <cause>. Fix: `<command>`.``
 
-   Expected: <observable result>.
+QUALITY & STYLE RULES
+- Voice & brevity: imperative or present tense, concise, high-signal; no filler or historical commentary.
+- Truth & placeholders: record only steps and failures observed in a real run. Keep unknown values visibly bracketed as `[placeholder]` and explain how to obtain them; never invent values. Mark untested entries or branches `[DRAFT]` and ask the first real runner to report back.
+- Commands: copy-pasteable with concrete values where known; label variants inside the code block (`# safe mode` / `# live mode`).
+- Ordering & safety: state wrong-order consequences inline before hazardous steps. For `OPERATOR` or `DESTRUCTIVE` entries, state the rollback path (or plainly note that none exists) and end with a verification step proving the final observable state. Mark the preferred path `(recommended)` when alternatives exist.
 
-2. <Perform the next action>:
+LIFECYCLE & WORKFLOW
+- Add: assign the next free `RUN-NNN`, add a row to `## Entries`, and append the entry using the Example Layout below.
+- Update: edit commands, expected results, and troubleshooting inline when behavior changes; remove obsolete steps.
+- Promote draft: after a real run confirms the steps, update observed outputs, fill resolved placeholders, and remove `[DRAFT]`.
+- Retire: delete the `## RUN-NNN` section body and update its `## Entries` row to `| [NNN](#...) | Retired - <reason or replacement RUN-NNN> |` so the ID is never reused.
 
-   ```
-   <command>
-   ```
+ANTI-PATTERNS
+- Writing desk-imagined steps without `[DRAFT]`.
+- Inventing tokens, ports, hostnames, or IDs instead of using `[bracketed placeholders]`.
+- Renumbering entries or reusing retired `RUN-NNN` IDs.
+- Putting multiple actions in one step, or using bullets instead of numbered steps.
+- Writing vague troubleshooting ("check logs") instead of verbatim symptom + cause + exact fix.
+- Leaving stale commands after changing code/tooling, or adding design rationale.
 
-**Troubleshooting**
+EXAMPLE LAYOUT (4-SPACE INDENTED)
 
-- **`<verbatim symptom>`**: <cause>. Fix: `<command>`.
-````
+    ## Entries
+
+    | RUN | Procedure |
+    |---|---|
+    | [001](#run-001-risk-imperative-task) | <imperative task> |
+
+    ---
+
+    ## RUN-001 (OPERATOR): <imperative task>
+
+    <What this procedure does.> Does not <scope exclusion>. Rollback: <undo command, or "none; state change is irreversible">.
+
+    1. <Perform one action (note wrong-order consequence if applicable)>:
+
+       ```
+       # safe mode (recommended)
+       <command with [bracketed placeholder] - obtain via [how]>
+       ```
+
+       Expected: <observable result>.
+
+    2. <Verify final observable state>:
+
+       ```
+       <verification command>
+       ```
+
+       Expected: <observable end state>.
+
+    **Troubleshooting**
+
+    - **`<verbatim error or log string>`**: <cause>. Fix: `<exact command>`.
+-->
+
+---
 
 ## Entries
 
-| ID | Procedure |
+| RUN | Procedure |
 |---|---|
-| RUN-001 | Probe the backing services |
-| RUN-002 | Run the quality gate before a handoff |
-| RUN-003 | Verify a live MCP session with the stdio probes |
-| RUN-004 | Rebuild a workspace index from scratch |
-| RUN-005 | Stop a sidecar writer daemon |
-| RUN-006 | Read the sidecar session timeline |
+| [001](#run-001-safe-probe-the-backing-services) | Probe the backing services |
+| [002](#run-002-safe-run-the-quality-gate-before-a-handoff) | Run the quality gate before a handoff |
+| [003](#run-003-operator-verify-a-live-mcp-session-with-the-stdio-probes) | Verify a live MCP session with the stdio probes |
+| [004](#run-004-destructive-rebuild-a-workspace-index-from-scratch) | Rebuild a workspace index from scratch |
+| [005](#run-005-operator-stop-a-sidecar-writer-daemon) | Stop a sidecar writer daemon |
+| [006](#run-006-safe-read-the-sidecar-session-timeline) | Read the sidecar session timeline |
 
 ## RUN-001 (SAFE): Probe the backing services
 

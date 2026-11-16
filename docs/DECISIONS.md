@@ -1,17 +1,129 @@
 # Architecture Decision Records
 
-The "why" behind the structural, architectural, and dependency choices in this project, compressed
-to the minimum needed to convey the decision. Read the relevant entry before "fixing" behaviour that
-looks unusual — most of it is a deliberate decision recorded here.
+Concise record of architecturally significant choices made in this project—capturing the context, decision, and trade-offs behind non-obvious structure and dependencies. Read the relevant entry before modifying or reverting established behavior.
 
-**Rules**
+<!--
+DECISIONS.md MAINTENANCE GUIDE (FOR AGENTS & CONTRIBUTORS)
 
-- One entry per decision: **Context** (why it came up), **Decision** (what holds now), **Consequences**
-  (what to keep, and what not to change back).
-- Numbers are stable identifiers. Append new decisions as the next number; renumber only when an
-  entry is deleted.
-- Superseded entries are deleted, not kept: fold the surviving part of a decision into the entry that
-  replaced it. Do not resurrect a removed pattern without a new ADR.
+PURPOSE & SCOPE
+- Canonical, single-file log of architecturally significant decisions for future
+  engineers and autonomous agents.
+- Explains *why* structural, dependency, and cross-cutting design choices exist.
+- NOT a changelog, task/issue tracker, release note, API doc, or how-to guide.
+
+UPDATE TRIGGERS
+Update `docs/DECISIONS.md` before ending a session or finalizing a change whenever you:
+- Introduce, swap, or retire a technology, framework, protocol, or design pattern.
+- Make a structural choice that constrains multiple modules or is costly to reverse.
+- Accept or reject a `Proposed` ADR.
+- Supersede or deprecate an existing ADR (update BOTH the new and old entries,
+  plus the summary index table).
+Draft entries before or alongside implementation—never leave decisions undocumented.
+
+INCLUSION / EXCLUSION CRITERIA
+INCLUDE:
+- Framework, library, or runtime adoption/removal.
+- Data storage, schema paradigm, caching, or state-management architecture.
+- Public API, IPC, or integration contracts and concurrency/deployment models.
+- Security, authentication, or boundary rules and non-obvious constraints.
+
+EXCLUDE:
+- Routine bug fixes, patch/minor version bumps, or dependency hygiene.
+- Local implementation details, variable naming, or behavior-preserving refactors.
+- Trivial config/lint tweaks, temporary workarounds, or unmade hypotheticals.
+
+STRUCTURE & FORMATTING
+- Single H1: Keep `# Architecture Decision Records` as the only H1 in the file
+  (per MADR / markdownlint MD025).
+- Summary Index Table: Maintain `| ADR | Decision |` under `## Entries`
+  in ascending numeric order. Every row must link to its section anchor
+  (`[NNN](#adr-nnn-kebab-case-title)`).
+- Numbering: Use 3-digit zero-padded IDs (`ADR-001`, `ADR-002`, ...; expand to
+  4 digits only past `999`). IDs are permanent; never reuse or renumber them.
+- Entry Heading: `## ADR-NNN: <Short Descriptive Title>` (H2 so file keeps one H1).
+- Required Metadata (immediately below the entry heading):
+    **Status**: Proposed | Accepted | Rejected | Deprecated | Superseded by ADR-NNN
+    **Date**: YYYY-MM-DD  (ISO 8601 date of creation or last status update)
+    **Deciders**: <@handles, team/role, or agent/session identifier>
+- Required Subsections (exact names and H3 level, in order):
+    ### Context
+    ### Decision
+    ### Consequences
+- Required Consequences Fields:
+    **Good**: <Positive outcomes.>
+    **Bad**: <Real trade-offs, costs, or limitations.>
+    **Mitigations**: <Guardrails or follow-up actions; omit ONLY if none apply.>
+- Never omit `### Context`, `### Decision`, `### Consequences`, `**Good**:`, or
+  `**Bad**:`. Keep entries in ascending numeric order (`ADR-001` .. `ADR-NNN`).
+
+QUALITY & STYLE RULES
+- Tense & Tone: Neutral, factual, concise (~15-25 lines per entry). Use past
+  tense for `Context` ("Faced..."), present/imperative for `Decision` ("Use...").
+- Honesty: Document genuine downsides in `**Bad**:`; no choice is cost-free.
+- Verifiability: Ground claims in concrete constraints, observed measurements,
+  or repo-relative paths and ADR IDs (`ADR-NNN`). Avoid vague adjectives
+  ("faster", "cleaner", "better") without specifics.
+- Cross-Links: Reference related decisions inline as `ADR-NNN` (e.g., `see ADR-002`).
+
+LIFECYCLE & WORKFLOW
+- Add: Append the new entry at the end of the file with the next `ADR-NNN` and
+  add its matching row to the summary index table.
+- Promote / Reject: Transition `**Status**` (`Proposed` -> `Accepted` or
+  `Rejected`) and update `**Date**`. Keep `Rejected` entries so dead ends are
+  not retried.
+- Clarify: Only typo or wording fixes that preserve meaning are allowed on an
+  `Accepted` entry. Never silently change the substance of an `Accepted` ADR.
+- Supersede / Deprecate (Preserve History): Never delete old entries. To replace
+  an `Accepted` decision, append a new `ADR-MMM` citing `ADR-NNN`, then update
+  the old entry's `**Status**` to `Superseded by ADR-MMM` (or `Deprecated` if
+  retired without replacement) and update its `**Date**`.
+
+ANTI-PATTERNS
+- Editing an `Accepted` ADR to say the opposite instead of writing a new ADR.
+- Deleting `Deprecated`, `Rejected`, or `Superseded` entries, or renumbering IDs.
+- Adding extra H1 (`#`) headings, skipping metadata fields, or forgetting to
+  update the top summary index table / anchor links.
+- Writing `**Bad**: None.` or omitting trade-offs.
+- Recording implementation steps, file diffs, or routine bug fixes as ADRs.
+
+EXAMPLE LAYOUT (4-SPACE INDENTED)
+
+    ## Entries
+
+    | ADR | Decision |
+    |---|---|
+    | [001](#adr-001-short-descriptive-title) | Short descriptive title |
+
+    ---
+
+    ## ADR-001: Short Descriptive Title
+
+    **Status**: Accepted
+    **Date**: YYYY-MM-DD
+    **Deciders**: @handle, Core Team
+
+    ### Context
+
+    <2-4 sentences describing the problem, technical constraints, and forces
+    requiring a decision. Cite affected components or prior ADRs if relevant.>
+
+    ### Decision
+
+    <1-3 sentences stating the exact choice made and any firm boundaries.>
+
+    ### Consequences
+
+    **Good**: <Concrete benefits and enabled capabilities.>
+
+    **Bad**: <Accepted costs, complexity, or limitations.>
+
+    **Mitigations**: <Steps or controls reducing the bad consequences.>
+
+-->
+
+---
+
+## Entries
 
 | ADR | Decision |
 |---|---|
@@ -31,7 +143,6 @@ looks unusual — most of it is a deliberate decision recorded here.
 | [014](#adr-014-per-workspace-sidecar-writer--read-only-mcp-sessions) | Per-workspace sidecar writer + read-only MCP sessions |
 | [015](#adr-015-harness-entries-are-global-only-no-per-project-data) | Harness entries are global-only, no per-project data |
 
----
 
 ## ADR-001: Index on save, not git-committed state
 

@@ -1,7 +1,69 @@
 # Notes
 
-Gotchas, oddities and findings that are not open issues ([`ISSUES.md`](ISSUES.md)). 
-Read this before a live-model session — the provider and harness quirks below cost real time to rediscover.
+Gotchas, oddities, and verified findings that are not open issues (`ISSUES.md`).
+Read this before a live or coding session — the quirks below cost real time to rediscover.
+
+<!--
+NOTES.md MAINTENANCE GUIDE (FOR AGENTS & CONTRIBUTORS)
+
+PURPOSE & SCOPE
+- Audience: Future LLM agents and developers before coding, debugging, or running live sessions.
+- Is: A dense operational reference of verified gotchas, non-obvious invariants, environment/tooling quirks, and fragile coupling that cost real time to rediscover.
+- Is NOT: An issue tracker (`ISSUES.md`), architecture log (ADRs), changelog, TODO list, or general API tutorial.
+
+UPDATE TRIGGERS
+Update this file at the end of a session (or immediately during work) whenever you:
+- Discover and verify a non-obvious failure mode, race, timeout, platform quirk, or workaround.
+- Change a default, path, config key, ordering invariant, or constraint already documented here.
+- Fix a bug whose regression prevention relies on preserving a hidden constraint (cite `(ISS-N, fixed YYYY-MM-DD)`).
+- Retire a component, flag, or workaround, making its existing note obsolete.
+
+INCLUSION / EXCLUSION CRITERIA
+- Include:
+  * Silent failure modes and ordering invariants ("must run X before Y because Z silently breaks").
+  * Host/OS/tool/SDK version quirks, port/path/permissions traps, and test-harness constraints.
+  * Intentional design traps where the "obvious" refactor breaks a subtle contract.
+- Exclude:
+  * Open bugs, unverified theories, or unresolved regressions (file in `ISSUES.md` instead).
+  * Routine feature summaries, git-history narration, or facts obvious from reading one short function.
+  * Speculative advice not directly observed in code, logs, or test runs.
+
+STRUCTURE & FORMATTING
+- Top-level structure: Keep `# Notes` and the short preamble visible; keep all entries under `## <component-or-area>` headings.
+- Headings: Use short, lowercase component/area names (no `###` subheadings; omit empty `##` sections).
+- Numbering/IDs: Do NOT assign numeric IDs (no `NOTE-01`). Use unnumbered `- ` bullets under each `##` heading.
+- Sub-items: Keep bullets flat. Use indented numbered items (`  1. `) only for 2-4 tightly coupled consequences of a single root cause.
+- Bullet anatomy:
+  `- **<Bold lead-in rule or quirk>** [(YYYY-MM-DD[, ref])]: <mechanism, what breaks if violated, exact symbol/path/workaround>.`
+- Dates & versions: Use ISO `YYYY-MM-DD` for time-sensitive observations or fixes; pin exact versions when version-specific (e.g., `SDK 2.x`).
+- Cross-links: Put symbols, files, keys, and env vars in inline backticks; reference `(ISS-N, fixed YYYY-MM-DD)` or `(ADR-NNN)` inline when relevant.
+
+QUALITY & STYLE RULES
+- Tone & tense: Terse, factual, imperative or present tense for active invariants; past tense only for the observed failure/repro.
+- Brevity: Target 1-4 sentences (one paragraph) per bullet.
+- Evidence required: State concrete thresholds, paths, error behaviors, and symbols rather than vague adjectives ("slow", "broken"). Always pair a prohibition ("never do X") with its failure mode and the safe alternative.
+
+LIFECYCLE & WORKFLOW
+- Add: Append a new bullet under the most specific existing `## <component-or-area>` (or create a new `##` section). Merge closely related facts into one bullet instead of fragmenting.
+- Edit in place: When behavior, defaults, or paths change, rewrite the existing bullet in place and update its date. Never append a second bullet that contradicts an older one.
+- Promote/Migrate: Move unresolved defects to `ISSUES.md`. If an architectural choice gets an ADR, link `(ADR-NNN)` and keep only the operational footgun here.
+- Retire: Delete bullets when the underlying component or quirk is removed, unless residual disk/state cleanup remains relevant (narrow the note to that residue).
+
+ANTI-PATTERNS
+- Dumping raw terminal logs, multi-paragraph essays, or fenced code blocks into bullets.
+- Recording unverified guesses, open bugs, or personal workspace state irrelevant to other sessions.
+- Writing "Do not change X" without explaining *what breaks* and *what to do instead*.
+- Leaving stale bullets intact after refactoring, or leaving empty `##` sections behind.
+
+EXAMPLE LAYOUT (4-SPACE INDENTED)
+
+    ## worker-runtime
+
+    - **Flush queue state before releasing the process lock** (`runtime.stop`, 2026-05-14): `clear_dirty_flags` is unscoped; releasing the lock first lets a newly spawned worker lose dirty state written concurrently. Always join background threads and flush while the lock is held.
+    - **Loopback probes must target `127.0.0.1`, not `localhost`** (ISS-12, fixed 2026-06-02): On dual-stack hosts where the service binds IPv4 only, `localhost` stalls on IPv6 connect timeouts (~1 s per request). Pass URLs through `net.ipv4_loopback` before calling the HTTP client.
+-->
+
+---
 
 ## simple-code-indexer
 - **Workspace walks must prune ignored dirs (`os.walk` + `dirnames[:]`), never `Path.rglob("*")`** — rglob descends into `.venv` (tens of thousands of files) over the Docker Desktop bind mount, which made the startup reconcile take so long that the phase-2 probe timed out with only 6 files indexed. `indexer.iter_workspace_files` prunes; keep it that way if refactoring.
