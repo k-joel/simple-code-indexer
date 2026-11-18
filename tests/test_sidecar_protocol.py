@@ -42,6 +42,7 @@ def test_state_paths_live_in_the_workspace_run_directory(tmp_path: Path) -> None
     assert state.ready == expected / paths.READY_FILENAME
     assert state.token == expected / paths.TOKEN_FILENAME
     assert state.spawn_lock == expected / paths.SPAWN_LOCK_FILENAME
+    assert state.spawn_claim == expected / paths.SPAWN_CLAIM_FILENAME
 
 
 def test_endpoint_is_stable_and_workspace_specific(tmp_path: Path) -> None:
@@ -73,6 +74,20 @@ def test_token_round_trip_and_clear(tmp_path: Path) -> None:
     assert paths.read_token(settings) == "secret"
     paths.clear_token(settings)
     assert paths.read_token(settings) is None
+
+
+def test_spawn_claim_round_trip_and_clear(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    assert paths.read_spawn_claim(settings) is None
+
+    paths.write_spawn_claim(settings, pid=12345)
+    claim = paths.read_spawn_claim(settings)
+    assert claim is not None
+    assert claim["pid"] == 12345
+    assert isinstance(claim["at"], float)
+
+    paths.clear_spawn_claim(settings)
+    assert paths.read_spawn_claim(settings) is None
 
 
 def _hello(settings: Settings, **overrides: Any) -> dict[str, Any]:

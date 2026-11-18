@@ -31,9 +31,9 @@ STRUCTURE & FORMATTING
 - Top-level sections: `# Issues`, short preamble, this guide, then `## Open`.
 - Always keep `## Open` present, even when empty (leave no entries beneath it).
   Never create a `## Closed` or `## Resolved` section.
-- ID scheme: `ISS-<n>` using the next free positive integer (`max open n + 1`,
+- ID scheme: `ISS-NNN` using the next free positive integer (`max open n + 1`,
   or `1` if none exist). Never reuse an ID referenced in open work.
-- Entry order: Ascending `ISS-<n>` under `## Open`.
+- Entry order: Ascending `ISS-NNN` under `## Open`.
 - Required fields per entry (exact order, four bullets):
   - `Symptom`: Observable error, failing command, or broken behavior.
   - `Where flagged`: `YYYY-MM-DD, <session or task context>`.
@@ -51,11 +51,11 @@ QUALITY & STYLE RULES
 
 LIFECYCLE & WORKFLOW
 - Read first: Check existing `## Open` entries to avoid duplicates and compute
-  the next `ISS-<n>`.
-- Reference & link: Refer to entries by `ISS-<n>` in commits or PRs (do not
+  the next `ISS-NNN`.
+- Reference & link: Refer to entries by `ISS-NNN` in commits or PRs (do not
   use GitHub `#<n>` syntax).
 - Close by deleting: Local-markdown entries do NOT auto-close on PR merge.
-  Delete the entire `### ISS-<n>` heading and its bullets once fixed (either
+  Delete the entire `### ISS-NNN` heading and its bullets once fixed (either
   in the fixing commit/PR or manually afterward).
 - Verify: Re-read the diff after editing to confirm schema compliance and
   that no unrelated lines changed.
@@ -71,7 +71,7 @@ ANTI-PATTERNS
 EXAMPLE LAYOUT (4-SPACE INDENTED)
     ## Open
 
-    ### ISS-<n>: <short, specific summary>
+    ### ISS-NNN: <short, specific summary>
 
     - **Symptom**: `<command or action>` fails with `<brief observed error>`.
     - **Where flagged**: YYYY-MM-DD, <task or check where discovered>.
@@ -84,7 +84,7 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ## Open
 
-### ISS-13: Most catalog languages produce no symbols
+### ISS-013: Most catalog languages produce no symbols
 
 - **Symptom**: `symbol_lookup` never resolves a name in most newly indexable languages (Zig, Nim,
   Svelte, Vue, Terraform, Nix, V, Odin, Gleam, and others); the file is searchable but contributes
@@ -96,17 +96,4 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 - **Suggested fix**: add `SYMBOL_NODES` entries to the generator for languages users report, keeping
   `catalog.VERSION` unchanged (no index migration needed). Verify each node type against the real
   grammar before committing.
-
-### ISS-14: Concurrent first readers can spawn two sidecar daemons
-
-- **Symptom**: `tests/test_sidecar_daemon.py::test_concurrent_readers_share_one_daemon` intermittently
-  fails with `assert 2 == 3`; the captured log shows two `spawned sidecar writer pid=...` lines for
-  one workspace, and the losing session is dropped and later re-registered.
-- **Where flagged**: 2026-11-17, during the catalog consolidation (ADR-016); the sidecar code was not
-  part of that change, and the test passes in isolation.
-- **Cause**: `src/simple_code_indexer/sidecar/client.py:261` takes `spawn.lock`, but two readers that
-  both find no ready file can still both reach `_spawn_daemon` at `:275` — the ready-file check and
-  the spawn are not atomic under the same lock hold.
-- **Suggested fix**: re-read the ready file while still holding the spawn lock and skip the spawn when
-  a live pid is published; then re-run the test repeatedly (not just once) to confirm.
 

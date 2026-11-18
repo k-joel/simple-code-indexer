@@ -323,9 +323,12 @@ sidecar daemon — writer role (one per workspace, detached)
 
 Every harness still spawns its own MCP server, but only the daemon writes. The
 first reader that cannot reach a daemon spawns one under
-`<index dir>/run/daemon.spawn.lock`; the daemon takes the writer lease **before**
-publishing `<index dir>/run/daemon.json`, so a discovered endpoint always points
-at a live writer. The control channel is stdlib `multiprocessing.connection`
+`<index dir>/run/daemon.spawn.lock`, then publishes
+`<index dir>/run/daemon.spawn.json` with the child pid before releasing the lock;
+peers that see a live claim wait for that daemon instead of spawning a duplicate.
+The daemon takes the writer lease **before** publishing
+`<index dir>/run/daemon.json`, so a discovered endpoint always points at a live
+writer. The control channel is stdlib `multiprocessing.connection`
 (Windows named pipe or POSIX AF_UNIX) with the token in `daemon.token` as the
 `authkey`; message bodies are JSON text, never pickle.
 
@@ -690,6 +693,7 @@ Per workspace (gitignore `.simple-ci/`):
     daemon.json                # published endpoint + pid (protocol versioned)
     daemon.token               # control-channel auth token (0600)
     daemon.spawn.lock          # serializes first daemon spawns
+    daemon.spawn.json          # in-flight spawn claim (child pid + timestamp)
   log/
     embed.log                  # mode: embedded
     writer.log                 # sidecar daemon
@@ -969,7 +973,7 @@ so a killed writer never leaves a stale lock (only the file).
 ### 7.10 `sidecar/`
 
 - `paths.py` — protocol version, `<index dir>/run/` discovery files, atomic
-  `daemon.json` write, 0600 token, deterministic endpoint:
+  `daemon.json` and `daemon.spawn.json` writes, 0600 token, deterministic endpoint:
   `\\.\pipe\simple-code-indexer-<hash>` on Windows; a per-user runtime directory
   with `<hash>.sock` on POSIX.
 - `protocol.py` — message types `hello`, `welcome`, `register`, `registered`,

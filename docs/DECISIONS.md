@@ -358,7 +358,9 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   path was already read-only (WAL + `mode=ro`); only startup insisted on being the writer.
 - **Decision:** Topology B. Every harness still spawns its own MCP server, but that server is a **reader**
   by default (`mode: sidecar`). The first reader that cannot reach a daemon spawns one detached under
-  `daemon.spawn.lock`; the daemon acquires the writer lease *before* publishing `daemon.json` and owns the
+  `daemon.spawn.lock` and publishes a `daemon.spawn.json` claim with the child pid before releasing the
+  lock, so concurrent readers wait for that daemon instead of racing a duplicate; the daemon acquires the
+  writer lease *before* publishing `daemon.json` and owns the
   watcher, writer thread, sweep timer, managed services, SQLite, FAISS file, Qdrant collection, and
   heartbeat. One process hosts at most one runtime — no multi-workspace daemon. The control channel is
   stdlib `multiprocessing.connection` (Windows named pipe / POSIX AF_UNIX) with the token as `authkey` and

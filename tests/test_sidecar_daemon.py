@@ -6,9 +6,11 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -207,6 +209,18 @@ def test_concurrent_readers_share_one_daemon(
     _env(monkeypatch, tmp_path, grace=30.0)
     settings = _settings(tmp_path, idle_grace_s=30.0)
     sessions: list[ReaderSession] = []
+    spawned: list[int] = []
+    spawned_lock = threading.Lock()
+    original_spawn = ReaderSession._spawn_daemon
+
+    def counting_spawn(session: ReaderSession) -> subprocess.Popen[Any] | None:
+        process = original_spawn(session)
+        if process is not None:
+            with spawned_lock:
+                spawned.append(process.pid)
+        return process
+
+    monkeypatch.setattr(ReaderSession, "_spawn_daemon", counting_spawn)
 
     def start_one() -> ReaderSession:
         return _start(settings)
@@ -214,6 +228,7 @@ def test_concurrent_readers_share_one_daemon(
     try:
         with ThreadPoolExecutor(max_workers=3) as pool:
             sessions = list(pool.map(lambda _: start_one(), range(3)))
+        assert len(spawned) == 1, f"readers spawned duplicate daemons: {spawned}"
         writer_pids = {_writer_pid(session) for session in sessions}
         assert len(writer_pids) == 1
         status = sessions[0].status(5.0)

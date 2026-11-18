@@ -24,6 +24,7 @@ RECONNECT_INTERVAL_S = 5.0
 REQUEST_TIMEOUT_S = 3.0
 _SPAWN_COOLDOWN_S = 2.0
 _MAX_SPAWN_COOLDOWN_S = 30.0
+_SPAWN_CLAIM_MAX_AGE_S = 600.0
 
 # Windows process creation flags; harmless constants on other platforms.
 _CREATE_NO_WINDOW = 0x08000000
@@ -270,13 +271,41 @@ class ReaderSession:
             ready = paths.read_ready(self.settings)
             if ready is not None and self._pid_alive(ready["pid"]):
                 return
+            if self._spawn_in_flight():
+                return
             self._last_spawn_at = now
             self._spawn_attempts += 1
-            self._spawn_daemon()
+            process = self._spawn_daemon()
+            if process is not None:
+                try:
+                    paths.write_spawn_claim(self.settings, pid=process.pid)
+                except OSError:
+                    logger.warning(
+                        "cannot record the sidecar spawn claim", exc_info=True
+                    )
         finally:
             lock.release()
 
-    def _spawn_daemon(self) -> None:
+    def _spawn_in_flight(self) -> bool:
+        """True while a daemon spawned by another reader may still be starting.
+
+        The ready file is only published after the daemon has taken the writer
+        lease and opened its listener, so a peer that merely checks for it can
+        still spawn a duplicate during startup. The spawn claim closes that
+        window: it is written under the spawn lock before it is released.
+        """
+        claim = paths.read_spawn_claim(self.settings)
+        if claim is None:
+            return False
+        if time.time() - claim["at"] > _SPAWN_CLAIM_MAX_AGE_S:
+            paths.clear_spawn_claim(self.settings)
+            return False
+        if self._pid_alive(claim["pid"]):
+            return True
+        paths.clear_spawn_claim(self.settings)
+        return False
+
+    def _spawn_daemon(self) -> subprocess.Popen[Any] | None:
         root = self.settings.workspace_root.resolve()
         env = dict(os.environ)
         env["WORKSPACE_ROOT"] = str(root)
@@ -316,12 +345,13 @@ class ReaderSession:
                 )
         except OSError:
             logger.warning("cannot spawn the sidecar writer", exc_info=True)
-            return
+            return None
         self._children.append(process)
         threading.Thread(
             target=process.wait, name="sidecar-child-reaper", daemon=True
         ).start()
         logger.info("spawned sidecar writer pid=%d for %s", process.pid, root)
+        return process
 
     def _harness_metadata(self) -> tuple[int | None, str | None]:
         try:

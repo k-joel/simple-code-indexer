@@ -335,6 +335,11 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   from `DIR` instead of the workspace, so `--reset` can no longer delete the collection a live
   MCP server is using. Each `bench_matrix.py` run already has its own scratch folder, so it
   also gets its own collection.
+- Concurrent readers can no longer spawn duplicate sidecar daemons. The reader that wins
+  `daemon.spawn.lock` publishes `daemon.spawn.json` with the child pid before releasing it, so
+  peers wait for that daemon instead of launching a second one; stale claims (dead pid or older
+  than 10 minutes) are ignored. A duplicate spawned just before a forced stop could previously
+  win the freed writer lease and outlive the cleanup that killed the published daemon.
 
 ### Removed
 
