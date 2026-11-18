@@ -17,7 +17,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from simple_code_indexer import configfile, model_prompts
+from simple_code_indexer import configfile, model_prompts, sqlite_vec_store
 from simple_code_indexer.errors import ConfigError
 from simple_code_indexer.harnesses import HarnessSpec, load_harnesses
 from simple_code_indexer.setup_wizard import (
@@ -858,6 +858,7 @@ class Wizard:
     def _vector_store_from_raw(self, raw: dict[str, Any]) -> str:
         configured = raw.get("vector_store")
         if isinstance(configured, str) and configured.strip().lower() in {
+            "sqlite-vec",
             "faiss",
             "qdrant",
         }:
@@ -865,7 +866,7 @@ class Wizard:
         qdrant = raw.get("qdrant")
         if isinstance(qdrant, dict) and qdrant:
             return "qdrant"
-        return "faiss"
+        return "sqlite-vec"
 
     def _existing_vector_store(self) -> str:
         paths = (
@@ -874,27 +875,40 @@ class Wizard:
             else configfile.config_paths(self.cwd, self.home)
         )
         if not paths:
-            return "faiss"
+            return "sqlite-vec"
         try:
             raw = configfile.load_layered_config(paths)
         except ConfigError:
-            return "faiss"
+            return "sqlite-vec"
         return self._vector_store_from_raw(raw)
 
     def _step_vector_store(self) -> str:
         if self.vector_store is not None:
             return self.vector_store
+        ok, detail = sqlite_vec_store.available()
+        if not ok:
+            self.prompts.say(f"sqlite-vec is unavailable here: {detail}")
         labels = [
-            "FAISS (recommended) — local file, no Docker",
+            "sqlite-vec (recommended) — vectors inside index.db, no Docker"
+            if ok
+            else "sqlite-vec — unavailable on this Python",
+            "FAISS — separate local index file, no Docker",
             "Qdrant — Docker container or existing server",
         ]
-        default = 0 if self._existing_vector_store() == "faiss" else 1
+        order = ["sqlite-vec", "faiss", "qdrant"]
+        existing = self._existing_vector_store()
+        default = order.index(existing) if existing in order else 0
+        if not ok and default == 0:
+            default = 1
         choice = self._ask_choice(
             "Which vector store should back semantic search?",
             labels,
             default=default,
         )
-        return "qdrant" if choice == 1 else "faiss"
+        if choice == 0 and not ok:
+            self.prompts.say("Falling back to FAISS because sqlite-vec cannot load.")
+            return "faiss"
+        return order[choice]
 
     def _step_qdrant(self) -> dict[str, Any]:
         if not self._docker_ready():
@@ -1537,7 +1551,7 @@ def run(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--vector-store",
-        choices=["faiss", "qdrant"],
+        choices=["sqlite-vec", "faiss", "qdrant"],
         default=None,
         help="force the semantic backend",
     )

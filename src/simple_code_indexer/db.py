@@ -427,6 +427,8 @@ _QDRANT_URL_KEY = "qdrant_url"
 _BACKEND_KEY = "vector_backend"
 _FAISS_PATH_KEY = "faiss_path"
 _FAISS_DIM_KEY = "faiss_dim"
+_SQLITE_VEC_STORE_KEY = "sqlite_vec_store"
+_SQLITE_VEC_DIM_KEY = "sqlite_vec_dim"
 _LABEL_SEQ_KEY = "vector_label_seq"
 
 # Writer liveness, updated by the writer runtime and read by readers without an RPC.
@@ -437,6 +439,7 @@ WRITER_STARTED_AT_KEY = "writer_started_at"
 _IDENTITY_KEYS = {
     "qdrant": (_QDRANT_URL_KEY, _COLLECTION_KEY),
     "faiss": (_FAISS_PATH_KEY, _FAISS_DIM_KEY),
+    "sqlite-vec": (_SQLITE_VEC_STORE_KEY, _SQLITE_VEC_DIM_KEY),
 }
 
 _SQL_BATCH = 500
@@ -462,11 +465,13 @@ def ensure_index_identity(
 ) -> bool:
     """Bind the index to one vector store; drop rows whose vectors are gone.
 
-    `identity` is (url, collection) for Qdrant and (path, dim) for FAISS. Rows
-    indexed against another store have no vectors where the next write lands,
-    and the hash/mtime short circuits would never re-embed them, so they must
-    go. A DB written before `vector_backend` existed was Qdrant-bound when the
-    Qdrant keys are present, so an existing Qdrant install survives the upgrade.
+    `identity` is (url, collection) for Qdrant, (path, dim) for FAISS and
+    ("sqlite-vec", dim) for sqlite-vec — whose vectors live in this very
+    database, so the binding deliberately ignores the file path. Rows indexed
+    against another store have no vectors where the next write lands, and the
+    hash/mtime short circuits would never re-embed them, so they must go. A DB
+    written before `vector_backend` existed was Qdrant-bound when the Qdrant keys
+    are present, so an existing Qdrant install survives the upgrade.
     Returns True when the index was invalidated — an earlier binding existed,
     or rows were present.
     """
@@ -631,6 +636,24 @@ def flag_chunks_for_reembed(conn: sqlite3.Connection) -> int:
     covered = int(row[0])
     logger.debug("flagged %d chunk(s) for re-embedding", covered)
     return covered
+
+
+def invalidate_embeddings(conn: sqlite3.Connection) -> int:
+    """Mark every embedded chunk missing so the next sweep re-embeds it.
+
+    Used when a backend loses its vectors without losing the chunks — a
+    sqlite-vec table rebuilt for a new dimension or chunk size. Returns the
+    number of rows whose status changed.
+    """
+    cursor = conn.execute(
+        """
+        UPDATE embedding_state SET status = 'missing', updated_at = datetime('now')
+        WHERE status = 'ok'
+        """
+    )
+    changed = int(cursor.rowcount)
+    logger.debug("invalidated %d embedding(s)", changed)
+    return changed
 
 
 class ChunkSpan(NamedTuple):

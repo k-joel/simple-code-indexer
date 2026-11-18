@@ -121,6 +121,17 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ### Added
 
+- **sqlite-vec is the new default vector store** (ADR-017). Vectors live in a `vec_chunks`
+  table inside the existing `index.db`, so a file update and its vectors commit in one
+  transaction and there is no second file to keep in sync. `vector_store: faiss` and
+  `vector_store: qdrant` remain selectable; FAISS stays fully supported as the second option.
+- `sqlite_vec.chunk_size` (default `64`), `sqlite_vec.mmap_size` (default `1 GiB`), and
+  `sqlite_vec.cache_size` (default `-256 MiB`), overridable with `SQLITE_VEC_CHUNK_SIZE`,
+  `SQLITE_VEC_MMAP_SIZE`, and `SQLITE_VEC_CACHE_SIZE`.
+- The setup wizard offers sqlite-vec first, FAISS second, and Qdrant third, and probes whether
+  the interpreter can load the extension before selecting it (`--vector-store sqlite-vec`).
+- `get_status.vector_index` reports `<index.db>#vec_chunks` for the default backend;
+  `vector_index_age_s` is derived from the newest successful embedding.
 - Language coverage goes from 36 to 322 indexable languages (ADR-016). Every language in
   `tree-sitter-language-pack` is declared in one generated table,
   `src/simple_code_indexer/languages/catalog.py`, which replaces the 38 `builtin/*.py` modules
@@ -139,6 +150,14 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ### Changed
 
+- **BREAKING:** the default `vector_store` is now `sqlite-vec`. A workspace whose config does
+  not set `vector_store` explicitly is rebound on first start, which invalidates the old index
+  and re-embeds it once (vectors are never migrated). Configs that say `vector_store: faiss` or
+  `vector_store: qdrant` keep their backend. Delete a stale `.simple-ci/vectors.faiss` after
+  switching away from FAISS.
+- `vector_store.py` is now a backend registry instead of a branch-per-function router; every
+  backend module implements the same `STORE_CONTRACT`, so `get_status`, search, and indexing
+  behaviour is identical across backends.
 - Language ids are now the tree-sitter grammar names: `c_sharp` → `csharp`, `.tsx` → `tsx`,
   `.zsh` → `zsh`, `.fish` → `fish`. `catalog.VERSION` drives a targeted startup reconcile that
   drops rows whose stored language changed or whose path is no longer allowed, and the sweep
@@ -159,6 +178,10 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ### Fixed
 
+- Shutdown no longer leaves the `service-probe` thread running. The writer runtime owns the
+  thread, signals it through the shared stop event, and joins it; `embed_texts` aborts its
+  retries and backoff on that signal, so probe requests and log records cannot outlive the
+  runtime.
 - Data formats can no longer reach the index. `catalog.DATA_FORMATS` entries are not registered,
   so detection returns `None` for `.md`, `.txt`, `.json`, `.yaml`, `.toml`, `.xml`, `.csv`,
   `.ini`, `.rst`, and the rest. `.txt` matters most: it maps to `vimdoc`, so a registered `.txt`

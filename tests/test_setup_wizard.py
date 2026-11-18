@@ -237,7 +237,7 @@ def test_existing_endpoint_writes_one_global_config(
     tmp_path: Path, monkeypatch
 ) -> None:
     prompts = ScriptedPrompter(
-        choices=[2, 1, 1],
+        choices=[2, 2, 1],
         texts=[EMBED_URL, "", "my-model", QDRANT_URL],
     )
     wizard, project, home = _wizard(tmp_path, prompts=prompts)
@@ -285,7 +285,7 @@ def test_auto_download_writes_compose_and_services(tmp_path: Path, monkeypatch) 
         "download_model",
         lambda url, destination, **kwargs: downloaded.append((url, destination)),
     )
-    prompts = ScriptedPrompter(choices=[1, 1, 1, 0])
+    prompts = ScriptedPrompter(choices=[1, 1, 2, 0])
     runner = _docker_runner()
     wizard, project, home = _wizard(tmp_path, prompts=prompts, runner=runner)
 
@@ -401,7 +401,7 @@ def test_auto_download_gemma_on_nvidia_writes_prompts_and_devices(
     assert document["embedding"]["query_prefix"] == model_prompts.GEMMA_CODE_QUERY
     assert document["embedding"]["document_prefix"] == model_prompts.GEMMA_CODE_DOCUMENT
     assert document["setup"]["gpu"] == "nvidia"
-    assert document["vector_store"] == "faiss"
+    assert document["vector_store"] == "sqlite-vec"
 
 
 def test_nvidia_init_runs_when_the_runtime_is_missing(
@@ -488,7 +488,7 @@ def test_nvidia_init_failure_falls_back_to_cpu(tmp_path: Path, monkeypatch) -> N
 
 
 def test_existing_stopped_container_is_started(tmp_path: Path) -> None:
-    prompts = ScriptedPrompter(choices=[0, 0, 1, 1], texts=[QDRANT_URL])
+    prompts = ScriptedPrompter(choices=[0, 0, 2, 1], texts=[QDRANT_URL])
     runner = _docker_runner(
         containers=(
             "embed-box\tghcr.io/ggml-org/llama.cpp:server\t"
@@ -649,7 +649,7 @@ def test_existing_global_setup_is_reused(tmp_path: Path, monkeypatch) -> None:
     assert document["embedding"]["dim"] == 768
     assert document["setup"]["model_key"] == "embeddinggemma2"
     assert document["embedding"]["service"]["compose_file"] == str(compose_file)
-    assert document["vector_store"] == "faiss"
+    assert document["vector_store"] == "sqlite-vec"
     assert not (project / ".simple-ci" / "config.yaml").exists()
 
 
@@ -1623,7 +1623,7 @@ def test_legacy_models_directory_is_migrated(tmp_path: Path) -> None:
 
 
 def test_faiss_branch_writes_no_qdrant_config(tmp_path: Path) -> None:
-    prompts = ScriptedPrompter(choices=[2, 0], texts=[EMBED_URL, "", "my-model"])
+    prompts = ScriptedPrompter(choices=[2, 1], texts=[EMBED_URL, "", "my-model"])
     runner = _docker_runner()
     wizard, _project, home = _wizard(tmp_path, prompts=prompts, runner=runner)
 
@@ -1636,7 +1636,7 @@ def test_faiss_branch_writes_no_qdrant_config(tmp_path: Path) -> None:
 
 
 def test_run_leaves_the_workspace_untouched(tmp_path: Path) -> None:
-    prompts = ScriptedPrompter(choices=[2, 0], texts=[EMBED_URL, "", "my-model"])
+    prompts = ScriptedPrompter(choices=[2, 1], texts=[EMBED_URL, "", "my-model"])
     wizard, project, _home = _wizard(tmp_path, prompts=prompts)
 
     assert wizard.run() == 0

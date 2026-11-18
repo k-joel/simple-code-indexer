@@ -286,7 +286,7 @@ Architectural boundaries:
 | One workspace per process, taken from the process cwd (`WORKSPACE_ROOT` overrides) | Multi-repo registry, path sandbox, worktree identity |
 | Index-on-save from working-tree bytes | Git readiness, commit gating, provenance |
 | SQLite + FTS5 lexical index | Staged generations, quarantine trees |
-| Direct chunk embeddings; FAISS default, Qdrant opt-in | LLM chunk summaries before embedding |
+| Direct chunk embeddings; sqlite-vec default, FAISS and Qdrant opt-in | LLM chunk summaries before embedding |
 | Three MCP tools: `search_code`, `symbol_lookup`, `get_status` | Admin/enterprise gateway, auth service, metrics stack |
 | One writer per workspace; readers are read-only | Multi-writer coordination |
 
@@ -307,7 +307,7 @@ harness process(es)
   ▼
 MCP server — reader role
   ├─ tool handlers: search_code | symbol_lookup | get_status
-  │    read-only SQLite (mode=ro), read-only FAISS search, read-only Qdrant search
+  │    read-only SQLite (mode=ro), read-only sqlite-vec/FAISS/Qdrant search
   ├─ ReaderSession: attach/register/heartbeat/status over a local control channel
   └─ ParentWatchdog: exits when the harness process that owns the session dies
 
@@ -397,9 +397,11 @@ The writer queue also carries a sweep sentinel and tombstones:
 - `WorkItem(path, deleted=True)` → remove the path from SQLite and the vector store.
 - `SWEEP_REQUEST` → run a reconciliation sweep in the writer thread.
 
-When the queue drains, the writer flushes the FAISS index at most once per
-`FLUSH_DEBOUNCE_S` (30 s). A sweep flushes at its end regardless. Queued work
-left behind at shutdown is recovered by the next startup reconcile.
+When the queue drains, the writer flushes the vector store at most once per
+`FLUSH_DEBOUNCE_S` (30 s). For sqlite-vec and Qdrant that is a WAL checkpoint
+respectively a no-op; FAISS persists its in-memory index here. A sweep flushes at
+its end regardless. Queued work left behind at shutdown is recovered by the next
+startup reconcile.
 
 ### 3.1 Reconciliation backstops
 
@@ -466,9 +468,9 @@ ordered by path then line.
 | **File record** | workspace-relative POSIX `path` (unique) | language, size, sha256, mtime, indexed_at |
 | **Symbol** | (`file_id`, name, line) | kind, line_end, signature |
 | **Chunk** | (`file_id`, `chunk_index`) | start_line, end_line, content |
-| **Vector label** | monotonic integer in `vector_labels` | (`path`, `chunk_index`), dirty flag; never reused |
+| **Vector label** | monotonic integer in `vector_labels` | (`path`, `chunk_index`); never reused; `dirty` is FAISS-only |
 | **Qdrant point ID** | `uuid5(namespace, "path:chunk_index")` | payload `{path, chunk_index}` |
-| **Embedding state** | `chunk_id` | vector id (FAISS label or Qdrant point id), status `ok`/`error`/`missing`, updated_at |
+| **Embedding state** | `chunk_id` | vector id (label, or Qdrant point id), status `ok`/`error`/`missing`, updated_at |
 | **Writer** | process holding `<index_db>.lock` | embedded server or sidecar daemon |
 | **Reader** | MCP server process | session id, server pid, harness pid/name |
 | **Session lease** | session id | live control connection, last heartbeat, registered process |
@@ -577,20 +579,22 @@ lexical content aligned; the writer never manually deletes FTS rows.
 chunk existence. A chunk counts as embedded only when a row with `status='ok'`
 exists; absent, `error`, and `missing` all count as pending.
 
-`vector_labels` is FAISS-specific bookkeeping kept in SQLite: it maps the
-monotonic FAISS label to `(path, chunk_index)` and records whether the vector may
-not have been persisted yet (`dirty`). Labels are allocated from
+`vector_labels` is the stable label map kept in SQLite: it maps a monotonic
+integer label to `(path, chunk_index)` and records whether a FAISS vector may not
+have been persisted yet (`dirty`). Labels are allocated from
 `meta.vector_label_seq` and are **never reused**; recycling an id could attach an
-old vector left by a crash to a new chunk.
+old vector left by a crash to a new chunk. sqlite-vec uses the same label as its
+`vec_chunks.rowid`; Qdrant derives its own point ids and ignores the table.
 
 `meta` keys written by the current code:
 
 | Key | Meaning |
 |---|---|
-| `vector_backend` | `faiss` or `qdrant` |
+| `vector_backend` | `sqlite-vec`, `faiss` or `qdrant` |
 | `qdrant_url`, `qdrant_collection` | Qdrant binding |
 | `faiss_path`, `faiss_dim` | FAISS binding; `faiss_dim` is `<dim>:<fingerprint>` when a fingerprint exists |
-| `vector_label_seq` | highest FAISS label ever allocated |
+| `sqlite_vec_store`, `sqlite_vec_dim` | sqlite-vec binding; `sqlite_vec_store` is the constant `sqlite-vec`, the dim slot carries `<dim>:<fingerprint>` |
+| `vector_label_seq` | highest label ever allocated |
 | `writer_pid`, `writer_heartbeat`, `writer_started_at` | writer liveness for readers without a daemon RPC |
 
 `ensure_schema` also migrates the legacy `embedding_state.qdrant_point_id` column
@@ -602,6 +606,9 @@ to `vector_id` with a guarded `ALTER TABLE ... RENAME COLUMN`.
 
 - Qdrant identity: `(qdrant_url, qdrant_collection)`.
 - FAISS identity: `(faiss_path, "<dim>:<embed_fingerprint>")`.
+- sqlite-vec identity: `("sqlite-vec", "<dim>:<embed_fingerprint>")` — the path is
+  deliberately absent because the vectors live inside this same database, so
+  moving or renaming a workspace must not force a re-embed.
 
 If the binding differs from what `meta` records, every `files` row and every
 `vector_labels` row is deleted, so the startup reconcile re-indexes and
@@ -609,16 +616,50 @@ re-embeds the workspace. Vectors from another store are never migrated. A legacy
 database with Qdrant keys and no `vector_backend` is treated as Qdrant-bound.
 On a FAISS identity change the runtime also replaces `vectors.faiss` with an
 empty index immediately; otherwise the stale file could survive and collide with
-the restarted label sequence.
+the restarted label sequence. sqlite-vec drops and recreates `vec_chunks` on
+reset, and the router drops a leftover `vec_chunks` table whenever another
+backend becomes active.
 
 ### 6.2 Vector stores
 
-`vector_store.py` is the backend router. Call sites use
-`ensure_ready`, `upsert_chunks`, `delete_by_path`, `search`, `search_readonly`,
-`reconcile`, `flush`, `last_ok`, `describe`, and `identity`; FAISS modules are
-imported lazily so the Qdrant path never imports faiss/numpy.
+`vector_store.py` is a registry-backed router, not a branch table. Every backend
+module exposes the same module-level function set (`STORE_CONTRACT`):
 
-**FAISS (default)**
+`describe`, `identity`, `ensure_ready`, `reset`, `upsert_chunks`,
+`delete_by_path`, `search`, `search_readonly`, `reconcile`, `flush`, `last_ok`,
+`vector_index_age_s`.
+
+`_STORES` maps a backend name to a lazy module loader, so a sqlite-vec workspace
+never imports faiss or qdrant-client and vice versa. Adding a backend means one
+module plus one registry entry; `tests/test_vector_store.py` asserts every
+registered module still implements the whole contract. `vector_util.py` supplies
+the shared width validation and L2 normalisation, so both local stores accept the
+same vectors and report the same cosine score.
+
+**sqlite-vec (default)**
+
+- Storage: a `vec_chunks` virtual table inside `<index dir>/index.db`, created by
+  the store (never by `ensure_schema`), so a file update and its vectors commit in
+  one transaction.
+  `vec0(embedding float[<embed_dim>] distance_metric=cosine, chunk_size=<n>)`;
+  `rowid` is the `vector_labels.label`.
+- Vectors are L2-normalised on write and on query; sqlite-vec returns cosine
+  *distance*, so the score is `1 - distance` (same range as the other backends).
+- `upsert_chunks` allocates/reuses labels, deletes stale labels and their vec
+  rows, then updates each row (`INSERT OR REPLACE` does not exist on vec0 0.1.9,
+  so an update that changes nothing falls back to an insert) — all in one
+  transaction.
+- `chunk_size` and the dimension are fixed in the DDL: a mismatch drops and
+  recreates the table and marks every `ok` embedding `missing`, so the next sweep
+  re-embeds without re-parsing.
+- Query connections (writer and reader) load the extension and set
+  `PRAGMA mmap_size` / `PRAGMA cache_size`; read-only search opens `mode=ro` and
+  never creates the table — a missing table means "semantic index not ready".
+- `flush` is a `wal_checkpoint(PASSIVE)`; `reconcile` only heals a table that had
+  to be recreated; `vector_index_age_s` is the age of the newest `ok` embedding.
+- `identity` ignores the workspace path; see the invalidation notes above.
+
+**FAISS (second option)**
 
 - File: `<index dir>/vectors.faiss`; `faiss.path` / `FAISS_PATH` overrides.
 - Structure: `IndexIDMap2(IndexFlatIP(embed_dim))`.
@@ -638,7 +679,7 @@ imported lazily so the Qdrant path never imports faiss/numpy.
 - Memory and query cost scale with the number of vectors; `IndexFlatIP` is a
   linear scan, acceptable for the intended workspace sizes.
 
-**Qdrant (opt-in)**
+**Qdrant (third option)**
 
 - URL: `qdrant.url` / `QDRANT_URL`, default `http://localhost:6333`.
 - Collection: `qdrant.collection` / `QDRANT_COLLECTION`, otherwise derived as
@@ -686,7 +727,7 @@ Per workspace (gitignore `.simple-ci/`):
 
 ```
 <workspace>/.simple-ci/
-  index.db                     # SQLite (plus -wal/-shm)
+  index.db                     # SQLite (plus -wal/-shm); holds vec_chunks by default
   index.db.lock                # writer lease
   vectors.faiss                # FAISS backend only
   run/
@@ -724,7 +765,9 @@ Package: `src/simple_code_indexer/` (import `simple_code_indexer`).
 | `registry.py` | indexes the language catalog: detection, allowlists, grammar prefetch |
 | `embed.py` | OpenAI-compatible embeddings client: prompts, batching, retries, dimension checks |
 | `model_prompts.py` | documented query/document prefixes per supported model family |
-| `vector_store.py` | backend router and identity description |
+| `vector_store.py` | registry-backed backend router and identity description |
+| `vector_util.py` | shared vector width validation and L2 normalisation |
+| `sqlite_vec_store.py` | `vec_chunks` table lifecycle, transactional upsert/delete/search, read-only search |
 | `faiss_store.py` | FAISS index lifecycle, labels, dirty tracking, read-only search |
 | `qdrant_store.py` | collection lifecycle, upsert/delete/search, read-only validation |
 | `ignore.py` | layered workspace `.gitignore` resolution |
@@ -769,10 +812,13 @@ Precedence is **environment variable > global YAML value > default**. Discovery:
 
 | YAML key | Environment | Default |
 |---|---|---|
-| `vector_store` | `VECTOR_STORE` | `faiss` (`qdrant` when a non-empty `qdrant:` section exists and no key is set) |
+| `vector_store` | `VECTOR_STORE` | `sqlite-vec` (`qdrant` when a non-empty `qdrant:` section exists and no key is set) |
 | `qdrant.url` | `QDRANT_URL` | `http://localhost:6333` |
 | `qdrant.collection` | `QDRANT_COLLECTION` | derived per workspace |
 | `faiss.path` | `FAISS_PATH` | `<index dir>/vectors.faiss` |
+| `sqlite_vec.chunk_size` | `SQLITE_VEC_CHUNK_SIZE` | `64` |
+| `sqlite_vec.mmap_size` | `SQLITE_VEC_MMAP_SIZE` | `1073741824` (mapping limit, not preallocation) |
+| `sqlite_vec.cache_size` | `SQLITE_VEC_CACHE_SIZE` | `-262144` (KiB; negative means KiB) |
 | `embedding.base_url` | `EMBED_BASE_URL` | `http://localhost:8080` |
 | `embedding.model` | `EMBED_MODEL` | `Qwen3-Embedding-4B-Q6_K` |
 | `embedding.dim` | `EMBED_DIM` | `2560` |
@@ -868,7 +914,10 @@ Writes happen only in the writer role. Readers use `try_connect_readonly`.
 - Requests carry at most 16 inputs; at most two HTTP posts are in flight per
   process. A failed request is retried up to three total attempts with
   full-jitter exponential backoff capped at 2 s. Connect timeout is 1 s; the
-  overall timeout is `embedding.timeout_s`.
+  overall timeout is `embedding.timeout_s`. `embed_texts` accepts a keyword-only
+  `stop_event`: it aborts before each attempt and during the backoff wait,
+  raising `EmbedError` without touching `LAST_OK` (a cancelled request is not an
+  endpoint failure). Only the service probe passes one.
 - Loopback URLs are rewritten to `127.0.0.1` because Docker publishes IPv4 only
   while `localhost` may resolve to `::1` first.
 - `embed_documents` applies the document prompt with
@@ -881,17 +930,22 @@ Writes happen only in the writer role. Readers use `try_connect_readonly`.
   process-local: a fresh reader reports `false` until *that process* embeds a
   query.
 
-### 7.5 `vector_store.py`, `faiss_store.py`, `qdrant_store.py`
+### 7.5 `vector_store.py`, `sqlite_vec_store.py`, `faiss_store.py`, `qdrant_store.py`
 
 Covered in §6.2. Notable concurrency rules:
 
+- Every backend module owns its `identity`/`describe`/lifecycle functions; the
+  router only validates `vector_store` and dispatches through `_STORES`.
+- sqlite-vec needs no process lock for writes (SQLite serialises writers and
+  there is no in-process index state); a small lock covers the check-then-create
+  of `vec_chunks`. Reads open their own `mode=ro` connection and never create.
 - FAISS mutations hold one process lock covering the index and the
   `vector_labels` mapping; `flush` writes and clears dirty flags under the same
   lock.
 - Qdrant collection creation is serialized in-process and tolerant of losing a
   create race to another process.
-- `vector_store.identity` decides the binding stored in `meta`; `describe`
-  returns the FAISS file path or the Qdrant collection for status/logs.
+- `describe` returns the `<index.db>#vec_chunks` binding, the FAISS file path, or
+  the Qdrant collection for status/logs.
 
 ### 7.6 `ignore.py`
 
@@ -919,7 +973,7 @@ applied first and remains the fixed fallback.
 - `sweep` — re-embed pass, walk, `(mtime, size)` comparison, stale-path removal,
   vector deletion, flush, `LAST_SWEEP` / `LAST_SWEEP_STATS` / `SWEEP_GENERATION`.
 - `writer_loop` — consumes `WorkItem` / `SWEEP_REQUEST`, logs per-item failures,
-  and flushes an idle FAISS index at most once per 30 s.
+  and flushes the vector store at most once per 30 s while the queue is idle.
 - `note_watcher_event` / `watcher_activity` — the activity signal that resets
   sweep backoff. Only successfully queued work counts; ignored events do not.
 
@@ -949,22 +1003,27 @@ applied first and remains the fixed fallback.
    it.
 2. Ensure managed Docker services (fail-soft, bounded by their startup timeout).
 3. Start the grammar prefetch thread.
-4. `ensure_schema` and `ensure_index_identity`; on invalidation, reset the FAISS
-   file.
+4. `ensure_schema` and `ensure_index_identity`; on invalidation, `reset` the
+   active vector store (drops/recreates `vec_chunks`, writes an empty FAISS file,
+   or no-ops for Qdrant).
 5. `vector_store.ensure_ready` and `reconcile` (fail-soft).
-6. Start the service-probe thread.
+6. Start the service-probe thread (owned by the runtime, gated by its stop
+   event).
 7. Start `index-writer`, enqueue the startup `SWEEP_REQUEST`, start the watcher,
    start `sweep-timer`.
 8. Publish `meta.writer_pid` / `writer_heartbeat` / `writer_started_at` and start
    the heartbeat thread.
 
-`stop()` is idempotent and order-sensitive: stop the watcher, signal and join
-the sweep/heartbeat/writer threads, clear writer liveness, flush vectors and
-clear dirty flags **while the lease is still held**, log final stats, then
-release the lease last. The sidecar daemon also clears `daemon.json` and
-`daemon.token` before releasing, so a new daemon cannot publish files the old
-one then deletes. `clear_vector_dirty` is unscoped; releasing the lease first
-would let the old process clear the next writer's dirty flags.
+`stop()` is idempotent and order-sensitive: stop the watcher, signal the shared
+stop event (which also ends the probe's retry loop), join the
+probe/sweep/heartbeat/writer threads (the probe is bounded by
+`PROBE_JOIN_TIMEOUT_S`, the writer by `DRAIN_TIMEOUT_S`), clear writer liveness,
+flush vectors (and, for FAISS, clear dirty flags) **while the lease is still
+held**, log final stats, then release the lease last. The sidecar daemon also
+clears `daemon.json` and `daemon.token` before releasing, so a new daemon cannot
+publish files the old one then deletes. `clear_vector_dirty` is unscoped;
+releasing the lease first would let the old process clear the next writer's
+dirty flags.
 
 `workspace_lock.FileLock` uses `msvcrt.locking` on Windows and `fcntl.flock` on
 POSIX. The open handle is the lease: the OS releases it when the process exits,
@@ -1073,7 +1132,9 @@ The setup wizard:
 - resolves the embedding endpoint (existing container, existing URL, or a
   downloaded GGUF served by a generated compose file), probes the real
   dimension, and records model prompts;
-- chooses FAISS or Qdrant and optionally provisions services;
+- chooses sqlite-vec, FAISS, or Qdrant (sqlite-vec first, and it probes that the
+  interpreter can load the extension before offering it) and optionally
+  provisions services;
 - writes **one** global `~/.simple-ci/config.yaml`, merging a legacy local file
   and deleting it;
 - copies the working tree (including `.git` on first install) to the per-user
@@ -1182,9 +1243,9 @@ message.
   "sweep_seconds": 0,
   "ignored_dirs": 3,
   "ignored_files": 12,
-  "vector_store": "faiss",
+  "vector_store": "sqlite-vec",
   "vector_store_ok": true,
-  "vector_index": "d:/projects/my-app/.simple-ci/vectors.faiss",
+  "vector_index": "d:/projects/my-app/.simple-ci/index.db#vec_chunks",
   "embed_ok": true,
   "languages_loaded": 322,
   "languages_with_symbol_maps": 29,
@@ -1215,8 +1276,10 @@ message.
   `pending_embeddings` is `chunks_indexed - vectors_indexed`.
 - `vector_store_ok` can be true for an empty index; it does not imply vectors
   exist.
-- `vector_index` names the FAISS file or the derived Qdrant collection;
-  `vector_index_age_s` is its file mtime age for FAISS and `0`/null for Qdrant.
+- `vector_index` names the sqlite-vec table binding (`<index.db>#vec_chunks`),
+  the FAISS file, or the derived Qdrant collection; `vector_index_age_s` is the
+  age of the newest successful embedding for sqlite-vec, the file mtime age for
+  FAISS, and `0`/null for Qdrant.
 - `last_sweep` is the last completed sweep, not the config interval;
   `sweep_seconds` reports the configured interval (`0` = periodic sweeps off).
 - `ignored_dirs` / `ignored_files` are what the last sweep pruned via
@@ -1251,7 +1314,8 @@ at startup (`ConfigError`, `WorkspaceBusy` → exit).
   points. They never call `ensure_schema`, `flush`, `reset`, `reconcile`,
   `upsert_chunks`, or a delete path.
 - The writer queue decouples the observer callback from indexing.
-- FAISS mutations and dirty-flag updates share one lock.
+- sqlite-vec writes rely on SQLite's own writer serialisation; FAISS mutations
+  and dirty-flag updates share a process lock.
 - SQLite foreign-key cascades keep symbols, chunks, FTS rows, and embedding
   state aligned with `files`.
 - Finalization order (flush while the lease is held, release last) is
@@ -1298,7 +1362,7 @@ harness actually spawned.
 |---|---|---|
 | Language support | Generated table in `languages/catalog.py` | one `LanguageSpec` per language (`name` == `grammar`); `DATA_FORMATS` are never registered; hand-maintained overrides live in `tools/gen_language_catalog.py`; re-run the tool rather than editing the table |
 | Harness support | Drop-in module in `harnesses/` or workspace `harnesses/` | config paths, format, root key, optional entry/render/remove; global scope only in the wizard; user overrides builtin by `NAME` |
-| Vector backend | New module plus router functions in `vector_store.py` | must provide writer and read-only query paths, identity/describe, flush/reconcile semantics |
+| Vector backend | New module in `src/simple_code_indexer/` plus one `_STORES` entry in `vector_store.py` | must implement the whole `STORE_CONTRACT` (writer and read-only query paths, identity/describe, flush/reconcile/age); `tests/test_vector_store.py` enforces it |
 | Embedding model | Catalog entry plus `model_prompts.defaults_for_model` | dimension is probed, never trusted; document-prompt or chunker changes alter the vector identity |
 | Managed service | `service` block under `embedding` or `qdrant` | fail-soft; readiness waits bounded by `startup_timeout_s` |
 
@@ -1341,7 +1405,7 @@ files, and model downloads.
 
 | Layer | What it covers |
 |---|---|
-| Unit | `parse` symbols/chunks, `db` schema/FTS/short-circuit, `config` precedence, `ignore` matching, `embed` batching/retries, `faiss_store`/`qdrant_store` operations, `services`, `logging`, locks |
+| Unit | `parse` symbols/chunks, `db` schema/FTS/short-circuit, `config` precedence, `ignore` matching, `embed` batching/retries, `sqlite_vec_store`/`faiss_store`/`qdrant_store` operations, `services`, `logging`, locks |
 | Integration | `test_indexer` (tmp workspace, stubbed embeddings), `test_watcher` (real events), `test_runtime`, multi-workspace isolation (FAISS + embedding endpoint) |
 | Sidecar | protocol validation, lease registry, reader client, daemon lifecycle, MCP over a real daemon; tests kill spawned daemons by the pid in `daemon.json` in `finally` |
 | Stdio contract | `tests/mcp_client.py` is a reusable client with drained stderr and step deadlines; `mcp_probe.py` checks initialize/tools/list/tool shapes |
@@ -1350,7 +1414,8 @@ files, and model downloads.
 
 Probes spawn a real server, drain stderr on a thread, and bound the run with
 `PROBE_TIMEOUT` (default 180 s), so a stalled server fails instead of hanging.
-Benchmarks use `--local-path` to keep `index.db` and `vectors.faiss` out of the
+Benchmarks use `--local-path` to keep `index.db` (and therefore the default
+`vec_chunks` table) and `vectors.faiss` out of the
 live workspace, and derive a Qdrant collection from that path too.
 
 ### 12.3 Quality gates

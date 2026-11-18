@@ -7,8 +7,9 @@ Local-first MCP server that gives your AI coding agent hybrid lexical + semantic
 simple-code-indexer runs alongside your coding agent — Claude Code, VS Code, Cursor, Zed,
 OpenCode, Codex CLI, and [others](#supported-harnesses) — as a standard
 [MCP](https://modelcontextprotocol.io) server. A file watcher re-indexes every saved file into
-**SQLite/FTS5** (keyword search) and **FAISS** (semantic search; [Qdrant](https://qdrant.tech)
-optional), so results stay current without manual reindexing. Everything stays on your
+**SQLite/FTS5** (keyword search) and **sqlite-vec** (semantic search, vectors in the same
+`index.db`; [FAISS](https://github.com/facebookresearch/faiss) and [Qdrant](https://qdrant.tech)
+selectable), so results stay current without manual reindexing. Everything stays on your
 machine: each project keeps its index in `<project>/.simple-ci/`, and the single global config
 lives in `~/.simple-ci/config.yaml`.
 
@@ -28,10 +29,11 @@ lives in `~/.simple-ci/config.yaml`.
   cannot produce symbols.
 - **One-command setup.** An interactive wizard writes the MCP entry into 13 supported harnesses
   (see below) — you never edit a client config by hand.
-- **Local-first.** FAISS is the default store (a plain file in your project). Bring your own
-  OpenAI-compatible embedding endpoint, or let the wizard download a model (EmbeddingGemma 2
-  ~0.6 GB, Qwen3-Embedding 0.6B or 4B, Nomic Embed Code) and serve it locally via llama.cpp in
-  Docker (NVIDIA/AMD/Intel aware).
+- **Local-first.** sqlite-vec is the default store: vectors live in the same `index.db` as the
+  chunks, so a save and its vectors commit together. FAISS (a separate index file) and Qdrant
+  remain selectable. Bring your own OpenAI-compatible embedding endpoint, or let the wizard
+  download a model (EmbeddingGemma 2 ~0.6 GB, Qwen3-Embedding 0.6B or 4B, Nomic Embed Code) and
+  serve it locally via llama.cpp in Docker (NVIDIA/AMD/Intel aware).
 - **Multi-session safe.** Each harness session runs a read-only reader; one writer daemon per
   workspace keeps the index fresh and exits after the last session closes. Closing one harness
   never affects another.
@@ -74,7 +76,8 @@ The wizard:
 2. picks an embedding source: an existing container or URL, or a downloadable model
    (EmbeddingGemma 2, Qwen3-Embedding 0.6B, Qwen3-Embedding 4B, Nomic Embed Code), probing the
    real embedding dimension from the endpoint,
-3. picks the vector store: **FAISS** (recommended — a local file, no Docker) or **Qdrant**,
+3. picks the vector store: **sqlite-vec** (recommended — vectors inside `index.db`, no Docker),
+   **FAISS** (a separate local file), or **Qdrant**,
 4. selects which harnesses to configure (global scope; restart each harness afterwards),
 5. copies the repo to a per-user install directory and points the harness entries at it; the
    launcher self-updates via `git pull` on each start.
@@ -146,25 +149,32 @@ To support a client that is not on the list, drop a plugin module into
 ## Configuration
 
 One global file, `~/.simple-ci/config.yaml`. Precedence: **environment variable > YAML >
-default**. The wizard writes it; this is the whole file for the default FAISS backend:
+default**. The wizard writes it; this is the whole file for the default sqlite-vec backend:
 
 ```yaml
 version: 1
-mode: sidecar         # read-only sessions + one writer daemon (default); SIMPLE_CI_MODE overrides
-vector_store: faiss   # VECTOR_STORE overrides
+mode: sidecar              # read-only sessions + one writer daemon (default); SIMPLE_CI_MODE overrides
+vector_store: sqlite-vec   # VECTOR_STORE overrides; faiss | qdrant also supported
 embedding:
   base_url: http://localhost:8080
   model: embeddinggemma-2
-  dim: 768            # probed by the wizard from the endpoint
-sweep_seconds: 0      # 0 = watcher only (default); >0 = periodic reconcile backstop
+  dim: 768                 # probed by the wizard from the endpoint
+sweep_seconds: 0           # 0 = watcher only (default); >0 = periodic reconcile backstop
 ```
 
-For Qdrant, set `vector_store: qdrant` and add a `qdrant:` block with `url` (a `service:`
-block lets the server start that container at boot; services are fail-soft — the server never
-refuses to start when Docker is down, lexical search keeps working). Model-specific query and
-document prompt prefixes are applied automatically; `embedding.query_prefix` /
-`embedding.document_prefix` override them. Config is read at startup — **restart the harness
-session after changing it**.
+Optional sqlite-vec tuning (defaults shown): `sqlite_vec.chunk_size: 64`,
+`sqlite_vec.mmap_size: 1073741824` (a mapping limit, not preallocation), and
+`sqlite_vec.cache_size: -262144` (KiB); `SQLITE_VEC_CHUNK_SIZE`, `SQLITE_VEC_MMAP_SIZE`, and
+`SQLITE_VEC_CACHE_SIZE` override them. Changing `chunk_size` rebuilds the vector table and
+re-embeds the workspace.
+
+For FAISS, set `vector_store: faiss` (the separate `vectors.faiss` file; `faiss.path` /
+`FAISS_PATH`). For Qdrant, set `vector_store: qdrant` and add a `qdrant:` block with `url` (a
+`service:` block lets the server start that container at boot; services are fail-soft — the
+server never refuses to start when Docker is down, lexical search keeps working).
+Model-specific query and document prompt prefixes are applied automatically;
+`embedding.query_prefix` / `embedding.document_prefix` override them. Config is read at
+startup — **restart the harness session after changing it**.
 
 Where things land:
 
@@ -174,8 +184,8 @@ Where things land:
 | `~/.simple-ci/model/` | Downloaded GGUF models |
 | `~/.simple-ci/docker/` | Generated compose file + GPU bootstrap script |
 | Per-user app dir (e.g. `%APPDATA%\simple-code-indexer`) | Installed copy the harnesses launch |
-| `<project>/.simple-ci/index.db` | SQLite index (per workspace) |
-| `<project>/.simple-ci/vectors.faiss` | FAISS vectors (per workspace, default backend) |
+| `<project>/.simple-ci/index.db` | SQLite index (per workspace), including the default vector table |
+| `<project>/.simple-ci/vectors.faiss` | FAISS vectors (per workspace, `vector_store: faiss` only) |
 | `<project>/.simple-ci/log/` | `writer.log` + `reader.log` (sidecar) or `embed.log` (embedded) |
 
 Logs are DEBUG by default with rotation (`log.max_bytes`, `log.backups`, `LOG_LEVEL`). File
@@ -202,7 +212,7 @@ your workspace, with a lexical FTS baseline:
 
 ```bash
 uv run python tests/retrieval_bench.py --workspace . --model embeddinggemma-2 \
-  --base-url http://localhost:8080 --vector-store faiss --reset \
+  --base-url http://localhost:8080 --vector-store sqlite-vec --reset \
   --local-path artifacts/bench/local
 ```
 

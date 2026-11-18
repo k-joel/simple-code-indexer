@@ -35,6 +35,9 @@ def test_defaults_come_from_the_process_cwd(monkeypatch) -> None:
         "EMBED_DIM",
         "VECTOR_STORE",
         "FAISS_PATH",
+        "SQLITE_VEC_CHUNK_SIZE",
+        "SQLITE_VEC_MMAP_SIZE",
+        "SQLITE_VEC_CACHE_SIZE",
         "LOG_LEVEL",
         "LOG_MAX_BYTES",
         "LOG_BACKUPS",
@@ -47,9 +50,12 @@ def test_defaults_come_from_the_process_cwd(monkeypatch) -> None:
     settings = load_settings()
     assert settings.workspace_root == cwd
     assert settings.index_db_path == cwd / ".simple-ci" / "index.db"
-    assert settings.vector_store == "faiss"
+    assert settings.vector_store == "sqlite-vec"
     assert settings.faiss_path is None
     assert faiss_index_path(settings) == cwd / ".simple-ci" / "vectors.faiss"
+    assert settings.sqlite_vec_chunk_size == 64
+    assert settings.sqlite_vec_mmap_size == 1_073_741_824
+    assert settings.sqlite_vec_cache_size == -262_144
     assert settings.qdrant_url == "http://localhost:6333"
     assert settings.embed_base_url == "http://localhost:8080"
     assert settings.embed_dim == 2560
@@ -212,7 +218,7 @@ def test_a_legacy_qdrant_section_selects_qdrant(tmp_path: Path, monkeypatch) -> 
 
 def test_an_empty_qdrant_section_is_not_legacy(tmp_path: Path, monkeypatch) -> None:
     _config(tmp_path, monkeypatch, "qdrant:\n  {}\n")
-    assert load_settings().vector_store == "faiss"
+    assert load_settings().vector_store == "sqlite-vec"
 
 
 def test_explicit_faiss_beats_the_legacy_qdrant_section(
@@ -271,6 +277,47 @@ def test_absolute_faiss_path_is_kept(tmp_path: Path, monkeypatch) -> None:
     other = (tmp_path / "elsewhere" / "index.faiss").resolve()
     _config(tmp_path, monkeypatch, f"faiss:\n  path: {other}\n")
     assert load_settings().faiss_path == other
+
+
+def test_sqlite_vec_tuning_reaches_the_settings(tmp_path: Path, monkeypatch) -> None:
+    for name in (
+        "SQLITE_VEC_CHUNK_SIZE",
+        "SQLITE_VEC_MMAP_SIZE",
+        "SQLITE_VEC_CACHE_SIZE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    _config(
+        tmp_path,
+        monkeypatch,
+        "sqlite_vec:\n  chunk_size: 128\n  mmap_size: 268435456\n  cache_size: -1000\n",
+    )
+    settings = load_settings()
+    assert settings.sqlite_vec_chunk_size == 128
+    assert settings.sqlite_vec_mmap_size == 268_435_456
+    assert settings.sqlite_vec_cache_size == -1000
+
+
+def test_sqlite_vec_env_overrides_the_file(tmp_path: Path, monkeypatch) -> None:
+    _config(tmp_path, monkeypatch, "sqlite_vec:\n  chunk_size: 128\n")
+    monkeypatch.setenv("SQLITE_VEC_CHUNK_SIZE", "32")
+    monkeypatch.setenv("SQLITE_VEC_MMAP_SIZE", "0")
+    settings = load_settings()
+    assert settings.sqlite_vec_chunk_size == 32
+    assert settings.sqlite_vec_mmap_size == 0
+
+
+def test_invalid_sqlite_vec_values_raise(tmp_path: Path, monkeypatch) -> None:
+    _config(tmp_path, monkeypatch, "sqlite_vec:\n  chunk_size: 0\n")
+    with pytest.raises(ConfigError):
+        load_settings()
+
+    _config(tmp_path, monkeypatch, "sqlite_vec:\n  mmap_size: -1\n")
+    with pytest.raises(ConfigError):
+        load_settings()
+
+    _config(tmp_path, monkeypatch, "sqlite_vec:\n  cache_size: 0\n")
+    with pytest.raises(ConfigError):
+        load_settings()
 
 
 def test_log_section_values_reach_the_settings(tmp_path: Path, monkeypatch) -> None:

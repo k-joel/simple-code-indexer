@@ -342,6 +342,57 @@ def test_switching_back_to_qdrant_invalidates_faiss_rows(tmp_path: Path) -> None
         assert _bind(conn, COLLECTION_A) is False
 
 
+def _bind_sqlite_vec(conn, dim: str = "2560") -> bool:
+    return db.ensure_index_identity(
+        conn, backend="sqlite-vec", identity=("sqlite-vec", dim)
+    )
+
+
+def test_sqlite_vec_identity_binds_the_table_dimension(tmp_path: Path) -> None:
+    with db.connect(db_path=tmp_path / "index.db") as conn:
+        db.ensure_schema(conn)
+        assert _bind_sqlite_vec(conn) is False
+        assert db.get_meta(conn, "vector_backend") == "sqlite-vec"
+        assert db.get_meta(conn, "sqlite_vec_store") == "sqlite-vec"
+        assert db.get_meta(conn, "sqlite_vec_dim") == "2560"
+        assert _bind_sqlite_vec(conn) is False
+
+
+def test_sqlite_vec_dimension_change_invalidates_the_index(tmp_path: Path) -> None:
+    with db.connect(db_path=tmp_path / "index.db") as conn:
+        db.ensure_schema(conn)
+        assert _bind_sqlite_vec(conn) is False
+        _seed_rows(conn)
+        db.allocate_vector_label(conn, "src/foo.cpp", 0)
+
+        assert _bind_sqlite_vec(conn, "1024") is True
+        assert db.stats(conn) == {"files": 0, "symbols": 0, "chunks": 0}
+        assert db.vector_label_rows(conn, "src/foo.cpp") == []
+        assert _bind_sqlite_vec(conn, "1024") is False
+
+
+def test_switching_from_sqlite_vec_invalidates_the_index(tmp_path: Path) -> None:
+    with db.connect(db_path=tmp_path / "index.db") as conn:
+        db.ensure_schema(conn)
+        _bind_sqlite_vec(conn)
+        _seed_rows(conn)
+
+        assert _bind_faiss(conn) is True
+        assert db.stats(conn) == {"files": 0, "symbols": 0, "chunks": 0}
+        assert db.get_meta(conn, "vector_backend") == "faiss"
+
+
+def test_invalidate_embeddings_flags_only_ok_rows(tmp_path: Path) -> None:
+    with db.connect(db_path=tmp_path / "index.db") as conn:
+        db.ensure_schema(conn)
+        _seed_rows(conn)
+        with conn:
+            assert db.invalidate_embeddings(conn) == 1
+            assert db.embedding_counts(conn) == {"embedded": 0, "pending": 1}
+            # Nothing left in 'ok', so a second pass is a no-op.
+            assert db.invalidate_embeddings(conn) == 0
+
+
 def test_vector_labels_are_stable_and_never_reused(tmp_path: Path) -> None:
     with db.connect(db_path=tmp_path / "index.db") as conn:
         db.ensure_schema(conn)

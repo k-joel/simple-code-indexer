@@ -49,7 +49,8 @@ def ensure_managed_services(settings: Settings) -> None:
     if settings.vector_store == "qdrant":
         services.append(("qdrant", settings.qdrant_service))
     else:
-        # FAISS needs no server; an old qdrant.service block must not start Docker.
+        # Local backends (sqlite-vec, FAISS) need no server; an old qdrant.service
+        # block must not start Docker.
         LAST_STATE["qdrant"] = "not_managed"
     logger.info(
         "managed services: %s",

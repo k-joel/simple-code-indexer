@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,14 @@ def _start(settings: Settings) -> runtime.WriterRuntime:
     writer = runtime.WriterRuntime(settings)
     writer.start()
     return writer
+
+
+def test_vector_index_age_delegates_to_the_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(vector_store, "vector_index_age_s", lambda _s: 12.5)
+    assert runtime.vector_index_age(settings) == 12.5
 
 
 def test_start_acquires_the_lease_and_stop_releases_it(tmp_path: Path) -> None:
@@ -122,6 +131,25 @@ def test_stop_order_is_logged_for_the_parent_watch_test(
     )
     assert shutdown < released
     assert not watcher.is_alive()
+
+
+def test_stop_joins_the_service_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    order: list[str] = []
+
+    def idle_probe(_settings: Settings, stop_event: threading.Event) -> None:
+        stop_event.wait(5.0)
+        order.append("probe")
+
+    monkeypatch.setattr(runtime, "_probe_services", idle_probe)
+
+    writer = _start(settings)
+    writer.stop()
+    order.append("stop-returned")
+
+    assert order == ["probe", "stop-returned"]
 
 
 def test_writer_heartbeat_lives_and_then_clears(tmp_path: Path) -> None:

@@ -37,6 +37,9 @@ logger = logging.getLogger(__name__)
 
 # Long enough for an in-flight embedding request (EMBED_TIMEOUT_S default 15 s).
 DRAIN_TIMEOUT_S = 30.0
+# The probe is best-effort: the stop event ends its retries, so shutdown waits
+# only for one in-flight HTTP attempt.
+PROBE_JOIN_TIMEOUT_S = 2.0
 _STOP_TICK_S = 0.5
 
 
@@ -55,6 +58,7 @@ class WriterRuntime:
         self._writer_thread: threading.Thread | None = None
         self._sweep_thread: threading.Thread | None = None
         self._heartbeat_thread: threading.Thread | None = None
+        self._probe_thread: threading.Thread | None = None
         self._observer: BaseObserver | None = None
 
     @property
@@ -124,12 +128,13 @@ class WriterRuntime:
             int((time.monotonic() - phase) * 1000),
             vector_store.describe(settings),
         )
-        threading.Thread(
+        self._probe_thread = threading.Thread(
             target=_probe_services,
-            args=(settings,),
+            args=(settings, self._stop),
             name="service-probe",
             daemon=True,
-        ).start()
+        )
+        self._probe_thread.start()
 
         # Single writer owns all index writes; startup reconcile goes through it.
         work_queue = indexer.new_work_queue()
@@ -190,6 +195,7 @@ class WriterRuntime:
         except Exception:
             logger.warning("cannot stop the watcher cleanly", exc_info=True)
         self._stop.set()
+        self._join(self._probe_thread, PROBE_JOIN_TIMEOUT_S)
         self._join(self._sweep_thread, 2.0)
         self._join(self._heartbeat_thread, 2.0)
         self._join(self._writer_thread, DRAIN_TIMEOUT_S)
@@ -287,12 +293,8 @@ def writer_state(settings: Settings, *, stale_after_s: float) -> dict[str, Any]:
 
 
 def vector_index_age(settings: Settings) -> float | None:
-    """Age of the vector index view: file mtime for FAISS, live for Qdrant."""
-    if vector_store.backend(settings) == "faiss":
-        from simple_code_indexer import faiss_store
-
-        return faiss_store.vector_index_age_s(settings)
-    return 0.0 if vector_store.last_ok(settings) else None
+    """Age of the vector index view; each backend knows its own freshness."""
+    return vector_store.vector_index_age_s(settings)
 
 
 def _request_sweep(work_queue: indexer.WorkQueue, stop_event: threading.Event) -> bool:
@@ -430,10 +432,16 @@ def _reconcile_language_catalog(settings: Settings) -> None:
         logger.debug("language catalog %s: no stale paths", catalog.VERSION)
 
 
-def _probe_services(settings: Settings) -> None:
-    """Warm vector store + embed endpoint off the serve path; feeds status flags."""
+def _probe_services(settings: Settings, stop_event: threading.Event) -> None:
+    """Warm vector store + embed endpoint off the serve path; feeds status flags.
+
+    The owner's stop event gates every attempt, so a shutdown neither waits for
+    the probe's retries nor lets its records outlive the runtime.
+    """
     from simple_code_indexer import embed
 
+    if stop_event.is_set():
+        return
     try:
         vector_store.ensure_ready(settings)
         logger.info(
@@ -441,10 +449,13 @@ def _probe_services(settings: Settings) -> None:
         )
     except Exception:
         logger.exception("vector store probe failed")
+    if stop_event.is_set():
+        return
     try:
-        embed.embed_texts(settings, ["service probe"])
+        embed.embed_texts(settings, ["service probe"], stop_event=stop_event)
         logger.info(
             "service probe: embedding endpoint answered (%s)", settings.embed_base_url
         )
     except Exception:
-        logger.exception("embed probe failed")
+        if not stop_event.is_set():
+            logger.exception("embed probe failed")

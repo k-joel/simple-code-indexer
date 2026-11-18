@@ -108,22 +108,32 @@ SQLite + FTS5 store over file records, symbols, and chunk text. Powers BM25/keyw
 _Avoid_: text index, full-text index, FTS index
 
 **Semantic index**:
-Vector store of chunk embeddings. Powers similarity search. Backed by a local FAISS file
-by default, or by a Qdrant collection when configured.
+Vector store of chunk embeddings. Powers similarity search. Backed by the `vec_chunks` table
+inside `index.db` by default, by a local FAISS file, or by a Qdrant collection when configured.
 _Avoid_: embedding index
 
 **Vector store**:
-The configured backend for the semantic index: `faiss` (default) or `qdrant`.
+The configured backend for the semantic index: `sqlite-vec` (default), `faiss`, or `qdrant`.
 _Avoid_: vector database, vector backend (in prose)
 
+**Vector table** (`vec_chunks`):
+The sqlite-vec virtual table inside `index.db` that holds the default backend's vectors.
+`rowid` is the vector label, so a file update and its vectors commit in one transaction.
+_Avoid_: vector file, vector index file
+
+**sqlite-vec**:
+The SQLite extension providing the `vec0` virtual table and KNN queries. Loaded per
+connection; a Python built without loadable-extension support cannot use it.
+_Avoid_: sqlite vector, vec extension
+
 **FAISS index**:
-The ID-mapped flat index persisted at `<index directory>/vectors.faiss`. Owns the vectors;
-SQLite owns the chunk metadata and the label mapping.
+The ID-mapped flat index persisted at `<index directory>/vectors.faiss` when `faiss` is
+selected. Owns its vectors; SQLite owns the chunk metadata and the label mapping.
 _Avoid_: FAISS database, vector file
 
 **Vector label**:
-Monotonic FAISS id mapped to one `(path, chunk_index)` in `vector_labels`. Allocated from
-`meta.vector_label_seq`, never reused after a deletion.
+Monotonic integer mapped to one `(path, chunk_index)` in `vector_labels`; the sqlite-vec
+`rowid` or a FAISS id. Allocated from `meta.vector_label_seq`, never reused after a deletion.
 _Avoid_: FAISS id, vector id
 
 **Index** (the whole):
@@ -132,8 +142,9 @@ _Avoid_: database, catalog, store
 
 **Index directory**:
 The gitignored `.simple-ci/` directory in a workspace. Holds `index.db` (plus WAL and lock
-files), `vectors.faiss` for the FAISS backend, `run/` for sidecar discovery, and `log/` for
-role-specific logs. Configuration lives globally, not here.
+files; the default vector table lives inside it), `vectors.faiss` for the FAISS backend,
+`run/` for sidecar discovery, and `log/` for role-specific logs. Configuration lives globally,
+not here.
 _Avoid_: data directory, cache folder, `.index` (the retired name)
 
 **Config file**:
@@ -141,8 +152,8 @@ The single global `~/.simple-ci/config.yaml` read at server startup (or the expl
 `SIMPLE_CI_CONFIG` file; `none` disables discovery). Project-local
 `<workspace>/.simple-ci/config.yaml` files are legacy, migrated by the setup wizard and never
 read. Environment variables override individual file values. Records the vector-store
-backend, the embedding endpoint/model/dimension, either the FAISS path or the Qdrant URL, the
-runtime mode, and any Docker services the server should start.
+backend, the embedding endpoint/model/dimension, the FAISS path or Qdrant URL, the sqlite-vec
+tuning values, the runtime mode, and any Docker services the server should start.
 _Avoid_: settings, preferences, env file
 
 **Managed service**:
@@ -153,8 +164,8 @@ _Avoid_: sidecar, dependency, docker service (in prose)
 
 **Setup wizard**:
 The interactive flow started by `python setup.py`: installs `uv`, chooses an embedding
-endpoint (existing or downloaded), chooses FAISS or Qdrant, probes the vector dimension,
-registers the server with detected harnesses, and writes `config.yaml`.
+endpoint (existing or downloaded), chooses sqlite-vec, FAISS, or Qdrant, probes the vector
+dimension, registers the server with detected harnesses, and writes `config.yaml`.
 _Avoid_: installer, bootstrap, setup script (as a noun for the logic)
 
 **Collection name**:
@@ -217,7 +228,7 @@ The one process per workspace allowed to write the SQLite index and the vector s
 _Avoid_: indexer process, writer, mutator
 
 **Reader**:
-An MCP server in sidecar mode. It queries SQLite/FAISS/Qdrant read-only and registers with the workspace daemon for lifetime and status.
+An MCP server in sidecar mode. It queries SQLite and the configured vector store (sqlite-vec/FAISS/Qdrant) read-only and registers with the workspace daemon for lifetime and status.
 _Avoid_: query process, read-only server, slave
 
 **Session lease**:

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from simple_code_indexer import model_prompts
+from simple_code_indexer import configfile, model_prompts
 from simple_code_indexer.errors import ConfigError
 
 IGNORE_DIRS: frozenset[str] = frozenset(
@@ -54,8 +54,11 @@ class Settings:
     embedding_service: ManagedService | None = None
     qdrant_service: ManagedService | None = None
     config_source: Path | None = None
-    vector_store: str = "faiss"
+    vector_store: str = "sqlite-vec"
     faiss_path: Path | None = None
+    sqlite_vec_chunk_size: int = 64
+    sqlite_vec_mmap_size: int = 1_073_741_824
+    sqlite_vec_cache_size: int = -262_144
     embed_query_prefix: str | None = None
     embed_document_prefix: str | None = None
     embed_fingerprint: str = ""
@@ -73,7 +76,7 @@ class Settings:
         return self.sweep_seconds > 0
 
 
-VECTOR_STORES: frozenset[str] = frozenset({"faiss", "qdrant"})
+VECTOR_STORES: frozenset[str] = frozenset({"sqlite-vec", "faiss", "qdrant"})
 MODES: frozenset[str] = frozenset({"embedded", "sidecar"})
 LOG_LEVELS: frozenset[str] = frozenset(
     {"debug", "info", "warning", "error", "critical"}
@@ -265,7 +268,7 @@ def _managed_service(section: dict[str, Any], where: str) -> ManagedService | No
 def _vector_store(
     qdrant: dict[str, Any], file_value: str | None, env_value: str | None
 ) -> str:
-    """VECTOR_STORE > `vector_store` > legacy `qdrant:` section > faiss."""
+    """VECTOR_STORE > `vector_store` > legacy `qdrant:` section > sqlite-vec."""
     for name, value in (("VECTOR_STORE", env_value), ("vector_store", file_value)):
         if value is None:
             continue
@@ -275,7 +278,35 @@ def _vector_store(
                 f"{name} must be one of {sorted(VECTOR_STORES)}, got {value!r}"
             )
         return normalized
-    return "qdrant" if qdrant else "faiss"
+    return "qdrant" if qdrant else "sqlite-vec"
+
+
+def _sqlite_vec_section(
+    section: dict[str, Any],
+) -> tuple[int, int, int]:
+    """`sqlite_vec:` tuning: chunk_size, mmap_size, cache_size (KiB, negative)."""
+    chunk_size = _pick_int(
+        "SQLITE_VEC_CHUNK_SIZE",
+        configfile.get_int(section, "chunk_size", where="sqlite_vec"),
+        64,
+    )
+    if chunk_size <= 0:
+        raise ConfigError("sqlite_vec.chunk_size must be a positive integer")
+    mmap_size = _pick_int(
+        "SQLITE_VEC_MMAP_SIZE",
+        configfile.get_int(section, "mmap_size", where="sqlite_vec"),
+        1_073_741_824,
+    )
+    if mmap_size < 0:
+        raise ConfigError("sqlite_vec.mmap_size must be zero or a positive integer")
+    cache_size = _pick_int(
+        "SQLITE_VEC_CACHE_SIZE",
+        configfile.get_int(section, "cache_size", where="sqlite_vec"),
+        -262_144,
+    )
+    if cache_size == 0:
+        raise ConfigError("sqlite_vec.cache_size must not be zero")
+    return chunk_size, mmap_size, cache_size
 
 
 def _faiss_path(raw_path: str | None, workspace_root: Path) -> Path | None:
@@ -314,7 +345,6 @@ def _log_level(file_value: str | None, env_value: str | None) -> str:
 
 
 def load_settings() -> Settings:
-    from simple_code_indexer import configfile
     from simple_code_indexer.registry import get_registry
 
     registry = get_registry()
@@ -325,6 +355,7 @@ def load_settings() -> Settings:
     embedding = configfile.get_mapping(raw, "embedding")
     qdrant = configfile.get_mapping(raw, "qdrant")
     faiss = configfile.get_mapping(raw, "faiss")
+    sqlite_vec = configfile.get_mapping(raw, "sqlite_vec")
     log = configfile.get_mapping(raw, "log")
     env_log_level = os.environ.get("LOG_LEVEL")
     file_log_level = (
@@ -340,6 +371,7 @@ def load_settings() -> Settings:
         else configfile.get_str(raw, "vector_store", where="config")
     )
     vector_store = _vector_store(qdrant, file_vector_store, env_vector_store)
+    vec_chunk_size, vec_mmap_size, vec_cache_size = _sqlite_vec_section(sqlite_vec)
     faiss_path = _faiss_path(
         os.environ.get("FAISS_PATH")
         or configfile.get_str(faiss, "path", where="faiss"),
@@ -442,6 +474,9 @@ def load_settings() -> Settings:
         config_source=config_paths[-1] if config_paths else None,
         vector_store=vector_store,
         faiss_path=faiss_path,
+        sqlite_vec_chunk_size=vec_chunk_size,
+        sqlite_vec_mmap_size=vec_mmap_size,
+        sqlite_vec_cache_size=vec_cache_size,
         embed_query_prefix=query_prefix,
         embed_document_prefix=document_prefix,
         embed_fingerprint=fingerprint,

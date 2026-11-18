@@ -3,7 +3,14 @@ from pathlib import Path
 
 import pytest
 
-from simple_code_indexer import db, embed, faiss_store, indexer, qdrant_store
+from simple_code_indexer import (
+    db,
+    embed,
+    faiss_store,
+    indexer,
+    qdrant_store,
+    sqlite_vec_store,
+)
 from simple_code_indexer.config import IGNORE_DIRS, Settings
 from simple_code_indexer.errors import EmbedError
 from simple_code_indexer.registry import get_registry
@@ -241,6 +248,49 @@ def test_faiss_backend_records_labels_and_reembeds(tmp_path: Path, monkeypatch) 
     finally:
         faiss_store._reset_state()
         faiss_store.LAST_OK = None
+
+
+def test_sqlite_vec_backend_records_labels_and_reembeds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = replace(_settings(tmp_path), vector_store="sqlite-vec", embed_dim=8)
+    sqlite_vec_store._created_on_load = False
+    vector = [1.0] + [0.0] * 7
+
+    def _embed(_settings: Settings, texts: list[str]) -> list[list[float]]:
+        return [vector for _ in texts]
+
+    monkeypatch.setattr(embed, "embed_texts", _embed)
+    try:
+        sqlite_vec_store.ensure_ready(settings)
+        source = tmp_path / "a.cpp"
+        source.write_text("int a() { return 1; }", encoding="utf-8")
+        assert indexer.index_one_file(settings, source).status == "indexed"
+
+        with db.connect(settings.index_db_path) as conn:
+            assert db.vector_label_rows(conn, "a.cpp") == [(1, 0)]
+            rows = conn.execute(
+                "SELECT vector_id, status FROM embedding_state"
+            ).fetchall()
+            assert [(str(r["vector_id"]), str(r["status"])) for r in rows] == [
+                ("1", "ok")
+            ]
+        assert sqlite_vec_store.search(settings, vector, 1)[0].path == "a.cpp"
+
+        # A chunk flagged missing is re-embedded; the vector is replaced in place.
+        with db.connect(settings.index_db_path) as conn, conn:
+            db.invalidate_embeddings(conn)
+        assert indexer.sweep(settings).unchanged == 1
+        with db.connect(settings.index_db_path) as conn:
+            statuses = [
+                str(row["status"])
+                for row in conn.execute("SELECT status FROM embedding_state")
+            ]
+        assert statuses == ["ok"]
+        assert sqlite_vec_store.search(settings, vector, 1)[0].path == "a.cpp"
+    finally:
+        sqlite_vec_store._created_on_load = False
+        sqlite_vec_store.LAST_OK = None
 
 
 def test_sweep_indexes_drift_and_removes_deleted(tmp_path: Path) -> None:

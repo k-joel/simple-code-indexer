@@ -22,6 +22,7 @@ from simple_code_indexer import db
 from simple_code_indexer.config import Settings, faiss_index_path
 from simple_code_indexer.errors import VectorStoreUnavailable
 from simple_code_indexer.models import Chunk, VectorHit
+from simple_code_indexer.vector_util import normalize_query, normalize_rows
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,25 @@ def _faiss() -> Any:
     except Exception as exc:  # ImportError, but also a broken DLL on Windows
         raise VectorStoreUnavailable(f"faiss is not importable: {exc}") from exc
     return faiss
+
+
+def describe(settings: Settings) -> str:
+    """Human-readable identity of the store: the persisted index file."""
+    return str(faiss_index_path(settings))
+
+
+def identity(settings: Settings) -> tuple[str, str]:
+    """The binding stored in `meta`: (file path, dimension slot).
+
+    A non-empty `embed_fingerprint` (document prompt + chunker profile) is part
+    of the dimension slot, so changing how chunks are produced or formatted
+    re-embeds them. Query prompts do not affect stored vectors and leave the
+    identity untouched.
+    """
+    dim = str(settings.embed_dim)
+    if settings.embed_fingerprint:
+        dim = f"{dim}:{settings.embed_fingerprint}"
+    return (str(faiss_index_path(settings)), dim)
 
 
 def _reset_state() -> None:
@@ -179,21 +199,10 @@ def upsert_chunks(
         return []
     started = time.perf_counter()
     try:
-        vectors = np.asarray([vector for _, vector in items], dtype="float32")
-    except (TypeError, ValueError) as exc:
+        vectors = normalize_rows(items, settings.embed_dim, path=path)
+    except VectorStoreUnavailable:
         LAST_OK = False
-        raise VectorStoreUnavailable(
-            f"vectors for {path} are malformed: {exc}"
-        ) from exc
-    if vectors.ndim != 2 or vectors.shape[1] != settings.embed_dim:
-        LAST_OK = False
-        width = vectors.shape[1] if vectors.ndim == 2 else "ragged"
-        raise VectorStoreUnavailable(
-            f"embedding width {width} for {path}, expected {settings.embed_dim}"
-        )
-    vectors = vectors / np.maximum(
-        np.linalg.norm(vectors, axis=1, keepdims=True), 1e-12
-    )
+        raise
     chunk_indexes = [chunk.chunk_index for chunk, _ in items]
 
     with _lock:
@@ -301,13 +310,7 @@ def _hits_from_index(
 
 
 def _query_vector(settings: Settings, vector: list[float]) -> Any:
-    query = np.asarray([vector], dtype="float32")
-    if query.ndim != 2 or query.shape[1] != settings.embed_dim:
-        width = query.shape[1] if query.ndim == 2 else "ragged"
-        raise VectorStoreUnavailable(
-            f"query width {width}, expected {settings.embed_dim}"
-        )
-    return query / np.maximum(np.linalg.norm(query, axis=1, keepdims=True), 1e-12)
+    return normalize_query(vector, settings.embed_dim)
 
 
 def search(settings: Settings, vector: list[float], limit: int) -> list[VectorHit]:

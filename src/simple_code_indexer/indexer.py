@@ -455,8 +455,9 @@ def writer_loop(
 ) -> None:
     """Single index writer: consumes paths, tombstones and sweep requests.
 
-    When the queue drains, the in-memory FAISS index is persisted, at most once
-    per FLUSH_DEBOUNCE_S. A sweep already flushes at its end. A stop event lets
+    When the queue drains, the vector store is flushed, at most once per
+    FLUSH_DEBOUNCE_S (a WAL checkpoint for sqlite-vec, a file write for FAISS,
+    a no-op for Qdrant). A sweep already flushes at its end. A stop event lets
     the owning runtime end the thread without losing the process; queued items
     left behind are recovered by the next startup sweep.
     """

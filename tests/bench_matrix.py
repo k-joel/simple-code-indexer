@@ -292,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", type=Path, default=ROOT)
     parser.add_argument("--models", default="all")
-    parser.add_argument("--vector-stores", default="faiss,qdrant")
+    parser.add_argument("--vector-stores", default="sqlite-vec,faiss,qdrant")
     parser.add_argument(
         "--report", type=Path, default=ROOT / "artifacts" / "retrieval-quality.md"
     )

@@ -70,7 +70,7 @@ def test_empty_input_returns_empty() -> None:
 def _capture(monkeypatch) -> dict[str, list[str]]:
     captured: dict[str, list[str]] = {}
 
-    def fake_post(settings: Settings, texts: list[str]) -> list[list[float]]:
+    def fake_post(settings: Settings, texts: list[str], **_kwargs) -> list[list[float]]:
         captured["texts"] = texts
         return [[0.0] * settings.embed_dim for _ in texts]
 
@@ -129,7 +129,7 @@ def test_no_prompt_leaves_texts_unchanged(monkeypatch) -> None:
 def test_embed_texts_splits_requests_into_batches(monkeypatch) -> None:
     calls: list[list[str]] = []
 
-    def fake_post(settings: Settings, texts: list[str]) -> list[list[float]]:
+    def fake_post(settings: Settings, texts: list[str], **_kwargs) -> list[list[float]]:
         calls.append(list(texts))
         return [[0.0] * settings.embed_dim for _ in texts]
 
@@ -188,6 +188,46 @@ def test_retry_uses_jittered_backoff_and_marks_not_ok(monkeypatch) -> None:
         ceiling = min(embed._BACKOFF_CAP_S, embed._BACKOFF_BASE_S * 2**attempt)
         assert 0.0 <= delay <= ceiling
     assert embed.LAST_OK is False
+
+
+def test_stop_event_aborts_before_the_first_attempt(monkeypatch) -> None:
+    attempts = 0
+
+    def failing_post(url: str, **kwargs) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr(embed.httpx, "post", failing_post)
+    stop = threading.Event()
+    stop.set()
+
+    with pytest.raises(EmbedError):
+        embed.embed_texts(
+            _settings("http://localhost:8080"), ["alpha"], stop_event=stop
+        )
+
+    assert attempts == 0
+
+
+def test_stop_event_interrupts_the_retry_backoff(monkeypatch) -> None:
+    attempts = 0
+    stop = threading.Event()
+
+    def failing_post(url: str, **kwargs) -> None:
+        nonlocal attempts
+        attempts += 1
+        stop.set()
+        raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr(embed.httpx, "post", failing_post)
+
+    with pytest.raises(EmbedError):
+        embed.embed_texts(
+            _settings("http://localhost:8080"), ["alpha"], stop_event=stop
+        )
+
+    assert attempts == 1
 
 
 def test_post_embeddings_caps_in_flight_requests(monkeypatch) -> None:

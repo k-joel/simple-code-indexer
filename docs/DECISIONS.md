@@ -135,13 +135,15 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 | [006](#adr-006-single-workspace-no-multi-repo-registry) | Single workspace, no multi-repo registry |
 | [007](#adr-007-host-spawned-mcp-process-workspace--cwd) | Host-spawned MCP process, workspace = cwd |
 | [008](#adr-008-setup-wizard-and-fail-soft-managed-services) | Setup wizard and fail-soft managed services |
-| [009](#adr-009-faiss-is-the-primary-vector-store-qdrant-opt-in) | FAISS is the primary vector store; Qdrant opt-in |
+| [009](#adr-009-faiss-is-the-primary-vector-store-qdrant-opt-in) | FAISS is the primary vector store; Qdrant opt-in (superseded by ADR-017) |
 | [010](#adr-010-gpu-aware-compose-and-model-prompt-templates) | GPU-aware compose and model prompt templates |
 | [011](#adr-011-global-only-config-per-user-install-self-updating-launcher) | Global-only config, per-user install, self-updating launcher |
 | [012](#adr-012-role-specific-per-workspace-log-files) | Role-specific per-workspace log files |
 | [013](#adr-013-honor-gitignore-and-watch-the-workspace-root-recursively) | Honor `.gitignore` and watch the root recursively |
 | [014](#adr-014-per-workspace-sidecar-writer--read-only-mcp-sessions) | Per-workspace sidecar writer + read-only MCP sessions |
 | [015](#adr-015-harness-entries-are-global-only-no-per-project-data) | Harness entries are global-only, no per-project data |
+| [016](#adr-016-a-generated-language-catalog-replaces-the-plugin-folder) | A generated language catalog replaces the plugin folder |
+| [017](#adr-017-sqlite-vec-is-the-default-vector-store-faiss-and-qdrant-opt-in) | sqlite-vec is the default vector store; FAISS and Qdrant opt-in |
 
 
 ## ADR-001: Index on save, not git-committed state
@@ -183,7 +185,7 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   as fresh discoveries.
 - **Decision:** Python 3.12, official `mcp` SDK over stdio, `watchdog`, stdlib `sqlite3` + FTS5,
   `httpx` for embeddings, `tree-sitter` + `tree-sitter-language-pack`, `uv` for packaging. Vectors go
-  through `vector_store.py`: FAISS by default, `qdrant-client` opt-in (ADR-009).
+  through `vector_store.py`: sqlite-vec by default, FAISS and `qdrant-client` selectable (ADR-017).
 - **Consequences:** Keep the write path local-first, with short explicit timeouts and 0–2 retries. Never
   let a client default-retry toward the public internet.
 
@@ -244,6 +246,8 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   it); the name exists because the workflow is `git clone && python setup.py`.
 
 ## ADR-009: FAISS is the primary vector store, Qdrant opt-in
+
+**Status**: Superseded by ADR-017 (2026-11-18)
 
 - **Context:** Qdrant as the only backend made a second service mandatory for every install — a running
   server or Docker plus a managed container, a per-workspace collection, and a network round trip per
@@ -443,3 +447,33 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   `catalog.VERSION` is stored in `meta` and drives a targeted reconcile (drop rows that are no longer
   allowed or whose stored language changed) rather than a full re-embed. Fixing a wrong mapping is now
   a generator edit plus regeneration, not a user drop-in — accepted because the folder was empty.
+
+## ADR-017: sqlite-vec is the default vector store; FAISS and Qdrant opt-in
+
+**Status**: Accepted
+**Date**: 2026-11-18
+**Deciders**: @k-joel, agent session (report `artifacts/report-vector-store-replacement.md`)
+
+- **Context:** ADR-009 chose a separate `vectors.faiss` file because embedding vectors in SQLite needed an
+  extension or an O(n) Python distance loop. That premise no longer holds: `sqlite-vec` 0.1.9 is a 0.29 MB
+  wheel whose exact scan, tuned with `chunk_size=64` and `PRAGMA mmap_size`, measured 0.95 ms at this
+  repo's 1.5k×768 scale (FAISS: 0.70 ms) and 22–65 ms at 10k–30k×2560 (FAISS: 5–16 ms), with identical
+  recall. The separate file is what forces `vector_labels.dirty`, the atomic file replace, the reader
+  reload cache, and the reconcile pass. Read-only `mode=ro` KNN was verified while a writer held an
+  uncommitted WAL.
+- **Decision:** `sqlite-vec` (`vector_store: sqlite-vec`) is the default backend. Vectors live in a
+  `vec_chunks` virtual table inside `index.db`, `rowid` = the existing `vector_labels.label`, cosine
+  distance converted to `1 - distance`. FAISS stays fully supported as the second option (unchanged
+  code and dirty-flag semantics); Qdrant stays the third. `vector_store.py` is a registry of backend
+  modules implementing one `STORE_CONTRACT`, with lazy imports, so adding a backend is one module plus
+  one registry entry. `sqlite_vec.chunk_size` / `mmap_size` / `cache_size` are configurable
+  (`SQLITE_VEC_*`), and the wizard probes that the interpreter can load the extension before offering it.
+- **Consequences:** **Good**: one transaction covers labels and vectors, so there is no dirty-flag,
+  flush-file, reload-cache, or reconcile machinery for the default backend; one file to back up; a
+  smaller native dependency. **Bad**: sqlite-vec is pre-v1 and pinned to `>=0.1.9,<0.2`; the stable
+  release is an exact O(n·d) scan, roughly 4× FAISS at 30k×2560 (~65 ms); changing `chunk_size` or
+  `EMBED_DIM` rebuilds the table and re-embeds; interpreters without SQLite extension loading cannot use
+  it at all. **Mitigations**: FAISS remains selectable for large workspaces or blocked interpreters (the
+  wizard defaults to it when the probe fails); `mmap_size`/`cache_size` are tunable; a backend change
+  invalidates the binding and re-indexes rather than migrating vectors, and a leftover `vec_chunks` table
+  is dropped when another backend becomes active.

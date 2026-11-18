@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Minimal **code-index MCP server** (Python): watch files, index on save into **SQLite/FTS5** (lexical) + **FAISS** (semantic vectors, default) or **Qdrant** (opt-in).
+Minimal **code-index MCP server** (Python): watch files, index on save into **SQLite/FTS5** (lexical) + **sqlite-vec** (semantic vectors, default; FAISS and Qdrant selectable).
 See [README.md](README.md) for the detailed overview.
 
 ## Project Folders
@@ -87,7 +87,8 @@ Host-spawned MCP **reader** processes + one detached per-workspace **sidecar wri
 | Service | Endpoint / value |
 |---|---|
 | Embeddings (OpenAI-compatible) | `http://localhost:8080/v1/embeddings` — model `Qwen3-Embedding-4B-Q6_K`, **2560-dim** |
-| FAISS (default) | `<workspace>/.simple-ci/vectors.faiss` — no service; `faiss.path` / `FAISS_PATH` override |
+| sqlite-vec (**default**) | `vec_chunks` virtual table inside `<workspace>/.simple-ci/index.db` — no service; `sqlite_vec.chunk_size` / `mmap_size` / `cache_size` (`SQLITE_VEC_*`) |
+| FAISS (second) | `<workspace>/.simple-ci/vectors.faiss` — no service; `faiss.path` / `FAISS_PATH` override |
 | Qdrant (opt-in) | `http://localhost:6333` (no auth) — one derived collection per workspace |
 | Workspace | the MCP process cwd (`WORKSPACE_ROOT` overrides); index at `$WORKSPACE_ROOT/.simple-ci/index.db` |
 | Config | `~/.simple-ci/config.yaml` only (global); project-local configs are migrated by the wizard and never read; env vars win (`SIMPLE_CI_CONFIG=none` disables discovery) |
@@ -102,17 +103,20 @@ Host-spawned MCP **reader** processes + one detached per-workspace **sidecar wri
 | Install record | `setup.install_root` + `setup.harnesses` in `~/.simple-ci/config.yaml`; used by re-runs to remove deselected entries and by `--uninstall` |
 
 Config comes from the YAML file first, then env (e.g. `VECTOR_STORE`, `FAISS_PATH`,
-`QDRANT_URL`, `EMBED_BASE_URL`, `EMBED_API_KEY`, `SIMPLE_CI_MODE`, `IDLE_GRACE_S`,
-`HEARTBEAT_S`) — never hardcode secrets or local URLs in committed code. A `service` block
-makes the writer start that Docker container at boot (fail-soft); a `qdrant.service` is
-ignored on the FAISS backend.
+`SQLITE_VEC_CHUNK_SIZE`, `SQLITE_VEC_MMAP_SIZE`, `SQLITE_VEC_CACHE_SIZE`, `QDRANT_URL`,
+`EMBED_BASE_URL`, `EMBED_API_KEY`, `SIMPLE_CI_MODE`, `IDLE_GRACE_S`, `HEARTBEAT_S`) — never
+hardcode secrets or local URLs in committed code. A `service` block makes the writer start that
+Docker container at boot (fail-soft); a `qdrant.service` is ignored on the sqlite-vec and FAISS
+backends.
 Probe the services with `uv run python tests/service_probe.py` before a live-model session.
 
 ## Conventions
 
 - Prefer stdlib where it matters: **SQLite + FTS5** for lexical index (stdlib `sqlite3`).
-- Semantic path: embed with the same endpoint used for queries; store through `vector_store.py` (FAISS by default, Qdrant opt-in) so call sites stay backend-agnostic.
-- **Sidecar is the default** (`mode: sidecar`): `server._run` starts either `runtime.WriterRuntime` (embedded) or `sidecar.ReaderSession` (sidecar), never both. Readers must use `db.try_connect_readonly`, `faiss_store.search_readonly`, and `qdrant_store.search_readonly`; never call `ensure_schema`, `flush`, `reset`, `reconcile`, `upsert_chunks`, or a delete path from a reader.
+- Semantic path: embed with the same endpoint used for queries; store through `vector_store.py` (sqlite-vec by default, FAISS and Qdrant selectable) so call sites stay backend-agnostic.
+- **The router is a registry, not a branch table**: every backend module implements `vector_store.STORE_CONTRACT` (`describe`, `identity`, `ensure_ready`, `reset`, `upsert_chunks`, `delete_by_path`, `search`, `search_readonly`, `reconcile`, `flush`, `last_ok`, `vector_index_age_s`). Adding a backend = one module + one `_STORES` entry; `tests/test_vector_store.py` fails if a module drifts. Shared width checks/normalisation live in `vector_util.py`, and `vector_store.describe/identity` come from the module, never from backend checks in the router.
+- **sqlite-vec owns its table**: `vec_chunks` is created by `sqlite_vec_store.ensure_ready`, never by `db.ensure_schema` (creating it needs the extension loaded, and readers must not create it). Every sqlite-vec connection loads the extension and sets `PRAGMA mmap_size`/`cache_size`; read-only queries go through `search_readonly` on a `mode=ro` connection.
+- **Sidecar is the default** (`mode: sidecar`): `server._run` starts either `runtime.WriterRuntime` (embedded) or `sidecar.ReaderSession` (sidecar), never both. Readers must use `db.try_connect_readonly`, `sqlite_vec_store.search_readonly`, `faiss_store.search_readonly`, and `qdrant_store.search_readonly`; never call `ensure_schema`, `flush`, `reset`, `reconcile`, `upsert_chunks`, or a delete path from a reader.
 - **Writer lifecycle**: `runtime.WriterRuntime.start()` acquires `index.db.lock`; `stop()` stops the watcher + writer/sweep/heartbeat threads, flushes vectors and clears dirty flags **while the lease is held**, then releases it last. The daemon clears `.simple-ci/run/daemon.json`/`daemon.token` before releasing the lease so a new daemon cannot publish into a file the old one deletes.
 - **Daemon spawn**: `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` (plus `CREATE_BREAKAWAY_FROM_JOB` with fallback; POSIX `start_new_session=True`), stdio redirected, own `writer.log`, and no `ParentWatchdog` (it must outlive the spawner). Never use `DETACHED_PROCESS` here: the venv `python.exe` redirector spawns the real interpreter without creation flags, and that child then allocates a visible console window. The control channel is `multiprocessing.connection` with a token `authkey` and JSON string bodies, never pickle.
 - File-watcher / MCP surface should stay small: `search_code`, `symbol_lookup`, `get_status` (optional `reindex`). The watcher is the primary index path; the periodic reconciliation sweep is opt-in (`sweep_seconds: 0` = off) and must stay a backstop, with idle backoff.

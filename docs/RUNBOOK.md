@@ -125,7 +125,15 @@ Checks the embedding endpoint required by semantic search and Qdrant when `vecto
 
 3. Compare the reported `dim` with `s.embed_dim`. A mismatch prints `WARN` but still exits 0. Correct `embedding.dim` or unset the conflicting `EMBED_DIM` override before indexing.
 
-4. Read the Qdrant result for the active backend. With `vector_store: faiss`, `qdrant unavailable (optional ...)` is expected. With `vector_store: qdrant`, a failure exits 1; start Qdrant or correct `qdrant.url` before continuing.
+4. Read the Qdrant result for the active backend. With `vector_store: sqlite-vec` or `faiss`, `qdrant unavailable (optional ...)` is expected — local backends need no server. With `vector_store: qdrant`, a failure exits 1; start Qdrant or correct `qdrant.url` before continuing.
+
+5. For `vector_store: sqlite-vec`, confirm the interpreter can load the extension at all:
+
+   ```
+   uv run python -c "from simple_code_indexer import sqlite_vec_store; print(sqlite_vec_store.available())"
+   ```
+
+   Expect `(True, 'sqlite-vec v0.1.9')`. A `False` result means this Python blocks SQLite extension loading; select `vector_store: faiss` (the wizard does this automatically) or use a uv-managed interpreter.
 
 **Troubleshooting**
 
@@ -237,7 +245,7 @@ Deletes one workspace's derived `.simple-ci/` data and rebuilds it through start
    Remove-Item -Recurse -Force .simple-ci
    ```
 
-   If `INDEX_DB` points elsewhere, delete that index directory and the configured `faiss.path` instead. Use the paths printed in step 1.
+   If `INDEX_DB` points elsewhere, delete that index directory and the configured `faiss.path` instead. Use the paths printed in step 1. Deleting the index directory removes the default `vec_chunks` table with it; a stale `vectors.faiss` from an earlier FAISS run is not read while `sqlite-vec` is active and can be deleted.
 
 5. Trigger the rebuild with a probe, or open a harness session in the workspace. To use the probe, set a symbol that exists in the workspace:
 

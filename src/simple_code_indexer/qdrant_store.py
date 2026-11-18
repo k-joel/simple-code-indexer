@@ -146,6 +146,48 @@ def validate_collection(settings: Settings) -> None:
             raise QdrantUnavailable(f"cannot validate collection: {exc}") from exc
 
 
+def ensure_ready(settings: Settings) -> None:
+    """Writer-side readiness: create the collection when it is missing."""
+    ensure_collection(settings)
+
+
+def reset(settings: Settings) -> None:
+    """A vector-less collection is already empty; nothing to invalidate."""
+    del settings
+
+
+def reconcile(settings: Settings) -> int:
+    """Qdrant owns its vectors; there is no local journal to recover."""
+    del settings
+    return 0
+
+
+def flush(settings: Settings) -> None:
+    """Every upsert waits for the server, so there is nothing buffered here."""
+    del settings
+
+
+def last_ok(settings: Settings) -> bool:
+    del settings
+    return LAST_OK is True
+
+
+def vector_index_age_s(settings: Settings) -> float | None:
+    """Qdrant is authoritative: the index is as fresh as the last operation."""
+    del settings
+    return 0.0 if LAST_OK is True else None
+
+
+def describe(settings: Settings) -> str:
+    """Human-readable identity of the store: the collection name."""
+    return settings.qdrant_collection
+
+
+def identity(settings: Settings) -> tuple[str, str]:
+    """The binding stored in `meta`: (server URL, collection name)."""
+    return (settings.qdrant_url, settings.qdrant_collection)
+
+
 def upsert_chunks(
     settings: Settings, path: str, items: list[tuple[Chunk, list[float]]]
 ) -> list[str]:

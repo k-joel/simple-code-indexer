@@ -6,7 +6,7 @@ that) so FAISS and embed module state never leak between runs.
     uv run python tests/retrieval_bench.py \
         --workspace . --local-path artifacts/bench/local \
         --model embeddinggemma-2 --base-url http://localhost:8080 \
-        --vector-store faiss --reset --out artifacts/gemma-faiss.json
+        --vector-store sqlite-vec --reset --out artifacts/gemma-sqlite-vec.json
 """
 
 from __future__ import annotations
@@ -47,6 +47,9 @@ _ENV_OVERRIDES = (
     "VECTOR_STORE",
     "QDRANT_URL",
     "QDRANT_COLLECTION",
+    "SQLITE_VEC_CHUNK_SIZE",
+    "SQLITE_VEC_MMAP_SIZE",
+    "SQLITE_VEC_CACHE_SIZE",
     "SWEEP_SECONDS",
     "DEBOUNCE_MS",
 )
@@ -132,6 +135,8 @@ def _reset(settings, backend: str) -> None:
     if backend == "faiss":
         faiss_index_path(settings).unlink(missing_ok=True)
         return
+    if backend != "qdrant":
+        return  # sqlite-vec lives inside the index.db deleted above
     try:
         from qdrant_client import QdrantClient
 
@@ -356,7 +361,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", type=Path, default=Path.cwd())
     parser.add_argument("--queries", type=Path, default=DEFAULT_QUERY_FILE)
-    parser.add_argument("--vector-store", choices=["faiss", "qdrant"], default="faiss")
+    parser.add_argument(
+        "--vector-store",
+        choices=["sqlite-vec", "faiss", "qdrant"],
+        default="sqlite-vec",
+    )
     parser.add_argument("--base-url", default="http://localhost:8080")
     parser.add_argument("--model", required=True)
     parser.add_argument("--dim", type=int, default=None)
@@ -368,8 +377,8 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         metavar="DIR",
-        help="write index.db, vectors.faiss and the Qdrant collection into DIR "
-        "instead of <workspace>/.simple-ci",
+        help="write index.db, the vector table/FAISS file and the Qdrant collection "
+        "into DIR instead of <workspace>/.simple-ci",
     )
     parser.add_argument("--reset", action="store_true")
     parser.add_argument("--out", type=Path, default=None)

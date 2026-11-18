@@ -48,6 +48,7 @@ _MAX_INFLIGHT = 2
 _INFLIGHT = threading.BoundedSemaphore(_MAX_INFLIGHT)
 _BACKOFF_BASE_S = 0.5
 _BACKOFF_CAP_S = 2.0
+_CANCELLED = "embedding cancelled: the runtime is stopping"
 _sleep = time.sleep  # test seam
 
 
@@ -75,8 +76,17 @@ def _split_for_limit(text: str, limit: int = _SAFE_CHARS) -> list[str]:
     return pieces or [text[:limit]]
 
 
-def embed_texts(settings: Settings, texts: list[str]) -> list[list[float]]:
-    """Embed texts; raise EmbedError on failure. One vector per input text."""
+def embed_texts(
+    settings: Settings,
+    texts: list[str],
+    *,
+    stop_event: threading.Event | None = None,
+) -> list[list[float]]:
+    """Embed texts; raise EmbedError on failure. One vector per input text.
+
+    `stop_event` lets an owner that is shutting down abort the retries instead of
+    leaving a request (and its log records) running after the runtime stopped.
+    """
     global LAST_OK
     if not texts:
         return []
@@ -86,7 +96,13 @@ def embed_texts(settings: Settings, texts: list[str]) -> list[list[float]]:
     vectors: list[list[float]] = []
     batches = 0
     for start in range(0, len(flat), _MAX_INPUTS):
-        vectors.extend(_post_embeddings(settings, flat[start : start + _MAX_INPUTS]))
+        vectors.extend(
+            _post_embeddings(
+                settings,
+                flat[start : start + _MAX_INPUTS],
+                stop_event=stop_event,
+            )
+        )
         batches += 1
     pooled: list[list[float]] = []
     index = 0
@@ -111,7 +127,12 @@ def embed_texts(settings: Settings, texts: list[str]) -> list[list[float]]:
     return pooled
 
 
-def _post_embeddings(settings: Settings, texts: list[str]) -> list[list[float]]:
+def _post_embeddings(
+    settings: Settings,
+    texts: list[str],
+    *,
+    stop_event: threading.Event | None = None,
+) -> list[list[float]]:
     """POST {base}/v1/embeddings with retries; validates count and dim."""
     global LAST_OK
     url = ipv4_loopback(settings.embed_base_url.rstrip("/") + "/v1/embeddings")
@@ -124,6 +145,8 @@ def _post_embeddings(settings: Settings, texts: list[str]) -> list[list[float]]:
     was_ok = LAST_OK
     error: Exception | None = None
     for attempt in range(_ATTEMPTS):
+        if stop_event is not None and stop_event.is_set():
+            raise EmbedError(_CANCELLED)
         attempt_started = time.perf_counter()
         try:
             # connect=1.0: fail fast when the endpoint is down; the full
@@ -163,7 +186,12 @@ def _post_embeddings(settings: Settings, texts: list[str]) -> list[list[float]]:
             error = exc
             logger.debug("embed attempt %d/%d failed: %s", attempt + 1, _ATTEMPTS, exc)
             if attempt + 1 < _ATTEMPTS:
-                _sleep(_retry_delay(attempt))
+                delay = _retry_delay(attempt)
+                if stop_event is not None:
+                    if stop_event.wait(delay):
+                        raise EmbedError(_CANCELLED) from None
+                else:
+                    _sleep(delay)
     LAST_OK = False
     if was_ok is not False:
         logger.warning(
