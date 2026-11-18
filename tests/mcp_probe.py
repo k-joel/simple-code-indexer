@@ -11,6 +11,11 @@ contract check fails.
 The server's stderr is drained on a thread (an unread pipe blocks the server on
 its next INFO log write), and `PROBE_TIMEOUT` (seconds, default 180) bounds the
 child's lifetime so a stall becomes `PROBE FAIL` instead of a hang.
+
+Set `PROBE_WAIT_INDEX=<N>` to hold the reader open until the index has at least
+N files, zero pending embeddings and a completed sweep on two consecutive
+samples. Use it before querying an index that was just deleted and rebuilt;
+`PROBE_WAIT_TIMEOUT` (seconds, default 600) bounds that wait.
 """
 
 from __future__ import annotations
@@ -97,6 +102,11 @@ def _spawn(cmd: list[str]) -> tuple[subprocess.Popen[str], threading.Timer]:
         target=_drain_stderr, args=(proc,), daemon=True, name="stderr-drain"
     ).start()
     timeout = float(os.environ.get("PROBE_TIMEOUT", _DEFAULT_PROBE_TIMEOUT_S))
+    if int(os.environ.get("PROBE_WAIT_INDEX", "0") or 0) > 0:
+        # The reindex gate outlives the plain probe bound; do not kill the
+        # child before the gate's own deadline can fire.
+        wait_timeout = float(os.environ.get("PROBE_WAIT_TIMEOUT", "600"))
+        timeout = max(timeout, wait_timeout + 60.0)
     watchdog = threading.Timer(timeout, proc.kill)
     watchdog.daemon = True
     watchdog.start()
@@ -162,6 +172,49 @@ def main() -> None:
             if key not in payload:
                 raise ProbeError(f"get_status payload missing {key}: {payload}")
         print(f"get_status: {json.dumps(payload)}")
+
+        wait_for = int(os.environ.get("PROBE_WAIT_INDEX", "0") or 0)
+        if wait_for > 0:
+            wait_timeout = float(os.environ.get("PROBE_WAIT_TIMEOUT", "600"))
+            deadline = time.monotonic() + wait_timeout
+            stable = 0
+            wait_id = 1000
+            while True:
+                _send(
+                    proc,
+                    _rpc(
+                        wait_id,
+                        "tools/call",
+                        {"name": "get_status", "arguments": {}},
+                    ),
+                )
+                wait_payload = json.loads(
+                    _read_until(proc, wait_id)["result"]["content"][0]["text"]
+                )
+                wait_id += 1
+                print(
+                    "reindex: "
+                    f"files={wait_payload['files_indexed']} "
+                    f"chunks={wait_payload['chunks_indexed']} "
+                    f"vectors={wait_payload['vectors_indexed']} "
+                    f"pending={wait_payload['pending_embeddings']} "
+                    f"sweep={wait_payload['last_sweep']}"
+                )
+                settled = (
+                    int(wait_payload["files_indexed"]) >= wait_for
+                    and int(wait_payload["pending_embeddings"]) == 0
+                    and bool(wait_payload["watcher_alive"])
+                    and bool(wait_payload["last_sweep"])
+                )
+                stable = stable + 1 if settled else 0
+                if stable >= 2:
+                    break
+                if time.monotonic() > deadline:
+                    raise ProbeError(
+                        f"index did not settle at {wait_for} files with 0 pending "
+                        f"within {wait_timeout:.0f}s: {wait_payload}"
+                    )
+                time.sleep(2.0)
 
         symbol_from_env = "PROBE_SYMBOL" in os.environ
         symbol = os.environ.get("PROBE_SYMBOL", "calculateWidgetChecksum")

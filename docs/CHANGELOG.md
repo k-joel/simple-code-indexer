@@ -147,6 +147,15 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   back to the generic node walk (`SYMBOL_FALLBACK=0` disables it).
 - `get_status` reports `languages_loaded`, `languages_with_symbol_maps`, `languages_indexed`,
   and `data_formats_excluded`.
+- `tests/acp_probe.py` drives an ACP harness (OpenCode by default, Command Code accepted) over
+  stdio and asserts the full pipeline end to end — session creation, `cwd`-inferred workspace,
+  watcher pickup, all three MCP tools, sqlite/get_status agreement, and clean shutdown — without
+  a human in the loop. The MCP server is injected per ACP session; OpenCode 2.2.5 also starts its
+  configured entry first, so a checkout-only run masks that entry with a byte-exact backup and
+  restores it afterwards. Standard library only.
+- [ref-docs/acp-test-process.md](../ref-docs/acp-test-process.md) documents that automated run,
+  and [ref-docs/opencode-acp-mode.md](../ref-docs/opencode-acp-mode.md) documents ACP mode itself
+  (transport, editor setup, MCP injection, permissions, troubleshooting).
 
 ### Changed
 
@@ -168,6 +177,12 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   not a tree-sitter field, so the previous lookup always returned nothing.
 - README header reworked: title tagline, a flat-square badge row (Python 3.12+, platforms,
   license, last commit), and a new Development section with the lint/typecheck/test commands.
+- The ACP end-to-end procedure now targets the checkout under test
+  (`tests/acp_probe.py $repo --install $repo`) instead of the `%APPDATA%` install, verifies the
+  writer daemon's command line, and rebuilds a deleted index via `PROBE_WAIT_INDEX` before any
+  retrieval check. OpenCode's configured MCP entry is masked for checkout-only runs and restored
+  afterwards; the procedure is verified with both `faiss` and `sqlite-vec`. See
+  [ref-docs/acp-test-process.md](../ref-docs/acp-test-process.md).
 
 ### Removed
 
