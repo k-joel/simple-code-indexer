@@ -259,6 +259,11 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   `uv run --project <install> --no-sync python <install>/run_server.py` instead of
   hardcoding the copy's `.venv\Scripts\python.exe`. `--project` preserves the caller's
   cwd, so workspace inference is unchanged.
+- README rewritten as a user-facing document: identity, differentiation, status, and quick
+  start first; operator procedures (probes, index rebuilds, log reading, diagnosis) now live
+  only in `docs/RUNBOOK.md`. Stale claims fixed: the harness list now shows all 13 builtins
+  (Goose and Pi were missing), the retrieval benchmark set is 42 queries (not 40), and the
+  clone command uses the real repository URL.
 
 ### Fixed
 

@@ -1,560 +1,223 @@
 # simple-code-indexer
 
-Minimal code-index MCP server: file-watcher indexing into SQLite/FTS5 with FAISS
-semantic vectors (Qdrant optional).
+Local-first MCP server that gives your AI coding agent hybrid lexical + semantic code search, re-indexed on every save.
 
-## How it runs
+simple-code-indexer runs alongside your coding agent — Claude Code, VS Code, Cursor, Zed,
+OpenCode, Codex CLI, and [others](#supported-harnesses) — as a standard
+[MCP](https://modelcontextprotocol.io) server. A file watcher re-indexes every saved file into
+**SQLite/FTS5** (keyword search) and **FAISS** (semantic search; [Qdrant](https://qdrant.tech)
+optional), so results stay current without manual reindexing. Everything stays on your
+machine: each project keeps its index in `<project>/.simple-ci/`, and the single global config
+lives in `~/.simple-ci/config.yaml`.
 
-The harness spawns the server **on the host, inside the project you have open**:
+## Why this one
 
-- **Workspace** = the process working directory (`Path.cwd().resolve()`), overridable with `WORKSPACE_ROOT`.
-- **Index** = `$WORKSPACE_ROOT/.simple-ci/index.db` — gitignore `.simple-ci/` in every indexed project.
-- **Config** = one global file, `~/.simple-ci/config.yaml`. Project-local
-  `<workspace>/.simple-ci/config.yaml` files are legacy: the wizard migrates their keys into
-  the global file and removes them, and the server never reads them. Environment variables
-  override the file; `SIMPLE_CI_CONFIG` replaces discovery with one explicit file. See
-  [ADR-008](docs/DECISIONS.md#adr-008-setup-wizard-and-fail-soft-managed-services),
-  [ADR-010](docs/DECISIONS.md#adr-010-gpu-aware-compose-and-model-prompt-templates), and
-  [ADR-011](docs/DECISIONS.md#adr-011-global-only-config-per-user-install-self-updating-launcher).
-- **Vector store** = FAISS by default, persisted at `$WORKSPACE_ROOT/.simple-ci/vectors.faiss`
-  (override with `faiss.path` or `FAISS_PATH`). Vectors are L2-normalised, so scores are
-  cosine similarity. Qdrant stays available with `vector_store: qdrant`; its per-workspace
-  collection is `code_index_{folder_slug}_{sha256(path)[:8]}_{embed_dim}` (`QDRANT_COLLECTION`
-  overrides it). See [ADR-009](docs/DECISIONS.md#adr-009-faiss-is-the-primary-vector-store-qdrant-opt-in).
-- **Runtime** = `mode: sidecar` by default. Every harness still spawns its own MCP server,
-  but those servers are read-only **readers**; one detached per-workspace **daemon** owns
-  the watcher, writer, SQLite/FAISS/Qdrant writes, and managed services. The daemon starts
-  on demand, serves every harness in the workspace, and exits after the last session plus
-  `idle_grace_s` (default 60 s). Set `mode: embedded` (or `SIMPLE_CI_MODE=embedded`) to
-  restore the old all-in-one process. See
-  [ADR-014](docs/DECISIONS.md#adr-014-per-workspace-sidecar-writer--read-only-mcp-sessions).
-- **Services** = an OpenAI-compatible embedding endpoint always, plus Qdrant only when the
-  Qdrant backend is selected. They can be long-lived host services, or Docker containers the
-  server starts on demand when `config.yaml` names them. See
-  [ADR-007](docs/DECISIONS.md#adr-007-host-spawned-mcp-process-workspace--cwd).
-- **Models and containers** = downloaded into `~/.simple-ci/model/` and described by
-  `~/.simple-ci/docker/docker-compose.yml`, generated from a packaged template. The wizard
-  picks the llama.cpp image for the detected GPU (NVIDIA `server-cuda`, AMD `server-rocm`,
-  Intel `server-intel`, otherwise `server`). See
-  [ADR-010](docs/DECISIONS.md#adr-010-gpu-aware-compose-and-model-prompt-templates).
+- **Hybrid search in one tool.** `search_code` runs keyword queries through FTS5 and, with
+  `semantic=true`, vector search over 30-line chunk windows — overlapping hits are de-duplicated
+  automatically.
+- **Fresh on every save.** A file watcher indexes each save as it happens; a startup reconcile
+  heals anything the watcher missed, and an opt-in periodic sweep (`sweep_seconds`) is the
+  backstop. No manual reindex step.
+- **322 indexable languages.** All 371 tree-sitter grammars from `tree-sitter-language-pack`
+  are catalogued. Documentation and serialization formats — `.md`, `.txt`, `.json`, `.yaml`,
+  `.toml`, and the rest — are deliberately never indexed.
+- **Symbols, not just text.** `symbol_lookup` resolves definitions via tree-sitter, with
+  specialized extractors for Python, C/C++, and Make, and a `coverage` signal when a language
+  cannot produce symbols.
+- **One-command setup.** An interactive wizard writes the MCP entry into 13 supported harnesses
+  (see below) — you never edit a client config by hand.
+- **Local-first.** FAISS is the default store (a plain file in your project). Bring your own
+  OpenAI-compatible embedding endpoint, or let the wizard download a model (EmbeddingGemma 2
+  ~0.6 GB, Qwen3-Embedding 0.6B or 4B, Nomic Embed Code) and serve it locally via llama.cpp in
+  Docker (NVIDIA/AMD/Intel aware).
+- **Multi-session safe.** Each harness session runs a read-only reader; one writer daemon per
+  workspace keeps the index fresh and exits after the last session closes. Closing one harness
+  never affects another.
 
-## How to use
+**When not to use it:** you don't run an MCP-capable agent (the tools are only reachable
+through one); you need a shared team index (indexes are per-machine and per-workspace); or you
+want markdown/JSON/config content searchable (data formats are excluded by design).
 
-### Prerequisites
+## Status
 
-- **Python 3.12+** and **git**.
-- **Docker Desktop** only if you want the wizard to download an embedding model or run
-  Qdrant for you. The default FAISS backend needs no Docker at all, and existing services
-  elsewhere work too.
-- **GPU (optional)** — the wizard detects NVIDIA/AMD/Intel and uses the matching llama.cpp
-  image. On NVIDIA, Docker must expose the container toolkit; the wizard copies
-  `~/.simple-ci/docker/gpu_init.sh` and offers to run it when the runtime is missing, and
-  falls back to the CPU image if that fails. `--gpu cpu` forces CPU.
-- `uv` is installed by `setup.py` when missing.
+Actively maintained, **pre-1.0** — no tagged releases yet; recent work is tracked in
+[docs/CHANGELOG.md](docs/CHANGELOG.md) under *Unreleased*. Python 3.12+; Windows, macOS,
+Linux. Lexical search works with no external services; semantic search needs an OpenAI-compatible
+embedding endpoint, which the wizard can start for you in Docker.
 
-### Quick start
+## Quick start
+
+Prerequisites: **Python 3.12+** and **git**. **Docker Desktop** is optional — only needed to
+download an embedding model or run Qdrant; an embedding endpoint you already run elsewhere
+works too. The installer installs `uv` when missing.
 
 ```bash
-git clone <repo> simple-code-indexer
+git clone https://github.com/k-joel/simple-code-indexer.git simple-code-indexer
 cd simple-code-indexer
 python setup.py
 ```
 
-`setup.py` installs `uv` if needed, runs `uv sync`, and launches the interactive wizard
-(questionary menus on every platform). Run `python setup.py --dry-run` first to see every
-action without writing files or starting containers, or `python setup.py --yes` to accept the
-recommended answer everywhere. For a reproducible install, pick the model and backend
-explicitly:
+That launches the interactive wizard. Useful variants:
 
 ```bash
-python setup.py --yes --model embeddinggemma2 --gpu auto
-python setup.py --yes --model qwen3-embedding-0.6b --vector-store faiss
+python setup.py --dry-run                                 # print every action, change nothing
+python setup.py --yes                                     # accept all recommended defaults
+python setup.py --yes --model embeddinggemma2 --gpu auto  # one model, GPU autodetected
 python setup.py --yes --model qwen3-embedding-4b --vector-store faiss
-python setup.py --yes --container llamacpp-qwen3-embedding-4b-q6_k --vector-store qdrant
 ```
 
-The wizard copies the repo (including `.git`) to the per-user app directory and points every
-selected harness at that copy:
+The wizard:
 
-| Platform | Install directory |
-|---|---|
-| Windows | `%APPDATA%\simple-code-indexer` |
-| macOS | `~/Library/Application Support/simple-code-indexer` |
-| Linux | `$XDG_DATA_HOME/simple-code-indexer` or `~/.local/share/simple-code-indexer` |
+1. installs/starts Docker if it is missing (only needed for model downloads or Qdrant),
+2. picks an embedding source: an existing container or URL, or a downloadable model
+   (EmbeddingGemma 2, Qwen3-Embedding 0.6B, Qwen3-Embedding 4B, Nomic Embed Code), probing the
+   real embedding dimension from the endpoint,
+3. picks the vector store: **FAISS** (recommended — a local file, no Docker) or **Qdrant**,
+4. selects which harnesses to configure (global scope; restart each harness afterwards),
+5. copies the repo to a per-user install directory and points the harness entries at it; the
+   launcher self-updates via `git pull` on each start.
 
-Harness entries launch `run_server.py` through `uv run --project <install> --no-sync
-python <install>/run_server.py` on macOS/Linux; on Windows the wizard points them at the
-venv's windowless `<install>/.venv/Scripts/pythonw.exe` instead, so a GUI harness does not
-open a visible console window. The launcher runs `git pull --ff-only --autostash` first, runs
-`uv sync` only when `HEAD` moved, and then starts the server **in the harness's working
-directory**, so workspace inference is preserved.
+Everything the wizard writes — config, services, models, install copy — is global. The server
+creates `<project>/.simple-ci/` (index + vectors) only when it runs in a project.
 
-To refresh only the installed copy — no prompts, config, services, harness entries, or
-environment sync of the copy — run:
+### Verify the install
 
 ```bash
-python setup.py --install-only               # copies this checkout to the install directory
-python setup.py --install-only --dry-run     # print the source and target, copy nothing
-python setup.py --install-only --install-dir PATH
+uv run python tests/service_probe.py   # expect: embeddings OK dim=<n>, PROBE OK
+uv run python tests/mcp_probe.py     # exercises all three tools over stdio, expect PROBE OK
 ```
-
-### What the wizard asks
-
-| Step | Choices |
-|---|---|
-| Docker | Detected; if missing, offers to install it (`winget` on Windows, `brew` on macOS, the get.docker.com script on Linux) and waits for the daemon |
-| Existing config | If `~/.simple-ci/config.yaml` exists, shows it and offers **use / reconfigure / show file / cancel** (`--config-mode use\|reconfigure` answers non-interactively) |
-| Embedding source | An existing Docker container (every container is listed; running ones are marked `(running)` and stopped ones are started for you — `--container NAME` forces one), a catalog download (models already in `~/.simple-ci/model/` are marked `(downloaded)`), an existing URL, or Cancel |
-| Embedding dimension | Always probed from a real `/v1/embeddings` call; catalog values are only an offline fallback |
-| Vector store | **FAISS** (recommended — a local file, no Docker) or **Qdrant** (existing container/URL, or Docker compose) |
-| Harnesses | Multi-select from detected harnesses; selected harnesses are always installed at their **global** scope (`--harnesses all\|none\|name,name` is non-interactive) |
-| Install | Copies the repo to the per-user app directory and runs `uv sync` there (`--install-dir`, `--no-install`) |
-
-The wizard writes nothing into the current workspace: config, services, models and the
-installed copy are all global. The server creates `<project>/.simple-ci/` (index + vectors)
-only when it runs in a project. `--config PATH` writes one explicit config file for
-tests/advanced use. `--scope` was removed: configuration is always global.
 
 ### Uninstall
 
 ```bash
-python setup.py --uninstall --dry-run        # print the plan, delete nothing
-python setup.py --uninstall                  # asks once; --yes skips the prompt
-python setup.py --uninstall --keep-models    # keep the downloaded GGUFs
+python setup.py --uninstall --dry-run             # show the plan first
+python setup.py --uninstall --yes                 # remove install copy, config, services, entries
+python setup.py --uninstall --yes --keep-models  # same, but keep the downloaded GGUFs
 ```
 
-Uninstall is record-driven. The wizard records `setup.install_root` and `setup.harnesses`
-(`{name, config}` per harness) in `config.yaml`, so the same record also lets a later
-`python setup.py` **remove the entry from a harness you deselect**. `--uninstall` stops the
-compose services (`docker compose ... down --remove-orphans`, best-effort), then deletes the
-installed copy, `~/.simple-ci/config.yaml`, `~/.simple-ci/docker/`, the model cache (unless
-`--keep-models`), the recorded MCP entries and the `<config>.bak.<stamp>` backups setup
-created. Workspace `.simple-ci/` indexes, externally managed containers and plain
-`--embedding-url` endpoints are left alone; a config path that does not look like an install
-(no `run_server.py`) or that contains the working checkout is never deleted.
+Uninstall is record-driven: it removes exactly what setup wrote. Workspace `.simple-ci/`
+indexes, externally managed containers, and endpoints you configured yourself are left alone.
 
-### Model prompt instructions
+## Using it
 
-The wizard records each model's documented code-retrieval prompts, and the server applies
-them automatically when the model name matches (`embedding.query_prefix` and
-`embedding.document_prefix` in `config.yaml` override them):
+After the wizard finishes, **restart your harness** (MCP entries are read at session start),
+open a project, and ask in plain language: *"where is the writer lease acquired?"* The agent
+calls one of three tools:
 
-| Model | Query | Document (chunk) |
-|---|---|---|
-| EmbeddingGemma 2 | `task: code retrieval \| query: …` | `title: <relative path> \| text: …` |
-| Qwen3-Embedding | `Instruct: Given a code search query, …\nQuery: …` | none |
+| Tool | What it does |
+|---|---|
+| `search_code` | Keyword (FTS5) search; `semantic=true` switches to vector search |
+| `symbol_lookup` | Find definitions by symbol name, with a `coverage` signal |
+| `get_status` | Workspace, role, index/vector-store health, sessions, services |
 
-`embed_texts` (service probes) stays raw. The document prefix is part of the vector-store
-identity, so changing it re-embeds the workspace; changing only the query prefix does not.
+Every hit is a chunk: file path, line range, snippet, score. Every semantic response adds
+`ready` and `pending_embeddings`, so an empty result during indexing is distinguishable from a
+genuine no-match:
 
-### Where files land
+```json
+{
+  "hits": [
+    {
+      "file": "src/simple_code_indexer/indexer.py",
+      "line": 106,
+      "end_line": 135,
+      "snippet": "…",
+      "score": 0.81
+    }
+  ],
+  "source": "semantic",
+  "ready": true,
+  "pending_embeddings": 0
+}
+```
+
+## Supported harnesses
+
+The wizard writes the MCP entry into each client's global config:
+
+Claude Code · Claude Desktop · Codex CLI · Gemini CLI · OpenCode · Cursor · Windsurf (Devin
+Local) · VS Code · Zed · Goose · Pi · Command Code · MiMoCode
+
+To support a client that is not on the list, drop a plugin module into
+[`harnesses/`](harnesses/) — see [harnesses/README.md](harnesses/README.md) for the contract.
+
+## Configuration
+
+One global file, `~/.simple-ci/config.yaml`. Precedence: **environment variable > YAML >
+default**. The wizard writes it; this is the whole file for the default FAISS backend:
+
+```yaml
+version: 1
+mode: sidecar         # read-only sessions + one writer daemon (default); SIMPLE_CI_MODE overrides
+vector_store: faiss   # VECTOR_STORE overrides
+embedding:
+  base_url: http://localhost:8080
+  model: embeddinggemma-2
+  dim: 768            # probed by the wizard from the endpoint
+sweep_seconds: 0      # 0 = watcher only (default); >0 = periodic reconcile backstop
+```
+
+For Qdrant, set `vector_store: qdrant` and add a `qdrant:` block with `url` (a `service:`
+block lets the server start that container at boot; services are fail-soft — the server never
+refuses to start when Docker is down, lexical search keeps working). Model-specific query and
+document prompt prefixes are applied automatically; `embedding.query_prefix` /
+`embedding.document_prefix` override them. Config is read at startup — **restart the harness
+session after changing it**.
+
+Where things land:
 
 | Path | Contents |
 |---|---|
-| `~/.simple-ci/config.yaml` | The only config file: embedding endpoint/model/prompts/service, vector store, Qdrant |
-| `~/.simple-ci/docker/docker-compose.yml` | Generated services (`embed`, and `qdrant` only for the Qdrant backend) |
-| `~/.simple-ci/docker/gpu_init.sh` | NVIDIA container-toolkit bootstrap copied by the wizard |
-| `~/.simple-ci/model/` | Downloaded GGUF files (`embeddinggemma-2-BF16.gguf`, `Qwen3-Embedding-0.6B-Q8_0.gguf`, …) |
-| `~/.simple-ci/qdrant_storage/` | Qdrant data when that backend is selected |
-| `%APPDATA%/simple-code-indexer/` | Installed copy (`.git`, source, `.venv`, `run_server.py`) that harnesses launch |
-| `<project>/.simple-ci/index.db` | SQLite index (+ WAL files and the writer lock) |
-| `<project>/.simple-ci/vectors.faiss` | FAISS vectors (default backend; override with `faiss.path`) |
-| `<project>/.simple-ci/run/daemon.json` | Sidecar endpoint + pid; `daemon.token` (0600) authenticates the control pipe |
-| `<project>/.simple-ci/log/embed.log` | Embedded-mode diagnostics (rotated: `embed.log.1 … embed.log.3`) |
-| `<project>/.simple-ci/log/writer.log` | Sidecar writer diagnostics (same rotation) |
-| `<project>/.simple-ci/log/reader.log` | Sidecar reader diagnostics (same rotation; shared by readers) |
+| `~/.simple-ci/config.yaml` | The only config file |
+| `~/.simple-ci/model/` | Downloaded GGUF models |
+| `~/.simple-ci/docker/` | Generated compose file + GPU bootstrap script |
+| Per-user app dir (e.g. `%APPDATA%\simple-code-indexer`) | Installed copy the harnesses launch |
+| `<project>/.simple-ci/index.db` | SQLite index (per workspace) |
+| `<project>/.simple-ci/vectors.faiss` | FAISS vectors (per workspace, default backend) |
+| `<project>/.simple-ci/log/` | `writer.log` + `reader.log` (sidecar) or `embed.log` (embedded) |
 
-The FAISS index and SQLite database stay **per workspace**; only the configuration is global.
-`vector_store` and an optional `faiss.path` live in the global file, so every project uses the
-same backend choice. A relative `faiss.path` resolves against the workspace; an absolute path
-shares one index file (opt-in). Config precedence is **environment variable > global YAML >
-default**.
+Logs are DEBUG by default with rotation (`log.max_bytes`, `log.backups`, `LOG_LEVEL`). File
+contents are never logged — only paths, sizes, line ranges, and counts.
 
+## Troubleshooting
 
-### Supported harnesses
+- **Wizard says Docker is unavailable** — start Docker Desktop, or choose a branch that doesn't
+  need it (existing URL / FAISS).
+- **Port already in use** — the wizard picks the next free port and writes it to the config.
+- **Config changes ignored** — config is read at startup; restart the harness session.
+- **Semantic hits empty, lexical works** — check `ready` / `pending_embeddings` in the response:
+  vectors may still be warming up. Qwen3 embedding models need last-token pooling
+  (`LLAMA_ARG_POOLING=last`); the wizard warns when it detects a mean-pooling container.
+- **Clean rebuild** — delete `<project>/.simple-ci/` and trigger any MCP call; the startup
+  reconcile re-indexes and re-embeds everything.
+- **Anything else** — [docs/RUNBOOK.md](docs/RUNBOOK.md) has numbered procedures: service
+  probes, live-session verification, index rebuilds, stopping the writer daemon, reading logs.
 
-Builtin plugins write the server entry into each client's own file:
+## Benchmarks
 
-| Harness | Global config (the wizard writes here) |
-|---|---|
-| Claude Code | `~/.claude.json` |
-| Claude Desktop | `%APPDATA%/Claude/claude_desktop_config.json` (and macOS/Linux equivalents) |
-| Codex CLI | `~/.codex/config.toml` (`[mcp_servers.<name>]`, `startup_timeout_sec = 120`) |
-| Gemini CLI | `~/.gemini/settings.json` |
-| OpenCode | `~/.config/opencode/opencode.json(c)` (`mcp.servers.<name>`) |
-| Cursor | `~/.cursor/mcp.json` |
-| Windsurf / Devin Local | `~/.config/devin/mcp_config.json` (legacy `~/.codeium/windsurf/mcp_config.json`) |
-| VS Code | `%APPDATA%/Code/User/mcp.json` (and macOS/Linux equivalents) |
-| Zed | `~/.config/zed/settings.json` |
-| Command Code | `~/.commandcode/mcp.json` |
-| MiMoCode | `~/.config/mimocode/mimocode.json`, `~/.config/mimocode/config.json`, legacy `~/.mimocode/mimocode.json` |
-
-The wizard does **not** ask where to save each harness: selected harnesses are installed at
-their global scope. The entry is
-`uv run --project <install> --no-sync python <install>/run_server.py` (macOS/Linux) or
-`<install>/.venv/Scripts/pythonw.exe <install>/run_server.py` (Windows, no console window).
-Restart the harness after it is written;
-the file is read at session start. Codex/MiMo/OpenCode get a 120 s startup timeout because the
-launcher may sync dependencies and the server waits for Docker services before serving.
-
-
-### Manual config
-
-FAISS (the default — no Qdrant section is needed):
-
-```yaml
-version: 1
-mode: sidecar              # SIMPLE_CI_MODE overrides; embedded = all-in-one process
-idle_grace_s: 60           # daemon exit delay after the last session
-heartbeat_s: 5             # reader heartbeat; the daemon reaps after 3 intervals
-vector_store: faiss        # VECTOR_STORE overrides this
-embedding:
-  base_url: http://localhost:8080
-  model: embeddinggemma-2
-  dim: 768                 # must match the endpoint; the wizard probes it
-  api_key: null
-  timeout_s: 15
-  query_prefix: "task: code retrieval | query: {query}"
-  document_prefix: "title: {title} | text: {content}"
-  service:                 # optional: server starts this container at boot
-    container: simple-ci-embed-1   # compose-derived: <project>-<service>-<n>
-    compose_file: /home/you/.simple-ci/docker/docker-compose.yml
-    compose_service: embed
-    startup_timeout_s: 60
-faiss:
-  path: .simple-ci/vectors.faiss   # optional; FAISS_PATH overrides it
-sweep_seconds: 0            # 0 = watcher only (default); >0 = periodic reconcile
-debounce_ms: 400
-```
-
-Qdrant instead:
-
-```yaml
-version: 1
-mode: sidecar              # SIMPLE_CI_MODE overrides; embedded = all-in-one process
-idle_grace_s: 60
-heartbeat_s: 5
-vector_store: qdrant
-embedding:
-  base_url: http://localhost:8080
-  model: embeddinggemma-2
-  dim: 768
-  query_prefix: "task: code retrieval | query: {query}"
-  document_prefix: "title: {title} | text: {content}"
-qdrant:
-  url: http://localhost:6333
-  collection: code_index_my-app_1a2b3c4d_768   # optional; derived when absent
-  service:                 # optional: server starts this container at boot
-    container: simple-ci-qdrant-1
-    compose_file: /home/you/.simple-ci/docker/docker-compose.yml
-    compose_service: qdrant
-    startup_timeout_s: 45
-sweep_seconds: 0            # 0 = watcher only (default); >0 = periodic reconcile
-debounce_ms: 400
-```
-
-These blocks live in the single global `~/.simple-ci/config.yaml`. The wizard writes
-`embedding`, `vector_store`, `qdrant`, and the service blocks there; the index and vector
-files stay per workspace. A config with **no** `vector_store` key but a non-empty `qdrant:`
-section is treated as Qdrant, so existing installations keep their backend until they
-explicitly switch.
-
-When a `service` block is present the server verifies the container is running (starting it
-if needed) and waits for the endpoint before serving. It never refuses to start: if Docker
-or the service is unavailable, the server logs it, keeps lexical search working, and reports
-the state in `get_status.services`. A `qdrant.service` block is ignored (state
-`not_managed`) when the FAISS backend is active.
-
-### Verify
-
-```bash
-uv run python tests/service_probe.py
-uv run python tests/mcp_probe.py
-```
-
-`get_status` reports the resolved `workspace`, `role` (`reader` or `writer`),
-`index_ready`, `writer_pid`, `writer_ok`, `writer_heartbeat_age_s`, `writer_log_file`,
-`daemon_endpoint`, `sessions`, `harnesses`, `vector_store`, `vector_store_ok`,
-`vector_index` (the FAISS file path or the Qdrant collection), `vector_index_age_s`,
-`vectors_indexed` / `pending_embeddings` (chunk embedding progress), `sweep_seconds`
-(0 = periodic sweeps off), `config_file` (the global file, or `null`), `config_files`
-(0 or 1 entry), and `services` (`running`, `started`, `unavailable`, or `not_managed`).
-Semantic `search_code` responses also carry `ready` and `pending_embeddings`, so empty
-hits during indexing are distinguishable from a genuine no-match.
-`tests/service_probe.py` resolves the same settings, so it probes the configured
-endpoint and model automatically.
-
-### Retrieval benchmark
-
-`tests/retrieval_bench.py` indexes the workspace with one model/backend and scores the
-40-query golden set in `tests/retrieval_queries.json` (Recall@1/5/10, MRR@10, nDCG@10, plus
-a lexical FTS baseline):
+`tests/retrieval_bench.py` scores a 42-query golden set (Recall@1/5/10, MRR@10, nDCG@10) on
+your workspace, with a lexical FTS baseline:
 
 ```bash
 uv run python tests/retrieval_bench.py --workspace . --model embeddinggemma-2 \
   --base-url http://localhost:8080 --vector-store faiss --reset \
-  --local-path artifacts/bench/local --out artifacts/bench/gemma-faiss.json
+  --local-path artifacts/bench/local
 ```
 
-`--local-path DIR` keeps a run away from the workspace's live index: the SQLite database and
-the FAISS file go into `DIR` instead of `<workspace>/.simple-ci`, so `--reset` cannot delete an
-index a running MCP server is using. Without the flag, `--reset` still targets the live index
-and prints a warning naming it.
+`--local-path` keeps the run away from the live index. `tests/bench_matrix.py` runs every
+model/backend combination.
 
-`tests/bench_matrix.py` runs every model/backend combination, starts the containers
-(including the downloadable catalog models), deletes the index/collection between runs, and
-writes `artifacts/retrieval-quality-*.{md,json}`. Each run gets its own scratch folder under
-`artifacts/bench/<timestamp>/local/`:
+## Documentation
 
-```bash
-uv run python tests/bench_matrix.py --workspace . --vector-stores faiss,qdrant
-```
-
-The existing Qwen3-4B container was originally created with `LLAMA_ARG_POOLING=mean`; after
-recreating it with `last`, its nDCG@10 rose from 0.317 to 0.719. The wizard warns when it
-detects a Qwen3 model in a mean-pooling container.
-
-### Logging
-
-In `mode: embedded` the server writes `<workspace>/.simple-ci/log/embed.log`; in the
-default sidecar mode the writer daemon writes `writer.log` and each MCP reader writes
-`reader.log`. All three use the same `log.max_bytes` / `log.backups` rotation settings,
-while stderr keeps the INFO summary the harness shows. `reader.log` is shared by every
-reader in the workspace, so its rotation is best-effort; the writer-owned files have
-exactly one process. The file is DEBUG by default: startup banner, managed-service
-lifecycle, every database write and FTS query, chunk boundaries, per-file index outcomes,
-sweep summaries, watcher events, embed/vector-store timings, and every tool call with
-its query, hit count and latency. File contents are never logged — only paths, sizes,
-line ranges and counts.
-
-```yaml
-log:
-  level: debug        # debug | info | warning | error | critical (file only)
-  max_bytes: 5000000
-  backups: 3
-```
-
-Environment overrides: `LOG_LEVEL`, `LOG_MAX_BYTES`, `LOG_BACKUPS`. `get_status.log_file`
-reports the reader/embedded file; `get_status.writer_log_file` names the daemon's file.
-Quick looks:
-
-```powershell
-Get-Content .simple-ci/log/writer.log -Tail 80         # sidecar writer (default)
-Get-Content .simple-ci/log/reader.log -Tail 80         # sidecar readers (default)
-Get-Content .simple-ci/log/embed.log -Tail 80          # mode: embedded
-Select-String -Path .simple-ci/log/writer.log,.simple-ci/log/reader.log -Pattern "ERROR|WARNING|tool="
-```
-
-### Troubleshooting
-
-| Symptom | Fix |
+| Doc | Contents |
 |---|---|
-| Wizard says Docker is unavailable | Start Docker Desktop, or choose the URL/container-less branches |
-| Port already in use | The wizard picks the next free port (8080→8081, 6333→6334) and writes it to config |
-| GPU container exits immediately | `--gpu cpu`, or run `~/.simple-ci/docker/gpu_init.sh` in the WSL2/Linux distro that runs dockerd, then re-run setup. On Windows: `wsl --update` first |
-| Container image is `server` despite an NVIDIA card | Docker does not expose the NVIDIA runtime; run the generated `gpu_init.sh` (or `--gpu nvidia` after fixing it) |
-| Wizard offers to reuse the setup | It found `~/.simple-ci/config.yaml`; choose “reconfigure” or pass `--config-mode reconfigure`, or `--model KEY` to force a model |
-| Qwen3 embeddings look poor | The container is probably using mean pooling. Qwen3-Embedding is trained for last-token pooling: recreate it with `LLAMA_ARG_POOLING=last` (the wizard warns when it detects this) |
-| `get_status.services` shows `unavailable` | `docker ps -a`, inspect the container logs, then re-run `python setup.py` |
-| Changed the embedding model | The dimension changes, so the vector-store identity changes and the index re-embeds |
-| Config changes ignored | The server reads config at startup — restart the harness session |
-| `.simple-ci/index.db` deleted | Nothing to restore: the startup reconcile re-indexes the workspace |
-| `.simple-ci/vectors.faiss` deleted | Same: the store rebuilds empty and reconcile re-embeds every chunk |
-| Want a clean rebuild | Delete `.simple-ci/` and trigger an MCP call |
-
-## Design docs (start here)
-
-| Doc | Purpose |
-|---|---|
-| [docs/ARCH.md](docs/ARCH.md) | Live architecture overview — topology, data flow, domain/data model, component design, testing |
-| [docs/GLOSSARY.md](docs/GLOSSARY.md) | Domain language |
-| [docs/RUNBOOK.md](docs/RUNBOOK.md) | Numbered operator procedures (`RUN-001` upward) and the maintenance contract |
+| [docs/ARCH.md](docs/ARCH.md) | Architecture overview: topology, data flow, components, testing |
+| [docs/RUNBOOK.md](docs/RUNBOOK.md) | Operator procedures (RUN-001 …) |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Architecture decision records |
-| [docs/ARCH_ISSUES.md](docs/ARCH_ISSUES.md) | Open structural debt |
+| [docs/GLOSSARY.md](docs/GLOSSARY.md) | Domain terms |
+| [docs/CHANGELOG.md](docs/CHANGELOG.md) | Notable changes |
+| [AGENTS.md](AGENTS.md) | Notes for AI coding agents: dev loop, toolchain |
 
-## Runbook
+## Licence
 
-### Start / stop
-
-Start the backing services (let the wizard manage them, run your own compose project, or
-`docker run` them), then let the harness spawn the server per session. The FAISS backend
-needs only the embedding endpoint.
-
-In the default `mode: sidecar`, that server is a **reader**. The first session in a
-workspace spawns the detached writer daemon; other sessions attach to it, and closing one
-harness does not affect the others. The daemon keeps the index fresh while at least one
-session is attached, then exits after the last session plus `idle_grace_s` (60 s). A
-reader exits when its stdio session closes. It also watches the harness process that
-launched it — skipping the uv launcher and venv trampoline — so it exits when the harness
-disappears even if the pipe stays open. `SIMPLE_CI_PARENT_WATCH=0` disables that watchdog.
-A reused `opencode-cli serve --service` *is* the harness, so the reader intentionally
-lives as long as that service; stop it with `opencode service stop`.
-
-`mode: embedded` restores the old all-in-one process: the server itself takes the writer
-lease, and a second session logs `another simple-code-indexer already owns …` and exits.
-Use it only for diagnosis or when a daemon cannot be spawned.
-
-```bash
-# Qdrant, only when vector_store: qdrant
-docker run -d --name qdrant -p 6333:6333 -v qdrant_storage:/qdrant/storage qdrant/qdrant
-```
-
-| Service | Endpoint | Required |
-|---|---|---|
-| Embeddings (llama.cpp / OpenAI-compatible) | `http://localhost:8080/v1/embeddings` | always |
-| Qdrant | `http://localhost:6333` | only with `vector_store: qdrant` |
-
-Probe before debugging anything else:
-
-```bash
-uv run python tests/service_probe.py    # expect: embeddings OK dim=<your config>, PROBE OK
-                                        # (qdrant OK only when that backend is in use)
-```
-
-### Harness integration
-
-`setup.py` writes the entry for you. The equivalent global MiMoCode snippet is:
-
-```json
-{
-  "mcp": {
-    "simple-code-indexer": {
-      "type": "local",
-      "command": [
-        "C:\\Users\\you\\AppData\\Roaming\\simple-code-indexer\\.venv\\Scripts\\pythonw.exe",
-        "C:\\Users\\you\\AppData\\Roaming\\simple-code-indexer\\run_server.py"
-      ],
-      "enabled": true,
-      "timeout": 120000
-    }
-  }
-}
-```
-
-- **Restart the harness session after changing that file** (config is read at session start).
-- Windows entries use the venv's `pythonw.exe` (GUI subsystem) so the harness never opens a
-  console window; macOS/Linux entries use `uv run --project <install> --no-sync python …`.
-- The launcher runs `git pull --ff-only --autostash` in the installed copy, re-runs `uv sync`
-  when `HEAD` moved, then starts the server in the harness's cwd. Set `SIMPLE_CI_GIT_PULL=0`
-  to skip the pull (offline use or local development).
-- The server watches the harness that owns its stdio session (the `uv` launcher and venv
-  `python.exe` trampoline are skipped) and exits when the harness dies;
-  `SIMPLE_CI_PARENT_WATCH=0` disables it. For OpenCode the harness is
-  `opencode-cli serve --service`, so the server lives as long as that service — including when
-  a later UI reuses a service started by an earlier one. Stop it with `opencode service stop`.
-- Gate: `mimo mcp list` must show `✓ simple-code-indexer connected`.
-- Tools exposed: `search_code` (lexical; `semantic=true` uses the vector store), `symbol_lookup`, `get_status`.
-
-### Probes (no harness needed)
-
-```bash
-# services first, always
-uv run python tests/service_probe.py
-
-# stdio protocol + tool shapes (+ fixture symbol + semantic hit when PROBE_SYMBOL set)
-PROBE_SYMBOL=calculateWidgetChecksum uv run python tests/mcp_probe.py
-
-# index-on-save latency (creates/removes its own temp .cpp in the workspace)
-uv run python tests/live_watch_probe.py
-```
-
-Run them from the workspace you want indexed: each probe spawns the server, which inherits
-that cwd unless `WORKSPACE_ROOT` is set. The probe drains the server's stderr on a thread (an
-unread pipe would block the server on a log write), and `PROBE_TIMEOUT` (seconds, default 180)
-bounds the run so a stall fails instead of hanging.
-
-### Rebuild the index
-
-The lexical index lives at `$WORKSPACE_ROOT/.simple-ci/index.db`; the vectors live in
-`$WORKSPACE_ROOT/.simple-ci/vectors.faiss` (FAISS) or the per-workspace Qdrant collection.
-Switching the store, its path/URL/collection/dimension, the vector store backend, or the
-embedding model invalidates the stored rows automatically on the next start, and the startup
-reconcile re-indexes and re-embeds everything. Switching to FAISS leaves the old Qdrant
-points orphaned; delete that collection by hand if you care. To force a rebuild by hand —
-for example after upgrading code that changes chunking — delete `.simple-ci/` and restart
-the session:
-
-```bash
-Remove-Item -Recurse -Force .simple-ci   # or: rm -rf .simple-ci
-# then trigger any MCP call: startup reconcile re-embeds everything
-```
-
-### Diagnosis
-
-| Symptom | Check |
-|---|---|
-| `mimo mcp list` → `Failed to get tools` | Run `tests/mcp_probe.py`; the probe fails loudly on `outputSchema`/`tasks` regressions. First `uvx` launch legitimately takes ~5 s. A managed container may take longer — raise the harness timeout. |
-| Indexing the wrong tree / unexpected `vector_index` | `get_status.workspace` shows the resolved workspace. If it is wrong, the harness spawned the server outside your project — fix that in the harness, do not pin `WORKSPACE_ROOT` in a global entry ([ADR-015](docs/DECISIONS.md#adr-015-harness-entries-are-global-only-no-per-project-data)); a temporary pin is for debugging only. |
-| `get_status` → `watcher_alive: false` | Server not running / still starting; the watcher registers on a background thread (true within ~1 s of the first call). |
-| `vector_store_ok`/`embed_ok: false` | `tests/service_probe.py`; check `get_status.services` and the Docker container logs. `vector_store_ok: false` with `vector_store: faiss` usually means faiss failed to import or the file is unwritable. |
-| Server exits with `already owns …index.db` | Only possible in `mode: embedded` (or when a legacy embedded writer holds the lease). In sidecar mode a second session is a reader; leave it running. |
-| `get_status.role` is `reader` but `writer_ok: false` | The daemon is gone; the reader serves stale read-only data and respawns it automatically. Check `.simple-ci/log/writer.log`, and that `.simple-ci/run/daemon.json` is not blocked by permissions. |
-| Second harness still gets no tools | Check `get_status.role` and `writer_ok` in the first session; the second should attach as a reader. `writer.log` names the daemon failure. `SIMPLE_CI_MODE=embedded` is the old single-writer fallback, not a fix for shared sessions. |
-| Save not picked up within 5 s | Reconciliation sweep (45 s) is the backstop; then check `last_sweep` in `get_status`. |
-| Semantic hits empty but lexical works | `pending_embeddings > 0` / `ready: false` means vectors are still being written — wait for the sweep. Otherwise the vector-store identity changed without a rebuild (restart the session), or vectors failed earlier — the next sweep retries chunks whose `embedding_state` is not `ok`; if the log reports a vector width/collection-size mismatch, align `EMBED_DIM` (and for Qdrant delete the mismatched collection). |
-| Embedding requests slow or time out with several workspaces open | Each workspace has one writer daemon, but they share one embedding endpoint; `embed.py` caps each request at 16 inputs and two in flight per process, but N workspaces still multiply the load. Close idle sessions or raise `embedding.timeout_s`. |
-| `config_file: null` in `get_status` | `~/.simple-ci/config.yaml` does not exist; run `python setup.py` or create one. Project-local configs are ignored |
-| Logs | stderr of the spawned server (harness, INFO) **and** `<workspace>/.simple-ci/log/writer.log` + `reader.log` in sidecar mode, or `embed.log` in `mode: embedded` (all DEBUG, same rotation). `get_status.log_file`/`writer_log_file` name the active files; nothing is written to the workspace root. |
-
-### Retired state
-
-The pre-ADR-007 deployment used a global collection `code_index_2560` and a
-`docker exec`-attached container. Nothing reads that collection now — delete it in Qdrant
-by hand when convenient. The old `.index/` directory is no longer read or migrated; delete
-it by hand. Switching a workspace from Qdrant to FAISS (or back)
-also leaves the previous store's vectors orphaned; the Qdrant collection can be deleted by
-hand, and the FAISS file is replaced on the next identity reset.
-
-The pre-ADR-010 global layout (`~/.simple-ci/docker-compose.yml`, `~/.simple-ci/models/`)
-is replaced by `~/.simple-ci/docker/docker-compose.yml` and `~/.simple-ci/model/`. The
-wizard offers to rename the model directory and re-renders the compose file on the next
-run; an old compose file is simply ignored.
-
-## Harness plugins
-
-The wizard's knowledge of each MCP client lives in
-`src/simple_code_indexer/harnesses/` — plain modules with `NAME`, `HOME_DIRS`,
-`GLOBAL_CONFIGS`, `LOCAL_CONFIGS`, `FORMAT`, `ROOT_KEY`, and optional `entry`/`render`.
-Drop `my_harness.py` in [`harnesses/`](harnesses/) or `$WORKSPACE_ROOT/harnesses/` to add
-one; a user plugin overrides a builtin by `NAME`. See
-[harnesses/README.md](harnesses/README.md) for the contract. Bad plugins are logged and
-skipped, never fatal.
-
-## Languages
-
-All 371 languages of `tree-sitter-language-pack` are declared in a single
-generated table, `src/simple_code_indexer/languages/catalog.py`. There is no
-drop-in plugin folder: adding or correcting a language means editing the
-generator (`tools/gen_language_catalog.py`) and re-running it.
-
-**Data formats are never indexed.** Serialization and documentation formats —
-`.md`, `.txt`, `.json`, `.yaml`, `.toml`, `.xml`, `.csv`, `.ini`, `.rst` and the
-rest of `catalog.DATA_FORMATS` — are catalogued for completeness but are not
-registered, so detection returns `None` and the indexer skips the file. That is
-an absolute rule, not a default: `CMakeLists.txt` is matched by *filename* as
-CMake, which is why the `.txt` denial never swallows it.
-
-Specialized extractors live in `languages/extractors.py` (Python, Make, and the
-C/C++ declarator-chain walker). Every other language uses its symbol-node map if
-it has one; otherwise the pack's own `process()` analysis is tried, and finally
-the five generic node types. `SYMBOL_FALLBACK=0` disables that last step.
-
-`get_status` reports `languages_loaded`, `languages_with_symbol_maps`,
-`languages_indexed`, `data_formats_excluded`, and `grammars_ready`. Grammars
-download from tree-sitter-language-pack on demand; startup prefetches only the
-symbol-mapped grammars (~30, not 370) in a daemon thread, and
-`PREFETCH_GRAMMARS=0` disables it. `symbol_lookup` reports a `coverage` signal
-when a language produced no symbols, so a missing symbol is distinguishable from
-a language that cannot resolve symbols at all.
-
-## Development
-
-```bash
-uv sync
-uv run ruff check .
-uv run ruff format .
-uv run pyright
-uv run pytest
-```
-
-See [AGENTS.md](AGENTS.md) for agent-oriented setup notes.
+[Apache-2.0](LICENSE).

@@ -131,6 +131,7 @@ Checks the embedding endpoint required by semantic search and Qdrant when `vecto
 
 - **`embeddings FAIL URLError: ...`**: the endpoint is unavailable or its URL or port is wrong. Run `docker ps`, inspect `embedding.base_url`, then start the service or correct the setting.
 - **`embeddings WARN configured dim=...`**: the configuration and endpoint disagree. Align `embedding.dim` with the returned dimension before rebuilding an index.
+- **Embedding requests slow or time out with several workspaces open**: each workspace runs one writer daemon, but they share one embedding endpoint; each request is capped at 16 inputs with two in flight per process, yet N workspaces still multiply the load. Fix: close idle sessions or raise `embedding.timeout_s`.
 
 ## RUN-002 (SAFE): Run the quality gate before a handoff
 
@@ -207,6 +208,8 @@ Tests the MCP stdio contract and index-on-save behavior without a harness. Run i
 - **`PROBE FAIL: watcher never became alive within 10 s of startup`**: inspect `.simple-ci/log/writer.log` and `.simple-ci/run/daemon.json`. Stop a stale daemon with RUN-005.
 - **`PROBE FAIL: ... not indexed within 5 s of save`**: check `.gitignore` and `IGNORE_DIRS`, then search `writer.log` for a full-queue warning. Lexical indexing does not require the embedding endpoint.
 - **Semantic search returns hits with `ready: false`**: vectors are still being written. Wait for `pending_embeddings` to reach 0.
+- **`another simple-code-indexer already owns …index.db`**: only possible in `mode: embedded` (or when a legacy embedded writer holds the lease). In the default sidecar mode a second session is a read-only reader. Fix: leave the second session running in sidecar mode; use `mode: embedded` only for single-session diagnosis.
+- **`config_file: null` in `get_status`**: `~/.simple-ci/config.yaml` does not exist, and project-local configs are ignored. Fix: run `python setup.py` or create the global file.
 
 ## RUN-004 (DESTRUCTIVE): Rebuild a workspace index from scratch
 
