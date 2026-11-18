@@ -147,6 +147,8 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   adding ~370 languages cannot trigger a download storm at startup.
 - The Make extractor actually resolves rule targets now: `targets` is a named child of `rule`,
   not a tree-sitter field, so the previous lookup always returned nothing.
+- README header reworked: title tagline, a flat-square badge row (Python 3.12+, platforms,
+  license, last commit), and a new Development section with the lint/typecheck/test commands.
 
 ### Removed
 

@@ -1,4 +1,6 @@
-# simple-code-indexer
+# simple-code-indexer 🔍 — code search that indexes itself
+
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?style=flat-square)](https://www.python.org/downloads/) [![Platforms: Windows, macOS, Linux](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-3776AB?style=flat-square)](https://github.com/k-joel/simple-code-indexer#quick-start) [![License: Apache-2.0](https://img.shields.io/github/license/k-joel/simple-code-indexer?style=flat-square)](LICENSE) [![Last commit](https://img.shields.io/github/last-commit/k-joel/simple-code-indexer?style=flat-square)](https://github.com/k-joel/simple-code-indexer/commits/master)
 
 Local-first MCP server that gives your AI coding agent hybrid lexical + semantic code search, re-indexed on every save.
 
@@ -206,6 +208,19 @@ uv run python tests/retrieval_bench.py --workspace . --model embeddinggemma-2 \
 
 `--local-path` keeps the run away from the live index. `tests/bench_matrix.py` runs every
 model/backend combination.
+
+## Development
+
+Toolchain: [uv](https://docs.astral.sh/uv/), Python 3.12, Ruff, Pyright, pytest.
+
+```bash
+uv sync             # install dependencies
+uv run ruff check . # lint (uv run ruff format . to format)
+uv run pyright      # typecheck
+uv run pytest       # tests
+```
+
+See [AGENTS.md](AGENTS.md) for the full dev loop.
 
 ## Documentation
 
