@@ -121,6 +121,48 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ### Added
 
+- Language coverage goes from 36 to 322 indexable languages (ADR-016). Every language in
+  `tree-sitter-language-pack` is declared in one generated table,
+  `src/simple_code_indexer/languages/catalog.py`, which replaces the 38 `builtin/*.py` modules
+  and the `importlib` loader. Zig, Nim, Svelte, Vue, Astro, Solidity, Terraform, Nix, Kotlin,
+  Dart, and the rest now get a real language id, chunk/lexical/semantic search, and (where a
+  grammar exposes it) symbols, instead of `language="text"` and regex symbols.
+- `tools/gen_language_catalog.py` regenerates that table from the pack's published language
+  table; `--check` fails on drift, so a pack upgrade is a reviewable diff.
+- `symbol_lookup` reports `coverage` (`none`/`partial`/`full`), `languages_indexed`,
+  `languages_with_symbols`, and a `hint` when a language produced no symbols. A missing symbol
+  is now distinguishable from a language that cannot resolve symbols.
+- Unmapped languages get one attempt through the pack's own `process()` analysis before falling
+  back to the generic node walk (`SYMBOL_FALLBACK=0` disables it).
+- `get_status` reports `languages_loaded`, `languages_with_symbol_maps`, `languages_indexed`,
+  and `data_formats_excluded`.
+
+### Changed
+
+- Language ids are now the tree-sitter grammar names: `c_sharp` → `csharp`, `.tsx` → `tsx`,
+  `.zsh` → `zsh`, `.fish` → `fish`. `catalog.VERSION` drives a targeted startup reconcile that
+  drops rows whose stored language changed or whose path is no longer allowed, and the sweep
+  re-indexes them — no schema change and no full re-embed.
+- Grammar prefetch now loads only the symbol-mapped grammars (~29) instead of every grammar, so
+  adding ~370 languages cannot trigger a download storm at startup.
+- The Make extractor actually resolves rule targets now: `targets` is a named child of `rule`,
+  not a tree-sitter field, so the previous lookup always returned nothing.
+
+### Removed
+
+- **The `plugins/` drop-in folder and the `builtin/` module-per-language layout.** Language
+  support is a generated table; extending it means editing the generator. The `NAME`-based
+  override and extension-stealing rules are gone with it.
+- `get_status.plugins_loaded` (replaced by `languages_loaded`).
+
+### Fixed
+
+- Data formats can no longer reach the index. `catalog.DATA_FORMATS` entries are not registered,
+  so detection returns `None` for `.md`, `.txt`, `.json`, `.yaml`, `.toml`, `.xml`, `.csv`,
+  `.ini`, `.rst`, and the rest. `.txt` matters most: it maps to `vimdoc`, so a registered `.txt`
+  would have parsed `requirements.txt` and `LICENSE.txt` as Vim documentation. `CMakeLists.txt`
+  still resolves to `cmake` because filename matching runs first.
+
 - `docs/RUNBOOK.md`: numbered operator procedures (`RUN-001` upward) for service probes, the
   quality gate, live MCP verification, index rebuilds, sidecar shutdown, and log reading. The
   file header carries the maintenance contract and the evidence rules for new entries.

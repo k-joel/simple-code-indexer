@@ -27,8 +27,10 @@ from simple_code_indexer import (
     watcher,
     workspace_lock,
 )
-from simple_code_indexer.config import Settings
+from simple_code_indexer.config import Settings, is_allowed
 from simple_code_indexer.errors import VectorStoreUnavailable, WorkspaceBusy
+from simple_code_indexer.languages import catalog
+from simple_code_indexer.parse import detect_language
 from simple_code_indexer.registry import start_prefetch_thread
 
 logger = logging.getLogger(__name__)
@@ -99,6 +101,7 @@ class WriterRuntime:
             backend,
             invalidated,
         )
+        _reconcile_language_catalog(settings)
         if invalidated:
             logger.warning(
                 "vector store %s changed — index cleared for a full re-index",
@@ -384,6 +387,47 @@ def _dormant_sweep(
                 )
         except Exception:
             logger.exception("cannot request a temporary sweep")
+
+
+def _reconcile_language_catalog(settings: Settings) -> None:
+    """Drop rows the catalog no longer covers after a catalog change.
+
+    Language ids can change between catalog versions (``c_sharp`` → ``csharp``)
+    and a previously indexed path can become a denied data format. Dropping those
+    rows is enough: the startup sweep re-indexes a path that is no longer stored,
+    so the file comes back under its current language id. No schema change and no
+    full re-embed.
+    """
+    with db.connect(settings.index_db_path) as conn:
+        stored_version = db.get_meta(conn, "language_catalog_version")
+        if stored_version == catalog.VERSION:
+            return
+        rows = conn.execute("SELECT path, language FROM files").fetchall()
+        stale: list[str] = []
+        for row in rows:
+            path = str(row["path"])
+            candidate = settings.workspace_root / path
+            if not is_allowed(settings, candidate) or (
+                detect_language(candidate) != str(row["language"])
+            ):
+                stale.append(path)
+        with conn:
+            for path in stale:
+                db.delete_file(conn, path)
+            db.set_meta(conn, "language_catalog_version", catalog.VERSION)
+    if stale:
+        logger.info(
+            "language catalog %s: dropping %d stale path(s) for re-index",
+            catalog.VERSION,
+            len(stale),
+        )
+        for path in stale:
+            try:
+                vector_store.delete_by_path(settings, path)
+            except VectorStoreUnavailable:
+                logger.warning("cannot drop vectors for %s", path, exc_info=True)
+    else:
+        logger.debug("language catalog %s: no stale paths", catalog.VERSION)
 
 
 def _probe_services(settings: Settings) -> None:

@@ -103,6 +103,7 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 | [004](#run-004-destructive-rebuild-a-workspace-index-from-scratch) | Rebuild a workspace index from scratch |
 | [005](#run-005-operator-stop-a-sidecar-writer-daemon) | Stop a sidecar writer daemon |
 | [006](#run-006-safe-read-the-sidecar-session-timeline) | Read the sidecar session timeline |
+| [007](#run-007-safe-regenerate-the-language-catalog) | Regenerate the language catalog |
 
 ## RUN-001 (SAFE): Probe the backing services
 
@@ -328,3 +329,40 @@ Reads `writer.log` to identify attached harnesses, live session counts, and shut
 - **No `session registered` line appears but the tools work**: use the `writer_log_file` path from `get_status` to avoid reading another workspace's log.
 - **Repeated `workspace lock acquired` lines appear within seconds**: more than one daemon started. Stop the extras with RUN-005 and check for a slow daemon spawn.
 - **The tail contains mostly `db open ... (rw)` heartbeat lines**: use the filter in step 3 or increase the tail count.
+
+## RUN-007 (SAFE): Regenerate the language catalog
+
+Rebuilds `src/simple_code_indexer/languages/catalog.py` from the pack's published language table. It does not touch the index; a version bump takes effect on the next writer start.
+
+1. Check whether the committed catalog is already current (needs network):
+
+   ```
+   uv run python tools/gen_language_catalog.py --check
+   ```
+
+   Exit 0 prints `catalog is current`. Exit 1 means the table drifted — for example after a `tree-sitter-language-pack` upgrade.
+
+2. Regenerate and review the diff:
+
+   ```
+   uv run python tools/gen_language_catalog.py
+   git diff --stat src/simple_code_indexer/languages/catalog.py
+   ```
+
+   The tool fails loudly instead of guessing: an unresolvable display name means a new upstream row needs an entry in `ALIASES`.
+
+3. Confirm the invariants before committing:
+
+   ```
+   uv run pytest tests/test_language_catalog.py -q
+   ```
+
+   That suite asserts unique extension/filename ownership, that every grammar exists in the pack, and that no data-format extension leaks into the allowlist.
+
+4. Bump `CATALOG_VERSION` in the generator only when the change should force existing indexes to reconcile (a language id change, or a path that was indexed becoming denied). Then regenerate again — the constant is emitted into the catalog. Without a bump, the startup reconcile is a no-op and stale rows stay as they are.
+
+**Troubleshooting**
+
+- **`cannot resolve display name '...'`**: the upstream table gained a language whose display name is not a valid grammar name. Add it to `ALIASES` with the pack's name (verify with `tree_sitter_language_pack.has_language`).
+- **`parsed only N language rows; table layout changed?`**: the docs page markup changed. Re-check `parse_table` against the saved page, using `--table <saved.html>` to iterate offline.
+- **`catalog is stale` right after regenerating**: the file was formatted or hand-edited. The generated output is authoritative — re-run the tool rather than editing `catalog.py`.

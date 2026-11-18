@@ -425,7 +425,7 @@ servers; direct invocation is not an MCP-channel test).
 - Add every defect/gap to `docs/ISSUES.md` (next free `ISS-n`, symptom / where flagged / cause /
   suggested fix). Delete entries once fixed.
 - Add operational gotchas (harness quirks, process behaviour, paths) to `docs/NOTES.md`.
-- Add user-visible changes to `docs/CHANGELOG.md` per `ref-docs/changelog-best-practices.md`.
+- Add user-visible changes to `docs/CHANGELOG.md`.
 - Update `docs/HANDOFF.md` if the work is incomplete or multi-session.
 
 ### 7.5 Cleanup (ask first)

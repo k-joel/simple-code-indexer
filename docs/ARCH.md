@@ -470,7 +470,7 @@ ordered by path then line.
 | **Reader** | MCP server process | session id, server pid, harness pid/name |
 | **Session lease** | session id | live control connection, last heartbeat, registered process |
 | **Managed service** | (`config.yaml` service block) | container name, optional compose file/service, startup timeout |
-| **Language plugin** | `NAME` | grammar, extensions, filenames, symbol node map, optional extractor |
+| **Language catalog entry** | `name` (the pack grammar name) | grammar, extensions, filenames, symbol node map, optional extractor |
 | **Harness plugin** | `NAME` | detection dirs/binaries, config paths, format, entry/render/remove |
 
 Relationships: File 1—* Symbol; File 1—* Chunk; Chunk 1—1 `embedding_state`;
@@ -716,7 +716,8 @@ Package: `src/simple_code_indexer/` (import `simple_code_indexer`).
 | `models.py` | `FileRecord`, `Symbol`, `Chunk`, `SearchHit`, `VectorHit` |
 | `db.py` | SQLite schema/migrations, FTS queries, symbols, embedding state, vector labels, `meta` |
 | `parse.py` | language detection, symbol extraction, overlapping chunker, lazy parsers |
-| `registry.py` | language plugin discovery, allowlists, grammar prefetch |
+| `tsutil.py` | tree-sitter node helpers (`walk`/`text`/`signature`) shared by `parse` and the extractors |
+| `registry.py` | indexes the language catalog: detection, allowlists, grammar prefetch |
 | `embed.py` | OpenAI-compatible embeddings client: prompts, batching, retries, dimension checks |
 | `model_prompts.py` | documented query/document prefixes per supported model family |
 | `vector_store.py` | backend router and identity description |
@@ -732,7 +733,7 @@ Package: `src/simple_code_indexer/` (import `simple_code_indexer`).
 | `logging_setup.py` | stderr/file logging, rotation, excepthooks, active log path |
 | `server.py` | MCP stdio server, role selection, tool handlers, status assembly |
 | `sidecar/` | daemon, reader session, JSON control protocol, discovery paths, lease registry |
-| `builtin/` | 36 builtin language plugins |
+| `languages/` | generated `catalog.py`, `LanguageSpec`, specialized extractors |
 | `harnesses/` | MCP-client plugins for the setup wizard |
 | `setup_wizard/` | prompts, probes, GPU detection, compose/model provisioning, install/uninstall |
 
@@ -792,7 +793,7 @@ placeholders (`{query}` or `{title}`/`{content}`); a bad placeholder raises
 `sha256(document_prefix + "\0" + CHUNKER_VERSION)[:8]` — it changes only when
 stored vectors change, so query-prompt edits do not force a re-embed.
 
-`Registry` supplies `allowed_exts` (plugin extensions) and
+`Registry` supplies `allowed_exts` (catalog extensions, data formats excluded) and
 `allowed_filenames` (exact names such as `Dockerfile`). `ignore_dirs` is fixed:
 `.git`, `.index`, `.simple-ci`, `__pycache__`, `.venv`, `node_modules`.
 
@@ -817,27 +818,42 @@ An inferred workspace that is the user's home directory is refused with a
 
 Writes happen only in the writer role. Readers use `try_connect_readonly`.
 
-### 7.3 `parse.py` and `registry.py`
+### 7.3 `parse.py`, `registry.py` and `languages/`
 
-- `detect_language(path)` resolves a language plugin by exact filename first,
-  then extension.
-- `extract_symbols` loads the plugin's tree-sitter grammar lazily; a missing or
-  broken grammar falls back to a regex scan for `def`/`function`/`fn`/`class`/
-  `interface`.
-- `extract_from_tree` uses the plugin's optional `extract` callable or a generic
-  walk over `SYMBOL_NODES` plus a default node map. A signature is the node text
-  up to its `body` field, with the trailing `;` stripped.
+- `registry.py` indexes the **generated** table in `languages/catalog.py`. Every
+  entry is `LanguageSpec(name, grammar, extensions, filenames, symbol_nodes,
+  extract)`, and `name` is always the pack grammar name. There is no drop-in
+  folder: extending support means editing `tools/gen_language_catalog.py` and
+  re-running it.
+- `detect_language(path)` resolves an entry by exact filename first, then the
+  lowercased final suffix.
+- **Data formats are never registered.** `catalog.DATA_FORMATS` (json, yaml,
+  toml, xml, csv, markdown, vimdoc/`.txt`, rst, latex, regex, ini, properties and
+  the VCS/config grammars) exist in the table only for completeness, so `detect`
+  returns `None`, `extension_allowlist()` never contains their suffixes, and the
+  indexer skips the file. Because filename matching runs first, `CMakeLists.txt`
+  still resolves to `cmake`.
+- `extract_symbols` loads the grammar lazily; a missing or broken grammar falls
+  back to a regex scan for `def`/`function`/`fn`/`class`/`interface`.
+- `extract_from_tree` tries, in order: the entry's `extract` callable
+  (`languages/extractors.py`: Python, Make, C/C++ declarator chain); the generic
+  walk over `SYMBOL_NODES` merged with the default map; and, when that yields
+  nothing for an unmapped language, the pack's own `process()` analysis
+  (`SYMBOL_FALLBACK=0` disables). A signature is the node text up to its `body`
+  field, with the trailing `;` stripped.
 - `chunk_source` emits line-aligned windows: `CHUNK_LINES = 30`,
   `CHUNK_CHARS = 1200`, `CHUNK_OVERLAP_LINES = 15`. A long line may end a window
   early, but the next window starts at the first uncovered line, so no content
   is skipped. `CHUNKER_VERSION` (`windows/30x15/1200`) is part of the vector
   identity.
-- The plugin registry is built from `builtin/*.py`, then `<repo>/plugins/`, then
-  `$WORKSPACE_ROOT/plugins/`. A user plugin overrides a builtin by `NAME` and
-  claims every extension/filename it declares. Bad plugins are logged and
-  skipped, never fatal.
 - Grammars are prefetched on a daemon thread at writer startup
-  (`PREFETCH_GRAMMARS=0` disables) and loaded lazily otherwise.
+  (`PREFETCH_GRAMMARS=0` disables). Only the symbol-mapped grammars
+  (`mapped_grammars()`, ~30) are prefetched: pulling all ~370 would trigger a
+  download storm for no benefit.
+- `catalog.VERSION` is stored as `meta.language_catalog_version`.
+  `runtime._reconcile_language_catalog` compares it at startup and drops rows
+  whose path is no longer allowed or whose stored `language` no longer matches
+  detection; the startup sweep re-indexes them. No schema change, no re-embed.
 
 ### 7.4 `embed.py` and `model_prompts.py`
 
@@ -1037,8 +1053,8 @@ search continue. `get_status.services` reports
 
 ### 7.15 `harnesses/` and `setup_wizard/`
 
-A harness plugin is a plain module loaded from `builtin/`, `<repo>/harnesses/`,
-or `<workspace>/harnesses/`; a user plugin overrides a builtin by `NAME`. It
+A harness plugin is a plain module loaded from `src/simple_code_indexer/harnesses/`,
+`<repo>/harnesses/`, or `<workspace>/harnesses/`; a user plugin overrides a builtin by `NAME`. It
 declares `NAME`, `LABEL`, detection dirs/binaries, global config paths, format
 (`json`, `toml`, or `yaml`), the config root key, and optional
 `entry`/`render`/`remove` callables. Writer helpers parse/merge without
@@ -1166,7 +1182,10 @@ message.
   "vector_store_ok": true,
   "vector_index": "d:/projects/my-app/.simple-ci/vectors.faiss",
   "embed_ok": true,
-  "plugins_loaded": 36,
+  "languages_loaded": 322,
+  "languages_with_symbol_maps": 29,
+  "languages_indexed": 4,
+  "data_formats_excluded": 49,
   "grammars_ready": 36,
   "workspace": "d:/projects/my-app",
   "index_db": "d:/projects/my-app/.simple-ci/index.db",
@@ -1273,7 +1292,7 @@ harness actually spawned.
 
 | Extension | Mechanism | Rules |
 |---|---|---|
-| Language support | Drop-in module in `builtin/`, `<repo>/plugins/`, or `<workspace>/plugins/` | `NAME`, `GRAMMAR`, `EXTENSIONS`/`FILENAMES`; optional `SYMBOL_NODES`, `extract`; user plugin overrides a builtin by `NAME`; bad plugins skipped |
+| Language support | Generated table in `languages/catalog.py` | one `LanguageSpec` per language (`name` == `grammar`); `DATA_FORMATS` are never registered; hand-maintained overrides live in `tools/gen_language_catalog.py`; re-run the tool rather than editing the table |
 | Harness support | Drop-in module in `harnesses/` or workspace `harnesses/` | config paths, format, root key, optional entry/render/remove; global scope only in the wizard; user overrides builtin by `NAME` |
 | Vector backend | New module plus router functions in `vector_store.py` | must provide writer and read-only query paths, identity/describe, flush/reconcile semantics |
 | Embedding model | Catalog entry plus `model_prompts.defaults_for_model` | dimension is probed, never trusted; document-prompt or chunker changes alter the vector identity |

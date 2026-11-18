@@ -1121,7 +1121,9 @@ def test_install_only_no_git_pull_refreshes_the_recorded_entries(
     _project, home, repo = _workspace(tmp_path)
     target = tmp_path / "install"
     target.mkdir()
-    (target / install_mod.LAUNCHER_FILENAME).write_text("# launcher\n", encoding="utf-8")
+    (target / install_mod.LAUNCHER_FILENAME).write_text(
+        "# launcher\n", encoding="utf-8"
+    )
     config = home / ".simple-ci" / "config.yaml"
     config.parent.mkdir(parents=True)
     cursor_config = home / ".cursor" / "mcp.json"
@@ -1166,7 +1168,9 @@ def test_install_only_no_git_pull_is_idempotent(tmp_path: Path, monkeypatch) -> 
     _project, home, repo = _workspace(tmp_path)
     target = tmp_path / "install"
     target.mkdir()
-    (target / install_mod.LAUNCHER_FILENAME).write_text("# launcher\n", encoding="utf-8")
+    (target / install_mod.LAUNCHER_FILENAME).write_text(
+        "# launcher\n", encoding="utf-8"
+    )
     config = home / ".simple-ci" / "config.yaml"
     config.parent.mkdir(parents=True)
     cursor_config = home / ".cursor" / "mcp.json"
@@ -1207,7 +1211,9 @@ def test_install_only_no_git_pull_reports_the_recorded_install(
     recorded = tmp_path / "recorded"
     target = tmp_path / "install"
     target.mkdir()
-    (target / install_mod.LAUNCHER_FILENAME).write_text("# launcher\n", encoding="utf-8")
+    (target / install_mod.LAUNCHER_FILENAME).write_text(
+        "# launcher\n", encoding="utf-8"
+    )
     config = home / ".simple-ci" / "config.yaml"
     config.parent.mkdir(parents=True)
     cursor_config = home / ".cursor" / "mcp.json"

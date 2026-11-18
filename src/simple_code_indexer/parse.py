@@ -1,19 +1,22 @@
 """Symbol extraction and chunking (tree-sitter parsers load lazily).
 
-Language dispatch goes through the plugin registry (registry.py): builtin and
-user drop-in plugins declare allowlist extensions, grammar names, symbol node
-maps, and optional specialized extractors.
+Language dispatch goes through the registry (registry.py), which is driven by the
+generated catalog in languages/catalog.py. Languages with a curated node map or
+a specialized extractor use those; the rest fall back to the pack's own
+`process()` analysis, and finally to the five generic node types.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
 
 from simple_code_indexer.models import Chunk, Symbol
 from simple_code_indexer.registry import LanguageSpec, get_registry
+from simple_code_indexer.tsutil import signature, text, walk
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +56,7 @@ CHUNKER_VERSION = f"windows/{CHUNK_LINES}x{CHUNK_OVERLAP_LINES}/{CHUNK_CHARS}"
 
 
 def detect_language(path: Path) -> str | None:
-    """Map a path to a plugin language name, or None if not allowlisted."""
+    """Map a path to a catalog language id, or None if not indexable."""
     spec = get_registry().detect(path)
     language = spec.name if spec is not None else None
     logger.debug("detected language %s for %s", language or "text", path.name)
@@ -116,7 +119,7 @@ def extract_symbols(path: Path, source: str) -> list[Symbol]:
     """Extract symbols from source; regex fallback when no grammar is loadable."""
     spec = get_registry().detect(path)
     if spec is None:
-        logger.debug("no language plugin for %s; using regex symbols", path.name)
+        logger.debug("no indexed language for %s; using regex symbols", path.name)
         return _regex_symbols(source)
     try:
         parser = _parser(spec.grammar)
@@ -133,45 +136,77 @@ def extract_symbols(path: Path, source: str) -> list[Symbol]:
 
 
 def extract_from_tree(spec: LanguageSpec, root: Any, source: str) -> list[Symbol]:
-    """Run the plugin's extractor, or the generic name-field walker."""
+    """Run the specialized extractor, the node map, or the pack's analysis.
+
+    The pack's `process()` re-parses the source, so it is only consulted for an
+    unmapped language whose generic walk produced nothing. Mapped languages never
+    pay for it.
+    """
     if spec.extract is not None:
         return spec.extract(root, source)
-    return _extract_generic(
+    symbols = _extract_generic(
         root, source, {**_GENERIC_SYMBOL_NODES, **spec.symbol_nodes}
     )
+    if symbols or spec.symbol_nodes or not _symbol_fallback_enabled():
+        return symbols
+    return _process_symbols(spec.grammar, source) or symbols
 
 
-def _walk(root: Any) -> list[Any]:
-    nodes: list[Any] = []
-    stack = [root]
-    while stack:
-        node = stack.pop()
-        nodes.append(node)
-        stack.extend(reversed(node.children))
-    return nodes
+def _symbol_fallback_enabled() -> bool:
+    return os.environ.get("SYMBOL_FALLBACK", "1") != "0"
 
 
-def _text(node: Any, source: str) -> str:
-    return source.encode("utf-8")[node.start_byte : node.end_byte].decode("utf-8")
+def _process_symbols(grammar: str, source: str) -> list[Symbol]:
+    """Named symbols from the pack's own analyzer (unmapped languages only).
 
-
-def _signature(node: Any, source: str) -> str:
-    """Node text up to its body — e.g. `uint32_t f(const Widget&)`."""
-    body = node.child_by_field_name("body")
-    end = body.start_byte if body is not None else node.end_byte
-    return (
-        source.encode("utf-8")[node.start_byte : end]
-        .decode("utf-8")
-        .rstrip()
-        .rstrip(";")
-    )
+    The pack recognizes declarations that our five generic node types do not, so
+    this roughly doubles symbol coverage for the catalog. Any failure is a debug
+    log: symbol extraction must never fail an index write.
+    """
+    try:
+        from tree_sitter_language_pack import ProcessConfig, process
+    except ImportError:
+        return []
+    try:
+        result = process(
+            source,
+            ProcessConfig(
+                language=grammar,
+                structure=True,
+                imports=False,
+                exports=False,
+                docstrings=False,
+                diagnostics=False,
+            ),
+        )
+    except Exception:
+        logger.debug("pack process() unavailable for %r", grammar, exc_info=True)
+        return []
+    symbols: list[Symbol] = []
+    for item in getattr(result, "structure", ()) or ():
+        name = getattr(item, "name", None)
+        if not name:
+            continue
+        span = getattr(item, "span", None)
+        start = int(getattr(span, "start_line", 0)) + 1 if span else 1
+        end = int(getattr(span, "end_line", 0)) + 1 if span else None
+        symbols.append(
+            Symbol(
+                name=str(name),
+                kind=str(getattr(item, "kind", "function") or "function"),
+                line=start,
+                line_end=end,
+                signature=None,
+            )
+        )
+    return symbols
 
 
 def _extract_generic(
     root: Any, source: str, symbol_nodes: dict[str, str]
 ) -> list[Symbol]:
     symbols: list[Symbol] = []
-    for node in _walk(root):
+    for node in walk(root):
         kind = symbol_nodes.get(node.type)
         if kind is None:
             continue
@@ -180,11 +215,11 @@ def _extract_generic(
             continue
         symbols.append(
             Symbol(
-                name=_text(name_node, source),
+                name=text(name_node, source),
                 kind=kind,
                 line=node.start_point[0] + 1,
                 line_end=node.end_point[0] + 1,
-                signature=_signature(node, source) or None,
+                signature=signature(node, source) or None,
             )
         )
     return symbols

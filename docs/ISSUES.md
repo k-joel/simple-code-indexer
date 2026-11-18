@@ -84,13 +84,29 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ## Open
 
-### ISS-12: `ruff format --check` fails on two committed files
+### ISS-13: Most catalog languages produce no symbols
 
-- **Symptom**: `uv run ruff format --check .` reports `2 files would be reformatted`.
-- **Where flagged**: 2026-11-15, while running the quality gate before adding `docs/RUNBOOK.md`.
-- **Cause**: `src/simple_code_indexer/setup_wizard/__init__.py:1337` and
-  `tests/test_setup_wizard.py:1124`, `:1170`, `:1213` are committed without `ruff format`.
-- **Suggested fix**: run
-  `uv run ruff format src/simple_code_indexer/setup_wizard/__init__.py tests/test_setup_wizard.py`,
-  then re-run `uv run ruff format --check .` and the quality gate.
+- **Symptom**: `symbol_lookup` never resolves a name in most newly indexable languages (Zig, Nim,
+  Svelte, Vue, Terraform, Nix, V, Odin, Gleam, and others); the file is searchable but contributes
+  no symbols.
+- **Where flagged**: 2026-11-17, during the catalog consolidation (ADR-016).
+- **Cause**: `tools/gen_language_catalog.py` only ships the 29 curated `SYMBOL_NODES` maps; the
+  pack's `process()` fallback (`parse._process_symbols`) named a symbol for just 6 of 29 unmapped
+  languages sampled.
+- **Suggested fix**: add `SYMBOL_NODES` entries to the generator for languages users report, keeping
+  `catalog.VERSION` unchanged (no index migration needed). Verify each node type against the real
+  grammar before committing.
+
+### ISS-14: Concurrent first readers can spawn two sidecar daemons
+
+- **Symptom**: `tests/test_sidecar_daemon.py::test_concurrent_readers_share_one_daemon` intermittently
+  fails with `assert 2 == 3`; the captured log shows two `spawned sidecar writer pid=...` lines for
+  one workspace, and the losing session is dropped and later re-registered.
+- **Where flagged**: 2026-11-17, during the catalog consolidation (ADR-016); the sidecar code was not
+  part of that change, and the test passes in isolation.
+- **Cause**: `src/simple_code_indexer/sidecar/client.py:261` takes `spawn.lock`, but two readers that
+  both find no ready file can still both reach `_spawn_daemon` at `:275` — the ready-file check and
+  the spawn are not atomic under the same lock hold.
+- **Suggested fix**: re-read the ready file while still holding the spawn lock and skip the spawn when
+  a live pid is published; then re-run the test repeatedly (not just once) to confirm.
 

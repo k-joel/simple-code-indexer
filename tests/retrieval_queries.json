@@ -52,14 +52,14 @@
     {
       "id": "q09-cpp-symbols",
       "query": "how is a C++ function symbol extracted with tree-sitter",
-      "expected_files": ["src/simple_code_indexer/parse.py", "src/simple_code_indexer/builtin/cpp.py"],
+      "expected_files": ["src/simple_code_indexer/parse.py", "src/simple_code_indexer/languages/extractors.py"],
       "tags": ["parsing"]
     },
     {
-      "id": "q10-plugin-override",
-      "query": "how do user language plugins override builtin extensions",
-      "expected_files": ["src/simple_code_indexer/registry.py"],
-      "tags": ["plugins"]
+      "id": "q10-language-catalog",
+      "query": "which file extensions and grammars does the language catalog declare",
+      "expected_files": ["src/simple_code_indexer/languages/catalog.py"],
+      "tags": ["languages"]
     },
     {
       "id": "q11-opencode-path",
@@ -225,9 +225,9 @@
     },
     {
       "id": "q38-prefetch",
-      "query": "how does the plugin registry prefetch tree-sitter grammars in the background",
+      "query": "how does the language registry prefetch tree-sitter grammars in the background",
       "expected_files": ["src/simple_code_indexer/registry.py"],
-      "tags": ["plugins", "parsing"]
+      "tags": ["languages", "parsing"]
     },
     {
       "id": "q39-identity",

@@ -234,8 +234,9 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   probes the embedding dimension, writes `~/.simple-ci/config.yaml`, and registers detected harnesses.
   A `service` block names a container the writer starts and waits for at boot. Harness support is a
   plugin folder (`src/simple_code_indexer/harnesses/`, user drop-ins in `<repo>/harnesses/` and
-  `<workspace>/harnesses/`) mirroring the language plugin system; a bad plugin is skipped, never fatal,
-  and a user drop-in overrides a builtin by `NAME`.
+  `<workspace>/harnesses/`); a bad plugin is skipped, never fatal,
+  and a user drop-in overrides a builtin by `NAME`. (Language support was originally a parallel plugin
+  folder; ADR-016 replaced it with a generated table, so harnesses are now the only plugin axis.)
 - **Consequences:** `pyyaml` is a runtime dependency. The wizard and service manager take injectable
   runners/probers so tests need neither Docker nor network. Managed services are **fail-soft**: startup can
   block up to `startup_timeout_s`, but Docker being unavailable never refuses to serve — lexical search
@@ -408,3 +409,35 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   too is debugging-only and should not survive the session. When a harness genuinely cannot spawn
   in the project directory, that is a harness defect to record in `docs/ISSUES.md`, not something
   to paper over per project.
+
+## ADR-016: A generated language catalog replaces the plugin folder
+
+- **Context:** Language support was 38 `.py` modules under `builtin/` loaded with `importlib`, plus a
+  user drop-in folder (`<repo>/plugins/`, `<workspace>/plugins/`) with `NAME`-based override and
+  extension-stealing semantics. The folder shipped empty, and the override rules carried a documented
+  gotcha (a same-`NAME` drop-in frees the original extensions silently). Coverage was 36 languages;
+  the pack ships 371, so a Zig/Nim/Svelte/Solidity repo got `language="text"` and regex symbols.
+  Adding 336 modules would have cost ~0.35 s of `importlib` startup per process — for shipped data.
+  Two traps came with the expansion: the upstream table maps `.txt` to `vimdoc` and `.h` to `c`, and
+  49 catalog languages declare no extension at all.
+- **Decision:** `src/simple_code_indexer/languages/catalog.py` is a single generated
+  `tuple[LanguageSpec, ...]`, produced by `tools/gen_language_catalog.py` from the pack's published
+  language table. `registry.py` only indexes it; the `importlib` loader, the override machinery, and
+  both `plugins/` folders are deleted. Deliberate deviations from upstream live in the generator as
+  `EXT_OVERRIDES` (`.h`→`cpp`, `.m`→`objc`, `.tsx`→`tsx`) and `FILENAMES` (`CMakeLists.txt`,
+  `Dockerfile`, `Makefile`, `.vimrc`). Language ids are pack grammar names (`csharp`, not `c_sharp`).
+  The pack's own detector is never called at runtime.
+- **Decision (data formats):** `catalog.DATA_FORMATS` names every serialization/documentation/VCS
+  grammar, and those entries are **not registered**. Detection therefore returns `None`, the allowlist
+  never contains their extensions, and the indexer cannot ingest them. This keeps the pre-existing
+  "data formats are not indexed" rule and hardens it: a filename match still runs first, so
+  `CMakeLists.txt` resolves to `cmake` even though `.txt` belongs to the denied `vimdoc` language.
+- **Consequences:** Language coverage goes 36 → 322 indexable languages at zero startup cost, with no
+  storage-format change. Symbols are not free: only ~29 languages have a curated node map or extractor.
+  `symbol_lookup` now returns a `coverage` signal (`none`/`partial`/`full`) plus a hint when a language
+  produced no symbols, and unmapped languages get one attempt through the pack's `process()` analysis
+  (`SYMBOL_FALLBACK=0`, measured to name a symbol for 6 of 29 unmapped languages sampled). Prefetch is
+  bounded to the symbol-mapped grammars so startup cannot trigger a ~370-grammar download storm.
+  `catalog.VERSION` is stored in `meta` and drives a targeted reconcile (drop rows that are no longer
+  allowed or whose stored language changed) rather than a full re-embed. Fixing a wrong mapping is now
+  a generator edit plus regeneration, not a user drop-in — accepted because the folder was empty.

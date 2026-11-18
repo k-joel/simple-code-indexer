@@ -77,4 +77,4 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ## Inventory
 
-_No tools registered._
+- **`gen_language_catalog.py`** — Regenerates `src/simple_code_indexer/languages/catalog.py` from the `tree-sitter-language-pack` language table, merging the hand-maintained `EXT_OVERRIDES`, `FILENAMES`, `DATA_FORMATS`, symbol-node maps, and extractor ids; `--check` exits non-zero on drift and `--table` reads a saved page for offline runs. Requires network unless `--table` is given; otherwise standard library only.

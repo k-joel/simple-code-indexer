@@ -303,6 +303,25 @@ def symbol_lookup(conn: sqlite3.Connection, name: str) -> list[Symbol]:
     ]
 
 
+def languages_indexed(conn: sqlite3.Connection) -> dict[str, int]:
+    """Indexed file count per language id (the coverage denominator)."""
+    rows = conn.execute(
+        "SELECT language, COUNT(*) AS files FROM files GROUP BY language"
+    ).fetchall()
+    return {str(row["language"]): int(row["files"]) for row in rows}
+
+
+def languages_with_symbols(conn: sqlite3.Connection) -> frozenset[str]:
+    """Language ids that actually produced at least one symbol."""
+    rows = conn.execute(
+        """
+        SELECT DISTINCT f.language AS language
+        FROM symbols s JOIN files f ON f.id = s.file_id
+        """
+    ).fetchall()
+    return frozenset(str(row["language"]) for row in rows)
+
+
 def stats(conn: sqlite3.Connection) -> dict[str, int]:
     row = conn.execute(
         """

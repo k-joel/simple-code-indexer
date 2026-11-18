@@ -41,6 +41,7 @@ from simple_code_indexer.errors import (
     VectorStoreUnavailable,
     WorkspaceBusy,
 )
+from simple_code_indexer.languages import catalog
 from simple_code_indexer.registry import get_registry
 from simple_code_indexer.sidecar import ReaderSession
 
@@ -111,15 +112,18 @@ def _status_payload(
             if conn is None:
                 counts = {"files": 0, "symbols": 0, "chunks": 0}
                 embedding = {"embedded": 0, "pending": 0}
+                languages_seen: dict[str, int] = {}
                 index_ready = False
             else:
                 counts = db.stats(conn)
                 embedding = db.embedding_counts(conn)
+                languages_seen = db.languages_indexed(conn)
                 index_ready = True
     except sqlite3.Error:
         logger.debug("cannot read the index for get_status", exc_info=True)
         counts = {"files": 0, "symbols": 0, "chunks": 0}
         embedding = {"embedded": 0, "pending": 0}
+        languages_seen = {}
         index_ready = False
     registry = get_registry()
     from simple_code_indexer.parse import _parsers
@@ -141,7 +145,10 @@ def _status_payload(
         "vector_store_ok": vector_store.last_ok(settings),
         "vector_index": vector_store.describe(settings),
         "embed_ok": embed.LAST_OK is True,
-        "plugins_loaded": len(registry),
+        "languages_loaded": len(registry),
+        "languages_with_symbol_maps": len(registry.mapped_grammars()),
+        "languages_indexed": len(languages_seen),
+        "data_formats_excluded": len(catalog.DATA_FORMATS),
         "grammars_ready": len(_parsers),
         "workspace": str(settings.workspace_root),
         "index_db": str(settings.index_db_path),
@@ -358,6 +365,47 @@ def _search_code(
     }
 
 
+def _symbol_coverage(settings: Settings) -> dict[str, Any]:
+    """Distinguish "no symbol support for this language" from "symbol absent".
+
+    A zero-symbol language and a genuinely missing symbol used to return the same
+    payload, which makes the tool look broken. Callers get the coverage signal so
+    they fall back to `search_code` instead of concluding the symbol does not
+    exist.
+    """
+    try:
+        with db.try_connect_readonly(settings.index_db_path) as conn:
+            if conn is None:
+                return {}
+            indexed = db.languages_indexed(conn)
+            mapped = db.languages_with_symbols(conn)
+    except sqlite3.Error:
+        logger.debug("cannot read symbol coverage", exc_info=True)
+        return {}
+
+    languages = sorted(indexed)
+    covered = sorted(set(languages) & mapped)
+    if not languages or not covered:
+        state = "none"
+    elif len(covered) == len(languages):
+        state = "full"
+    else:
+        state = "partial"
+    payload: dict[str, Any] = {
+        "coverage": state,
+        "languages_indexed": languages,
+        "languages_with_symbols": covered,
+    }
+    if state != "full":
+        payload["hint"] = (
+            "symbol extraction is unavailable for "
+            + ", ".join(sorted(set(languages) - set(covered)))
+            + "; use search_code for those languages instead of concluding the "
+            "symbol does not exist"
+        )
+    return payload
+
+
 def _symbol_lookup(settings: Settings, args: dict[str, Any]) -> dict[str, Any]:
     name = str(args.get("symbol", ""))
     try:
@@ -392,8 +440,10 @@ def _symbol_lookup(settings: Settings, args: dict[str, Any]) -> dict[str, Any]:
             "language": s.language,
         }
 
+    coverage = _symbol_coverage(settings)
+
     if not symbols:
-        return {"symbol": name, "found": False, "matches": []}
+        return {"symbol": name, "found": False, "matches": [], **coverage}
     if len(symbols) == 1:
         return flat(symbols[0])
     return {

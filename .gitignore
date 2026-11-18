@@ -14,14 +14,13 @@ wheels/
 .ruff_cache/
 
 # Coding harnesses
+.agents/
 .mimocode/
 .commandcode/
 .kilo/
 
 # Index database + local config (SQLite WAL)
 .simple-ci/
-# Legacy index directory from before the rename
-.index/
 
 # Project artifacts
 artifacts/

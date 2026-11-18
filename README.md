@@ -520,18 +520,32 @@ one; a user plugin overrides a builtin by `NAME`. See
 [harnesses/README.md](harnesses/README.md) for the contract. Bad plugins are logged and
 skipped, never fatal.
 
-## Language plugins
+## Languages
 
-36 builtin languages ship in `src/simple_code_indexer/builtin/` (original
-Code-Index-MCP set minus data/doc formats). To add one: drop `lang_name.py` in
-[`plugins/`](plugins/) or `$WORKSPACE_ROOT/plugins/` — see
-[plugins/README.md](plugins/README.md) for the contract. User plugins override
-builtin plugins with the same `NAME`. Restart the server to pick up changes.
-Data formats (json, yaml, markdown, …) are intentionally not indexed.
+All 371 languages of `tree-sitter-language-pack` are declared in a single
+generated table, `src/simple_code_indexer/languages/catalog.py`. There is no
+drop-in plugin folder: adding or correcting a language means editing the
+generator (`tools/gen_language_catalog.py`) and re-running it.
 
-`get_status` reports `plugins_loaded` and `grammars_ready`. Grammars download
-from tree-sitter-language-pack on demand (background prefetch at startup;
-`PREFETCH_GRAMMARS=0` disables it).
+**Data formats are never indexed.** Serialization and documentation formats —
+`.md`, `.txt`, `.json`, `.yaml`, `.toml`, `.xml`, `.csv`, `.ini`, `.rst` and the
+rest of `catalog.DATA_FORMATS` — are catalogued for completeness but are not
+registered, so detection returns `None` and the indexer skips the file. That is
+an absolute rule, not a default: `CMakeLists.txt` is matched by *filename* as
+CMake, which is why the `.txt` denial never swallows it.
+
+Specialized extractors live in `languages/extractors.py` (Python, Make, and the
+C/C++ declarator-chain walker). Every other language uses its symbol-node map if
+it has one; otherwise the pack's own `process()` analysis is tried, and finally
+the five generic node types. `SYMBOL_FALLBACK=0` disables that last step.
+
+`get_status` reports `languages_loaded`, `languages_with_symbol_maps`,
+`languages_indexed`, `data_formats_excluded`, and `grammars_ready`. Grammars
+download from tree-sitter-language-pack on demand; startup prefetches only the
+symbol-mapped grammars (~30, not 370) in a daemon thread, and
+`PREFETCH_GRAMMARS=0` disables it. `symbol_lookup` reports a `coverage` signal
+when a language produced no symbols, so a missing symbol is distinguishable from
+a language that cannot resolve symbols at all.
 
 ## Development
 

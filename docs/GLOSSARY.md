@@ -80,8 +80,20 @@ The single root directory whose files are indexed and watched. The MCP process w
 _Avoid_: repo, repository, project root, codebase
 
 **File record**:
-The stored metadata for one indexed workspace file: path, language, size, content hash, mtime.
+The stored metadata for one indexed workspace file: path, language, size, content hash, mtime. The `language` value is a catalog language id, which is the tree-sitter grammar name.
 _Avoid_: document, entry, file entry
+
+**Language catalog**:
+The single generated table (`languages/catalog.py`) of every supported language: its id, grammar, extensions, filenames, symbol-node map, and optional extractor. Produced by `tools/gen_language_catalog.py`; there are no user drop-ins.
+_Avoid_: language plugin, plugin folder
+
+**Data format**:
+A language in the catalog that must never be indexed — serialization, documentation, and VCS/tool config grammars (`.md`, `.txt`/vimdoc, `.json`, `.yaml`, `.toml`, and the rest of `catalog.DATA_FORMATS`). Those entries are not registered, so detection returns `None`. A filename match still wins, which is why `CMakeLists.txt` is CMake and not a denied `.txt`.
+_Avoid_: non-code file, text file
+
+**Symbol coverage**:
+Whether the indexed languages can resolve symbols at all. Reported by `symbol_lookup` as `none`/`partial`/`full` so a missing symbol is distinguishable from a language that produced no symbols; the hint points the caller at `search_code`.
+_Avoid_: symbol accuracy, symbol quality
 
 **Symbol**:
 A named code definition extracted from a file (function, class, method, etc.) with kind, line range, and signature.

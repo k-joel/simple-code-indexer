@@ -1,6 +1,6 @@
 """Harness plugins: how each MCP client stores its server list.
 
-Contract (same as `builtin/` language plugins — plain module globals):
+Contract (plain module globals):
 
     NAME            stable id (file stem by convention)
     LABEL           human label shown by the setup wizard

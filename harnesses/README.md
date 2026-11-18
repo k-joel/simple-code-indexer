@@ -1,8 +1,10 @@
 # User harness plugins
 
 Drop-in modules that teach the setup wizard how a particular MCP client stores
-its server list. They follow the same contract as `src/simple_code_indexer/builtin/`
-language plugins: a plain `.py` file whose module globals are read by the loader.
+its server list. A plugin is a plain `.py` file whose module globals are read by
+the loader. (Languages used to work the same way; they are now a generated table
+in `src/simple_code_indexer/languages/catalog.py`, so harnesses are the only
+remaining plugin axis.)
 
 Search order (later wins): the builtin package → `<repo>/harnesses/` →
 `<workspace>/harnesses/`. A user plugin overrides a builtin by `NAME`; modules

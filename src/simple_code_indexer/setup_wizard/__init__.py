@@ -1334,9 +1334,7 @@ class Wizard:
                 self.prompts.say(f"Would update {target}:\n{snippet}")
             else:
                 try:
-                    write.install(
-                        spec, target, SERVER_NAME, command, self.harness_env
-                    )
+                    write.install(spec, target, SERVER_NAME, command, self.harness_env)
                 except (TypeError, ValueError, OSError) as exc:
                     self.prompts.say(f"Could not update {target}: {exc}")
                     self.prompts.say(
@@ -1459,9 +1457,7 @@ def _install_only(args: argparse.Namespace) -> int:
     return _repin_recorded_harnesses(target, prompts, dry_run=args.dry_run)
 
 
-def _repin_recorded_harnesses(
-    target: Path, prompts: Prompter, *, dry_run: bool
-) -> int:
+def _repin_recorded_harnesses(target: Path, prompts: Prompter, *, dry_run: bool) -> int:
     """Rewrite the recorded entries with the pull pin; returns a failure count."""
     config_path = configfile.global_config_path()
     record = uninstall.read_record(config_path)
