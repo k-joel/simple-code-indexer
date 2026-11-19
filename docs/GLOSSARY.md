@@ -76,8 +76,27 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 ## Language
 
 **Workspace**:
-The single root directory whose files are indexed and watched. The MCP process working directory, unless `WORKSPACE_ROOT` says otherwise.
+The single root directory whose files are indexed and watched. Resolved from `WORKSPACE_ROOT`, the
+client's MCP roots, the launching harness's published workspace, or the process working directory,
+in that order.
 _Avoid_: repo, repository, project root, codebase
+
+**Workspace source**:
+Which of the four workspace sources won for a session: `env`, `roots`, `harness:<name>`, or `cwd`.
+Reported as `Settings.workspace_source`, `get_status.workspace_source`, and in the startup banner.
+_Avoid_: workspace origin, cwd mode
+
+**MCP roots**:
+The folder list a client publishes for the session via the protocol's `roots/list` request. Probed
+once after the handshake, bounded by `SIMPLE_CI_ROOTS_TIMEOUT_S`; the first existing `file:`
+directory wins.
+_Avoid_: root dirs, client folders
+
+**Harness-published workspace**:
+A workspace a harness plugin returns from its optional `resolve_workspace(cwd)` hook, normally
+selected by the stable `SIMPLE_CI_HARNESS=<NAME>` entry marker; an entry without the marker is still
+asked every resolver when the cwd is implausible. All client-specific discovery stays inside the
+plugin. _Avoid_: harness cwd, plugin workspace
 
 **File record**:
 The stored metadata for one indexed workspace file: path, language, size, content hash, mtime. The `language` value is a catalog language id, which is the tree-sitter grammar name.

@@ -69,6 +69,7 @@ class Settings:
     mode: str = "sidecar"
     idle_grace_s: float = 60.0
     heartbeat_s: float = 5.0
+    workspace_source: str = "cwd"
 
     @property
     def sweep_enabled(self) -> bool:
@@ -179,32 +180,84 @@ def _prompt(
     return value
 
 
-def workspace_root_from_env() -> Path:
-    """`WORKSPACE_ROOT` when set, else the process cwd (the harness spawn dir)."""
-    env_root = os.environ.get("WORKSPACE_ROOT")
-    return Path(env_root).resolve() if env_root else Path.cwd().resolve()
+def resolve_workspace_root(mcp_workspace: Path | None = None) -> tuple[Path, str]:
+    """WORKSPACE_ROOT > MCP roots > harness-published workspace > process cwd.
 
+    Returns the workspace and its source — ``env``, ``roots``,
+    ``harness:<name>`` or ``cwd`` — so the choice is observable through
+    ``get_status.workspace_source`` (ADR-018).
 
-def _reject_home_workspace(workspace_root: Path) -> None:
-    """Refuse a harness spawn that resolved to the user's home directory.
-
-    Some clients (the OpenCode desktop home screen) start the global MCP entry
-    with the home directory as cwd. Indexing all of home would write a huge
-    `~/.simple-ci/index.db` next to the global config, so fail loudly instead;
-    an explicit `WORKSPACE_ROOT` still opts in.
+    Discovery is normally sealed by the entry's `SIMPLE_CI_HARNESS` marker. An
+    entry installed before that marker existed gets no marker at all, so when
+    the cwd is implausible (the editor's own install directory, the home
+    directory) every plugin with a resolver is asked instead. A plausible cwd
+    is never overridden: a terminal launch keeps indexing where it was started.
     """
-    if os.environ.get("WORKSPACE_ROOT"):
-        return
+    env_root = os.environ.get("WORKSPACE_ROOT")
+    if env_root:
+        return Path(env_root).resolve(), "env"
+    if mcp_workspace is not None:
+        return mcp_workspace.resolve(), "roots"
+    cwd = Path.cwd().resolve()
+    from simple_code_indexer import harnesses
+
+    found = harnesses.discover_workspace(cwd)
+    if found is None and _implausible_reason(cwd) is not None:
+        found = harnesses.discover_workspace(cwd, require_marker=False)
+    if found is not None:
+        return found[0], f"harness:{found[1]}"
+    return cwd, "cwd"
+
+
+def workspace_root_from_env() -> Path:
+    """The resolved workspace path (see `resolve_workspace_root`)."""
+    return resolve_workspace_root()[0]
+
+
+def _implausible_reason(workspace_root: Path) -> str | None:
+    """Why an *inferred* workspace cannot be a project root, or None.
+
+    Two directories are never projects: the user's home (the OpenCode desktop
+    home screen starts the global entry there, and indexing all of home would
+    write a huge `~/.simple-ci/index.db`) and the installation directory of a
+    live ancestor process (a harness that spawns stdio children without a cwd
+    makes the server inherit its own editor's install root).
+    """
     try:
         home = Path.home().resolve()
     except (OSError, RuntimeError):
+        home = None
+    if home is not None and workspace_root == home:
+        return "the user home directory"
+    from simple_code_indexer import parent_watch
+
+    for directory, name in parent_watch.ancestor_install_dirs():
+        if workspace_root == directory:
+            return f"the {name} installation directory"
+    return None
+
+
+def _reject_implausible_workspace(workspace_root: Path, source: str) -> None:
+    """Refuse an *inferred* workspace that cannot be a project root.
+
+    An explicit `WORKSPACE_ROOT` and a client-published MCP root are opt-ins:
+    in both cases the user chose the directory. Everything else must look like a
+    project, so a harness that spawns the server outside one fails loudly
+    instead of silently building an empty index it cannot even log to.
+    """
+    if source in {"env", "roots"}:
         return
-    if workspace_root == home:
-        raise ConfigError(
-            "the harness started the server in the user home directory "
-            f"({workspace_root}); refusing to index it. Start a session in a "
-            "project folder or set WORKSPACE_ROOT to the directory to index."
-        )
+    reason = _implausible_reason(workspace_root)
+    if reason is None:
+        return
+    raise ConfigError(
+        f"the harness started the server in {reason} ({workspace_root}); "
+        "refusing to index it. Start a session in a project folder or set "
+        "WORKSPACE_ROOT to the directory to index. If the harness spawns the "
+        "server outside the project, rewrite its entry with "
+        "`python setup.py --harnesses <name>` so the harness can publish its "
+        "workspace."
+    )
 
 
 def _pick_str(env_name: str, file_value: str | None, default: str) -> str:
@@ -344,12 +397,12 @@ def _log_level(file_value: str | None, env_value: str | None) -> str:
     return "debug"
 
 
-def load_settings() -> Settings:
+def load_settings(*, mcp_workspace: Path | None = None) -> Settings:
     from simple_code_indexer.registry import get_registry
 
     registry = get_registry()
-    workspace_root = workspace_root_from_env()
-    _reject_home_workspace(workspace_root)
+    workspace_root, workspace_source = resolve_workspace_root(mcp_workspace)
+    _reject_implausible_workspace(workspace_root, workspace_source)
     config_paths = configfile.config_paths(workspace_root)
     raw = configfile.load_layered_config(config_paths) if config_paths else {}
     embedding = configfile.get_mapping(raw, "embedding")
@@ -493,4 +546,5 @@ def load_settings() -> Settings:
         mode=mode,
         idle_grace_s=idle_grace_s,
         heartbeat_s=heartbeat_s,
+        workspace_source=workspace_source,
     )

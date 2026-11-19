@@ -27,6 +27,7 @@ from simple_code_indexer import (
     embed,
     indexer,
     logging_setup,
+    mcp_roots,
     parent_watch,
     runtime,
     services,
@@ -151,6 +152,7 @@ def _status_payload(
         "data_formats_excluded": len(catalog.DATA_FORMATS),
         "grammars_ready": len(_parsers),
         "workspace": str(settings.workspace_root),
+        "workspace_source": settings.workspace_source,
         "index_db": str(settings.index_db_path),
         "config_file": str(settings.config_source) if settings.config_source else None,
         "config_files": [str(path) for path in settings.config_sources],
@@ -515,24 +517,118 @@ def _call_tool(
     return _json_result(payload)
 
 
-def _build_server(
-    settings: Settings,
-    *,
-    role: str = "writer",
-    session: ReaderSession | None = None,
-) -> Server:
+class ServerState:
+    """Workspace-bound settings and the role runtime, resolved once the session exists.
+
+    Workspace sources are, in order, `WORKSPACE_ROOT`, the client's MCP roots,
+    the harness-published workspace, and the process cwd
+    (`config.resolve_workspace_root`). MCP roots can only be requested after
+    the handshake, so this object defers `load_settings()`, the log file, and
+    the runtime start until then (ADR-018).
+    """
+
+    def __init__(self, exit: Callable[[int], NoReturn] = os._exit) -> None:
+        self._exit = exit
+        self._lock = asyncio.Lock()
+        self._cleanup: Callable[[], None] | None = None
+        self._finalized = False
+        self._started_at = time.monotonic()
+        self.settings: Settings | None = None
+        self.role = "reader"
+        self.session: ReaderSession | None = None
+
+    async def ensure_started(self, session: Any) -> None:
+        """Resolve the workspace and start the writer/reader exactly once."""
+        if self.settings is not None:
+            return
+        async with self._lock:
+            if self.settings is not None:
+                return
+            roots = await mcp_roots.first_workspace(session)
+            try:
+                settings = load_settings(mcp_workspace=roots)
+            except ConfigError as exc:
+                logger.error("%s", exc)
+                self._exit(1)
+                raise
+            self._start(settings)
+
+    def _start(self, settings: Settings) -> None:
+        if settings.mode == "embedded":
+            log_file = logging_setup.configure_file(
+                settings, filename=logging_setup.EMBED_LOG_FILENAME
+            )
+            logging_setup.log_startup(settings, log_file, role="writer")
+            writer = runtime.WriterRuntime(settings, started_at=self._started_at)
+            try:
+                writer.start()
+            except WorkspaceBusy:
+                logger.error(
+                    "another simple-code-indexer already owns %s; refusing to start",
+                    settings.index_db_path,
+                )
+                self._exit(1)
+                raise
+            self.role = "writer"
+            self._cleanup = writer.stop
+        else:
+            log_file = logging_setup.configure_file(
+                settings, filename=logging_setup.READER_LOG_FILENAME
+            )
+            logging_setup.log_startup(settings, log_file, role="reader")
+            reader = ReaderSession(settings)
+            reader.start()
+            self.session = reader
+            self.role = "reader"
+            self._cleanup = reader.close
+        self.settings = settings
+        atexit.register(self.cleanup_once)
+        logger.info(
+            "serving on stdio (startup %.0f ms, role=%s)",
+            (time.monotonic() - self._started_at) * 1000,
+            self.role,
+        )
+
+    def cleanup_once(self) -> None:
+        """Stop the writer or unregister the reader exactly once."""
+        if self._finalized:
+            return
+        self._finalized = True
+        atexit.unregister(self.cleanup_once)
+        if self._cleanup is None:
+            return
+        try:
+            self._cleanup()
+        except Exception:
+            logger.warning("shutdown cleanup failed", exc_info=True)
+
+
+def _build_server(state: ServerState) -> Server:
     async def on_call_tool(
         ctx: Any, params: types.CallToolRequestParams
     ) -> types.CallToolResult:
+        await state.ensure_started(ctx.session)
+        assert state.settings is not None
         return _call_tool(
-            settings, params.name, params.arguments or {}, role=role, session=session
+            state.settings,
+            params.name,
+            params.arguments or {},
+            role=state.role,
+            session=state.session,
         )
 
-    return Server(
+    async def on_initialized(ctx: Any, params: types.NotificationParams) -> None:
+        await state.ensure_started(ctx.session)
+
+    server = Server(
         "simple-code-indexer",
         on_list_tools=_on_list_tools,
         on_call_tool=on_call_tool,
     )
+    server.add_notification_handler(
+        "notifications/initialized", types.NotificationParams, on_initialized
+    )
+    return server
 
 
 def _acquire_workspace_lock(index_db_path: Path) -> workspace_lock.WorkspaceLock:
@@ -558,7 +654,7 @@ async def _serve(
         dead = watchdog.dead()
         if dead is not None:
             on_parent_gone(dead.describe())
-        logger.debug("parent watchdog: watching %s", watchdog.describe())
+        logger.info("parent watchdog: watching %s", watchdog.describe())
     try:
         async with stdio_server() as (read_stream, write_stream):
             serving = asyncio.create_task(
@@ -591,61 +687,12 @@ async def _serve(
 
 
 async def _run() -> None:
-    started_at = time.monotonic()
-    settings = load_settings()
     logging_setup.install_excepthooks()
-
-    session: ReaderSession | None = None
-    if settings.mode == "embedded":
-        log_file = logging_setup.configure_file(
-            settings, filename=logging_setup.EMBED_LOG_FILENAME
-        )
-        logging_setup.log_startup(settings, log_file, role="writer")
-        writer = runtime.WriterRuntime(settings, started_at=started_at)
-        try:
-            writer.start()
-        except WorkspaceBusy:
-            logger.error(
-                "another simple-code-indexer already owns %s; refusing to start",
-                settings.index_db_path,
-            )
-            raise SystemExit(1) from None
-        role = "writer"
-        cleanup = writer.stop
-    else:
-        log_file = logging_setup.configure_file(
-            settings, filename=logging_setup.READER_LOG_FILENAME
-        )
-        logging_setup.log_startup(settings, log_file, role="reader")
-        session = ReaderSession(settings)
-        session.start()
-        role = "reader"
-        cleanup = session.close
-
-    finalized = False
-
-    def _cleanup_once() -> None:
-        """Stop the writer or unregister the reader exactly once."""
-        nonlocal finalized
-        if finalized:
-            return
-        finalized = True
-        atexit.unregister(_cleanup_once)
-        try:
-            cleanup()
-        except Exception:
-            logger.warning("shutdown cleanup failed", exc_info=True)
-
-    atexit.register(_cleanup_once)
+    state = ServerState()
     watchdog = parent_watch.ParentWatchdog() if parent_watch.enabled() else None
 
     try:
-        server = _build_server(settings, role=role, session=session)
-        logger.info(
-            "serving on stdio (startup %.0f ms, role=%s)",
-            (time.monotonic() - started_at) * 1000,
-            role,
-        )
+        server = _build_server(state)
 
         def _watchdog_exit(description: str) -> NoReturn:
             """Harness gone: stdio_server's reader thread cannot be cancelled, so
@@ -657,7 +704,7 @@ async def _run() -> None:
                 description,
             )
             try:
-                _cleanup_once()
+                state.cleanup_once()
             finally:
                 if watchdog is not None:
                     watchdog.close()
@@ -666,7 +713,7 @@ async def _run() -> None:
 
         await _serve(server, watchdog, _watchdog_exit)
     finally:
-        _cleanup_once()
+        state.cleanup_once()
 
 
 def main() -> None:

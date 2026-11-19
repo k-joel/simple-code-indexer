@@ -13,6 +13,14 @@ Contract (plain module globals):
     entry(...)      optional: build the per-harness server entry
     render(...)     optional: full override for merging into existing text
     remove(...)     optional: strip the server entry (None = nothing to remove)
+    resolve_workspace(cwd)  optional: publish this session's workspace at runtime
+
+A plugin that implements ``resolve_workspace`` must also put the reserved
+``SIMPLE_CI_HARNESS=<NAME>`` key into its entry env (``RUNTIME_ENV``), so the
+server asks that plugin — and only that plugin — for the workspace. The key is
+install-scoped (the same value for every project), never a path. Entries written
+before the key existed are still served: when the cwd is not a plausible project
+the server asks every resolver instead (see ``discover_workspace``).
 
 Search order (later wins): builtin package → ``<repo>/harnesses`` →
 ``<workspace>/harnesses``. A user plugin overrides a builtin by NAME; bad
@@ -46,6 +54,13 @@ logger = logging.getLogger(__name__)
 EntryFn = Callable[[list[str], dict[str, str]], dict[str, Any]]
 RenderFn = Callable[..., str]
 RemoveFn = Callable[..., str | None]
+ResolveWorkspaceFn = Callable[[Path], Path | None]
+
+RUNTIME_ENV = "SIMPLE_CI_HARNESS"
+"""Reserved entry env key naming the plugin that launched this session.
+
+Install-scoped, not per-project: the server uses it to pick the one plugin
+allowed to publish a workspace at runtime (ADR-018)."""
 
 _which = shutil.which
 _UNRESOLVED_VAR = re.compile(r"%[^%]+%")
@@ -63,6 +78,7 @@ class HarnessSpec:
     entry: EntryFn
     render: RenderFn
     remove: RemoveFn
+    workspace_resolver: ResolveWorkspaceFn | None = None
 
     def detected(self, home: Path | None = None) -> bool:
         """True when one of the harness's home folders or binaries exists."""
@@ -135,16 +151,83 @@ def load_harnesses(
     return [specs[name] for name in sorted(specs)]
 
 
-def default_user_harness_dirs() -> list[Path]:
-    """Repo-root harnesses/ (walk up to pyproject.toml) then workspace harnesses/."""
+def default_user_harness_dirs(workspace: Path | None = None) -> list[Path]:
+    """Repo-root harnesses/ (walk up to pyproject.toml) then workspace harnesses/.
+
+    `workspace` is explicit when the caller is *resolving* the workspace
+    (`discover_workspace`); otherwise `workspace_root_from_env()` is used.
+    """
     from simple_code_indexer.config import workspace_root_from_env
 
     dirs: list[Path] = []
     repo_harnesses = _repo_harnesses_dir()
     if repo_harnesses is not None:
         dirs.append(repo_harnesses)
-    dirs.append(workspace_root_from_env() / "harnesses")
+    base = workspace if workspace is not None else workspace_root_from_env()
+    dirs.append(base / "harnesses")
     return dirs
+
+
+def discover_workspace(
+    cwd: Path, *, require_marker: bool = True
+) -> tuple[Path, str] | None:
+    """Workspace published by the harness that launched this session.
+
+    The entry names its plugin through `RUNTIME_ENV`; only that plugin is
+    asked, and only it can answer (ADR-018). ``require_marker=False`` asks every
+    plugin that declares a resolver (the marked one first): an entry installed
+    before the marker existed then keeps working after `run_server.py` updates
+    the code, with no setup re-run. Fail-soft: an unknown plugin, a resolver
+    that raises, or a result that is not an existing directory all fall through
+    to the caller's next workspace source.
+    """
+    name = os.environ.get(RUNTIME_ENV)
+    if require_marker and not name:
+        return None
+    specs = load_harnesses(user_dirs=default_user_harness_dirs(cwd))
+    candidates = [item for item in specs if item.workspace_resolver is not None]
+    if require_marker:
+        candidates = [item for item in candidates if item.name == name]
+        if not candidates:
+            logger.debug("harness %r declares no workspace resolver", name)
+            return None
+    elif name:
+        candidates.sort(key=lambda item: item.name != name)
+    for spec in candidates:
+        found = _ask_resolver(spec, cwd)
+        if found is not None:
+            return found
+    if not name:
+        logger.debug("no harness declares a workspace for this session")
+    return None
+
+
+def _ask_resolver(spec: HarnessSpec, cwd: Path) -> tuple[Path, str] | None:
+    """Ask one plugin for its workspace; never raise (startup must not fail)."""
+    resolver = spec.workspace_resolver
+    if resolver is None:
+        return None
+    try:
+        found = resolver(cwd)
+    except Exception:
+        logger.warning("harness %r workspace resolver failed", spec.name, exc_info=True)
+        return None
+    if found is None:
+        logger.debug(
+            "harness %r published no workspace for this session; next source wins",
+            spec.name,
+        )
+        return None
+    try:
+        found = found.resolve()
+    except OSError:
+        return None
+    if not found.is_dir():
+        logger.warning(
+            "harness %r published %s, which is not a directory", spec.name, found
+        )
+        return None
+    return found, spec.name
 
 
 def _repo_harnesses_dir() -> Path | None:
@@ -207,6 +290,10 @@ def _spec_from_module(module: ModuleType, path: Path) -> HarnessSpec | None:
     if entry is not None and not callable(entry):
         logger.warning("harness plugin %s entry must be callable", path)
         return None
+    resolve_workspace = getattr(module, "resolve_workspace", None)
+    if resolve_workspace is not None and not callable(resolve_workspace):
+        logger.warning("harness plugin %s resolve_workspace must be callable", path)
+        return None
     fmt = getattr(module, "FORMAT", "json")
     if fmt not in {"json", "toml", "yaml"}:
         logger.warning("harness plugin %s FORMAT must be json, toml or yaml", path)
@@ -237,6 +324,11 @@ def _spec_from_module(module: ModuleType, path: Path) -> HarnessSpec | None:
         entry=resolved_entry,
         render=resolved_render,
         remove=resolved_remove,
+        workspace_resolver=(
+            cast(ResolveWorkspaceFn, resolve_workspace)
+            if resolve_workspace is not None
+            else None
+        ),
     )
 
 

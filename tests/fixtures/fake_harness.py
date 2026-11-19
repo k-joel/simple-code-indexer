@@ -4,7 +4,8 @@ Usage: python fake_harness.py <pid-file> <workspace> <server command...>
 
 The spawned server inherits this process's stdin, which the test holds open —
 exactly the harness behaviour that leaves ``stdio_server`` waiting for EOF
-(ISS-3). The script then sleeps until the test kills it.
+(ISS-3). The test writes the MCP handshake into that pipe so the deferred
+workspace resolution runs. The script then sleeps until the test kills it.
 """
 
 from __future__ import annotations

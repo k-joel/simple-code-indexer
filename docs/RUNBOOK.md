@@ -112,7 +112,7 @@ Checks the embedding endpoint required by semantic search and Qdrant when `vecto
 1. Print the settings the probe will use:
 
    ```
-   uv run python -c "from simple_code_indexer.config import load_settings; s = load_settings(); print('workspace:', s.workspace_root); print('index_db:', s.index_db_path); print('vector_store:', s.vector_store); print('embed:', s.embed_model, s.embed_dim)"
+   uv run python -c "from simple_code_indexer.config import load_settings; s = load_settings(); print('workspace:', s.workspace_root); print('source:', s.workspace_source); print('index_db:', s.index_db_path); print('vector_store:', s.vector_store); print('embed:', s.embed_model, s.embed_dim)"
    ```
 
 2. Run the probe from the repository root:
@@ -207,7 +207,7 @@ Tests the MCP stdio contract and index-on-save behavior without a harness. Run i
 
    The probe creates `watch_probe_tmp_<pid>.cpp`, waits for the watcher, saves the file, polls `symbol_lookup`, and removes the file. Expect `PROBE OK`.
 
-4. Read the final status. Expect `writer_ok: true` and `watcher_alive: true`. A nonzero `pending_embeddings` means vectors are still being written and is not a failure.
+4. Read the final status. Expect `writer_ok: true` and `watcher_alive: true`. A nonzero `pending_embeddings` means vectors are still being written and is not a failure. `workspace_source` names the resolved source (`env`, `roots`, `harness:<name>`, `cwd`); a harness whose entry predates ADR-018 reports `cwd` until `python setup.py --harnesses <name>` rewrites it.
 
 **Troubleshooting**
 
@@ -217,6 +217,7 @@ Tests the MCP stdio contract and index-on-save behavior without a harness. Run i
 - **`PROBE FAIL: ... not indexed within 5 s of save`**: check `.gitignore` and `IGNORE_DIRS`, then search `writer.log` for a full-queue warning. Lexical indexing does not require the embedding endpoint.
 - **Semantic search returns hits with `ready: false`**: vectors are still being written. Wait for `pending_embeddings` to reach 0.
 - **`another simple-code-indexer already owns …index.db`**: only possible in `mode: embedded` (or when a legacy embedded writer holds the lease). In the default sidecar mode a second session is a read-only reader. Fix: leave the second session running in sidecar mode; use `mode: embedded` only for single-session diagnosis.
+- **`get_status` reports the editor installation directory as the workspace**: the client spawns stdio children without a `cwd` (ISS-014). Check `workspace_source`: `roots` or `harness:<name>` should replace `cwd`. An entry without the `SIMPLE_CI_HARNESS` marker still gets `harness:<name>` (every resolver is asked when the cwd is an editor install), so a persistent `cwd` there means the plugin's discovery found no live window — check `~/.commandcode/ide/*.json` contains this window's extension-host pid. `load_settings` now refuses such a cwd with a `ConfigError` instead of building an empty index; re-run `python setup.py --harnesses <name>` for the marker fast path, or set `WORKSPACE_ROOT` for a one-off diagnosis (remove it afterwards).
 - **`config_file: null` in `get_status`**: `~/.simple-ci/config.yaml` does not exist, and project-local configs are ignored. Fix: run `python setup.py` or create the global file.
 
 ## RUN-004 (DESTRUCTIVE): Rebuild a workspace index from scratch
@@ -226,7 +227,7 @@ Deletes one workspace's derived `.simple-ci/` data and rebuilds it through start
 1. Confirm the target workspace and index path:
 
    ```
-   uv run python -c "from simple_code_indexer.config import load_settings; s = load_settings(); print('workspace:', s.workspace_root); print('index_db:', s.index_db_path); print('vector_store:', s.vector_store); print('embed:', s.embed_model, s.embed_dim)"
+   uv run python -c "from simple_code_indexer.config import load_settings; s = load_settings(); print('workspace:', s.workspace_root); print('source:', s.workspace_source); print('index_db:', s.index_db_path); print('vector_store:', s.vector_store); print('embed:', s.embed_model, s.embed_dim)"
    ```
 
 2. Confirm the backing services are available:

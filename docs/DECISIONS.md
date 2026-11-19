@@ -215,16 +215,18 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   index itself; pointing it at another project needed a compose edit and a rebuild. Bind mounts also cost
   real time (watcher registration over `.venv` blocked for >10 s). Compose mounts are fixed at
   `docker compose up`, so "open project X and index X" was not expressible.
-- **Decision:** The server runs **on the host**, spawned by the harness, and takes its workspace from
-  `Path.cwd().resolve()`, overridable with `WORKSPACE_ROOT`. No Docker image for the server ships in this
-  repo. The index lives at `$WORKSPACE_ROOT/.simple-ci/index.db`; each workspace gets its own derived
-  Qdrant collection `code_index_{slug}_{sha256(path)[:8]}_{dim}` on the Qdrant backend, and its own
+- **Decision:** The server runs **on the host**, spawned by the harness. The workspace originally came from
+  `Path.cwd().resolve()`, overridable with `WORKSPACE_ROOT`; ADR-018 extends the order to
+  `WORKSPACE_ROOT` > MCP `roots/list` > harness-published workspace > cwd. No Docker image for the server
+  ships in this repo. The index lives at `$WORKSPACE_ROOT/.simple-ci/index.db`; each workspace gets its own
+  derived Qdrant collection `code_index_{slug}_{sha256(path)[:8]}_{dim}` on the Qdrant backend, and its own
   `vectors.faiss` on the FAISS backend.
 - **Consequences:** One static harness snippet works for every project; `get_status.workspace` and
-  `vector_index` make the inference observable. `WORKSPACE_ROOT` is the escape hatch when a harness spawns
-  servers from elsewhere. An inferred workspace that is the user's home directory is refused. Do not go
-  back to `uvx --from <repo>` entries or a mounted container: the harness already starts the server inside
-  the project, so the workspace needs no configuration.
+  `get_status.workspace_source` make the inference observable. `WORKSPACE_ROOT` is the escape hatch when a
+  harness spawns servers from elsewhere and always wins. An inferred workspace that is the user's home
+  directory is refused; an explicit pin or a client-published root opts in. Do not go back to
+  `uvx --from <repo>` entries or a mounted container: the harness already starts the server inside (or, with
+  ADR-018, tells it) the project, so the workspace needs no configuration.
 
 ## ADR-008: Setup wizard and fail-soft managed services
 
@@ -402,11 +404,13 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 - **Decision:** A harness entry contains **only** install-scoped data: the interpreter, the
   installed `run_server.py` launcher, and the user's global settings. It must never contain a
   workspace path — no `WORKSPACE_ROOT`, no `cwd`, no `INDEX_DB`, no `FAISS_PATH`. Workspace
-  resolution stays entirely runtime-inferred from the harness's spawn cwd (ADR-007). Harness
-  plugins therefore drop `WORKSPACE_ROOT`/`cwd` from the entry they build and pass `env` through
-  untouched; the wizard passes an empty `env` unless `--no-git-pull` (a debug switch) adds
-  `SIMPLE_CI_GIT_PULL=0`. A temporary pin is allowed **only** inside a
-  debugging session, and must be removed before the session's work is called done.
+  resolution stays entirely runtime-inferred (ADR-007; ADR-018 adds roots and harness-published
+  sources). Harness plugins therefore drop `WORKSPACE_ROOT`/`cwd` from the entry they build and pass `env`
+  through untouched; the wizard passes an empty `env` unless `--no-git-pull` (a debug switch) adds
+  `SIMPLE_CI_GIT_PULL=0`. One reserved key is allowed: `SIMPLE_CI_HARNESS=<NAME>`, a stable
+  install-scoped marker that tells the server which plugin may publish this session's workspace. It carries
+  no project data, so it does not reintroduce the pinning this ADR forbids. A temporary pin is allowed
+  **only** inside a debugging session, and must be removed before the session's work is called done.
 - **Consequences:** One static entry set serves every project; moving or cloning a repo cannot
   leave a stale absolute path behind, and re-running `setup.py` is idempotent with respect to the
   workspace. `get_status.workspace` remains the way to detect a harness that spawns from elsewhere
@@ -477,3 +481,37 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   wizard defaults to it when the probe fails); `mmap_size`/`cache_size` are tunable; a backend change
   invalidates the binding and re-indexes rather than migrating vectors, and a leftover `vec_chunks` table
   is dropped when another backend becomes active.
+
+## ADR-018: MCP roots first, harness-published workspace third
+
+- **Context:** The Command Code VS Code extension spawns stdio MCP children **without a `cwd`**
+  (`shell: true`), so the server inherited the extension host's working directory
+  (`C:\Program Files\Microsoft VS Code`) and indexed nothing (ISS-014). ADR-015 correctly forbids pinning a
+  path in the global entry. The MCP protocol already has a first-class answer — `roots/list`, which every
+  client advertises — but the installed SDK (`mcp>=2.3.0`) handles `initialize` inline with the read loop
+  parked, so a server-initiated request cannot be awaited before the handshake, and the 2026-era protocol
+  forbids server-initiated requests entirely. The extension advertises `roots` and then never answers the
+  request, so roots alone cannot fix this client.
+- **Decision:** Workspace sources are resolved in this order: `WORKSPACE_ROOT` > the client's first
+  plausible `roots/list` `file:` directory > the launching harness's published workspace > process cwd.
+  Because roots requires a session, `server.ServerState` defers `load_settings()`, the file log, and the
+  writer/reader start until `notifications/initialized` (or the first `tools/*` call), with a bounded probe
+  (`SIMPLE_CI_ROOTS_TIMEOUT_S`, default 1 s, `0` disables; skipped when `WORKSPACE_ROOT` is set, the client
+  did not declare `roots`, or the connection has no back-channel). Harness-published workspaces are a
+  **plugin hook**: an optional `resolve_workspace(cwd)` on a harness plugin, dispatched to the plugin
+  named by the entry's stable `SIMPLE_CI_HARNESS=<NAME>` marker; the plugin owns all client-specific
+  discovery. Only `harnesses/commandcode.py` implements it, reading `~/.commandcode/ide/*.json` and
+  matching its `pid` against live ancestors (`parent_watch.ancestor_chain`) plus the IDE image name — never
+  by file recency, because the files are not self-cleaning. An entry installed before the marker existed
+  asks **every** resolver instead, but only when the cwd is implausible (the user home or a live
+  ancestor's executable directory); a plausible cwd is never overridden, so a terminal launch keeps
+  indexing where it was started. `get_status.workspace_source` and the startup banner report which
+  source won.
+- **Consequences:** A client that implements roots now controls the workspace without any discovery code
+  in this repo; a client that advertises roots but drops the request costs one bounded timeout per
+  session (the Command Code extension, today) and falls through to the harness source. A `run_server.py`
+  code update is enough for an existing install: the marker is a fast path, not a prerequisite. Deferred
+  startup moves the workspace refusal and the log-file setup from process start to session start; a
+  server that never receives a handshake never opens an index, which is correct, and one that lands in
+  an editor install or the home directory fails loudly instead of building an empty index. Discovery
+  stays isolated: core code knows only the generic hook, the marker key, and the ancestor walk.

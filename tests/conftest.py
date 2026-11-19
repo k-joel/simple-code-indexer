@@ -9,3 +9,6 @@ def _no_ambient_config(monkeypatch) -> None:
     monkeypatch.setenv("SIMPLE_CI_MODE", "embedded")
     # Keep questionary from drawing a TUI if a test instantiates the real Prompter.
     monkeypatch.setenv("SIMPLE_CI_NO_TUI", "1")
+    # A harness-launched server inherits these; tests must start from defaults.
+    monkeypatch.delenv("SIMPLE_CI_HARNESS", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_ROOTS_TIMEOUT_S", raising=False)

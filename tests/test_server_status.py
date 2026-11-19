@@ -88,6 +88,8 @@ def test_status_payload_reports_embedding_progress(tmp_path: Path) -> None:
     assert payload["vectors_indexed"] == 1
     assert payload["pending_embeddings"] == 1
     assert payload["sweep_seconds"] == 45.0
+    assert payload["workspace"] == str(tmp_path)
+    assert payload["workspace_source"] == "cwd"
 
 
 def test_semantic_search_collapses_overlapping_chunks(

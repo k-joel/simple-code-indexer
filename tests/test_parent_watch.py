@@ -201,6 +201,84 @@ def test_a_shell_launched_server_has_no_harness() -> None:
     assert seen == []
 
 
+def test_a_shell_between_the_plumbing_and_the_harness_is_transparent() -> None:
+    """The VS Code extension spawns with `shell: true` (cmd.exe shim)."""
+    root = os.getpid()
+    table = _table(
+        (root, 90, "server"),
+        (90, 80, "pythonw.exe"),  # venv trampoline
+        (80, 70, "cmd.exe"),  # shell: true shim
+        (70, 60, "Code.exe"),  # extension host: the harness
+        (60, 50, "Code.exe"),  # VS Code main
+        (50, 40, "explorer.exe"),
+    )
+    seen: list[int] = []
+    harness = _lookup(table, seen, frozenset({90}))
+    assert harness is not None
+    assert harness.pid == 70
+    assert seen == [70]
+
+
+def test_a_shell_above_the_harness_is_not_walked_through() -> None:
+    root = os.getpid()
+    table = _table(
+        (root, 90, "server"),
+        (90, 80, "opencode-cli.exe"),
+        (80, 70, "cmd.exe"),
+        (70, 60, "explorer.exe"),
+    )
+    seen: list[int] = []
+    harness = _lookup(table, seen)
+    assert harness is not None
+    assert harness.pid == 90
+    assert seen == [90]
+
+
+def test_ancestor_chain_ignores_launch_boundaries() -> None:
+    root = os.getpid()
+    table = _table(
+        (root, 90, "server"),
+        (90, 80, "pythonw.exe"),
+        (80, 70, "cmd.exe"),
+        (70, 60, "Code.exe"),
+        (60, 50, "explorer.exe"),
+    )
+
+    assert parent_watch.ancestor_chain(table) == [
+        (90, "pythonw.exe"),
+        (80, "cmd.exe"),
+        (70, "Code.exe"),
+        (60, "explorer.exe"),
+    ]
+    assert parent_watch.ancestor_chain(table, limit=2) == [
+        (90, "pythonw.exe"),
+        (80, "cmd.exe"),
+    ]
+
+
+def test_ancestor_install_dirs_maps_ancestors_to_executable_dirs() -> None:
+    root = os.getpid()
+    table = _table(
+        (root, 90, "server"),
+        (90, 80, "pythonw.exe"),
+        (80, 70, "cmd.exe"),
+        (70, 60, "Code.exe"),
+        (60, 50, "Code.exe"),
+    )
+    images = {
+        90: r"C:\venv\Scripts\pythonw.exe",
+        80: r"C:\Windows\System32\cmd.exe",
+        70: r"C:\Program Files\Microsoft VS Code\Code.exe",
+        60: r"C:\Program Files\Microsoft VS Code\Code.exe",
+    }
+
+    assert parent_watch.ancestor_install_dirs(table, executable=images.get) == (
+        (Path(r"C:\venv\Scripts"), "pythonw.exe"),
+        (Path(r"C:\Windows\System32"), "cmd.exe"),
+        (Path(r"C:\Program Files\Microsoft VS Code"), "Code.exe"),
+    )
+
+
 def test_watched_process_reports_exit() -> None:
     process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:
@@ -258,8 +336,19 @@ def test_server_exits_when_the_harness_process_dies(tmp_path: Path) -> None:
         stderr=subprocess.DEVNULL,
     )
     log_file = workspace / ".simple-ci" / "log" / "embed.log"
+    stderr_log = workspace / "server-stderr.log"
     server_watch: parent_watch.WatchedProcess | None = None
     try:
+        # The server inherits this pipe (via the fake harness), so it stays
+        # open after the harness dies — only the watchdog can end the server.
+        assert harness.stdin is not None
+        harness.stdin.write(
+            b'{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": '
+            b'{"protocolVersion": "2025-06-18", "capabilities": {}, '
+            b'"clientInfo": {"name": "fake-harness", "version": "0"}}}\n'
+            b'{"jsonrpc": "2.0", "method": "notifications/initialized"}\n'
+        )
+        harness.stdin.flush()
         _wait_for(
             lambda: "serving on stdio" in _read(log_file),
             timeout=60.0,
@@ -271,7 +360,9 @@ def test_server_exits_when_the_harness_process_dies(tmp_path: Path) -> None:
         server_watch = parent_watch.watch_process(int(match.group(1)), "server")
         assert server_watch is not None, "server process is already gone"
         assert server_watch.alive()
-        assert "parent watchdog: watching" in log
+        # Logged before the handshake, so only stderr has it: the file
+        # handler is configured once the workspace is resolved (ADR-018).
+        assert "parent watchdog: watching" in _read(stderr_log)
 
         os.kill(int(pid_file.read_text(encoding="utf-8")), signal.SIGTERM)
 

@@ -374,6 +374,205 @@ def test_commandcode_marks_the_stdio_transport() -> None:
     assert entry["enabled"] is True
     assert entry["command"] == "uvx"
     assert entry["args"] == ["--from", "/repo", NAME]
+    assert entry["env"] == {harnesses_pkg.RUNTIME_ENV: "commandcode"}
+
+
+def _discovery(
+    home: Path,
+    name: str,
+    *,
+    pid: int,
+    folders: list[str],
+    ide: str = "code",
+) -> None:
+    directory = home / ".commandcode" / "ide"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / name).write_text(
+        json.dumps(
+            {
+                "socketPath": "\\\\.\\pipe\\commandcode-code-b41e2d27",
+                "workspaceFolders": folders,
+                "pid": pid,
+                "ideName": ide,
+                "appName": "Visual Studio Code",
+                "timestamp": 1795094441611,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _ancestors(monkeypatch, *rows: tuple[int, str]) -> None:
+    from simple_code_indexer import parent_watch
+
+    monkeypatch.setattr(parent_watch, "ancestor_chain", lambda *a, **k: list(rows))
+
+
+def test_commandcode_resolves_the_ancestor_keyed_discovery_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    _discovery(home, "code-b41e2d27.json", pid=4242, folders=[str(workspace)])
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    _ancestors(monkeypatch, (999, "cmd.exe"), (4242, "Code.exe"))
+
+    resolver = _spec("commandcode").workspace_resolver
+    assert resolver is not None
+    assert resolver(tmp_path) == workspace.resolve()
+
+
+def test_commandcode_prefers_the_nearest_matching_ancestor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    outer = tmp_path / "outer"
+    inner = tmp_path / "inner"
+    outer.mkdir()
+    inner.mkdir()
+    _discovery(home, "code-11111111.json", pid=1000, folders=[str(outer)])
+    _discovery(home, "code-22222222.json", pid=2000, folders=[str(inner)])
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    _ancestors(monkeypatch, (2000, "Code.exe"), (1000, "Code.exe"))
+
+    resolver = _spec("commandcode").workspace_resolver
+    assert resolver is not None
+    assert resolver(tmp_path) == inner.resolve()
+
+
+def test_commandcode_ignores_files_that_are_not_live_ancestors(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    _discovery(home, "code-deadbeef.json", pid=4242, folders=[str(workspace)])
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    _ancestors(monkeypatch, (999, "cmd.exe"), (1000, "Code.exe"))
+
+    resolver = _spec("commandcode").workspace_resolver
+    assert resolver is not None
+    assert resolver(tmp_path) is None
+
+
+def test_commandcode_requires_the_ide_name_to_match_the_ancestor_image(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    _discovery(
+        home, "cursor-abcdef12.json", pid=4242, folders=[str(workspace)], ide="cursor"
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    _ancestors(monkeypatch, (4242, "Code.exe"))
+
+    resolver = _spec("commandcode").workspace_resolver
+    assert resolver is not None
+    assert resolver(tmp_path) is None
+
+
+def test_commandcode_skips_malformed_files_and_missing_folders(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    directory = home / ".commandcode" / "ide"
+    directory.mkdir(parents=True)
+    (directory / "code-broken.json").write_text("{not json", encoding="utf-8")
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    _discovery(home, "code-ok.json", pid=4242, folders=[str(workspace)])
+    _discovery(home, "code-gone.json", pid=1000, folders=[str(tmp_path / "missing")])
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    _ancestors(monkeypatch, (1000, "Code.exe"), (4242, "Code.exe"))
+
+    resolver = _spec("commandcode").workspace_resolver
+    assert resolver is not None
+    assert resolver(tmp_path) == workspace.resolve()
+
+
+def test_discover_workspace_requires_the_marker(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv(harnesses_pkg.RUNTIME_ENV, raising=False)
+    assert harnesses_pkg.discover_workspace(tmp_path) is None
+
+
+def test_discover_workspace_without_the_marker_asks_every_resolver(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "published"
+    workspace.mkdir()
+    _write(
+        tmp_path / "harnesses",
+        "probe.py",
+        "from pathlib import Path\n"
+        'NAME = "probe"\nGLOBAL_CONFIGS = ["~/probe.json"]\nROOT_KEY = "mcpServers"\n'
+        f"def resolve_workspace(cwd):\n    return Path({str(workspace)!r})\n",
+    )
+    monkeypatch.delenv(harnesses_pkg.RUNTIME_ENV, raising=False)
+    _ancestors(monkeypatch)  # the builtin resolver sees no live ancestors
+
+    assert harnesses_pkg.discover_workspace(tmp_path) is None
+    assert harnesses_pkg.discover_workspace(tmp_path, require_marker=False) == (
+        workspace.resolve(),
+        "probe",
+    )
+
+
+def test_discover_workspace_dispatches_to_the_named_plugin(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "published"
+    workspace.mkdir()
+    _write(
+        tmp_path / "harnesses",
+        "probe.py",
+        "from pathlib import Path\n"
+        'NAME = "probe"\nGLOBAL_CONFIGS = ["~/probe.json"]\nROOT_KEY = "mcpServers"\n'
+        f"def resolve_workspace(cwd):\n    return Path({str(workspace)!r})\n",
+    )
+    monkeypatch.setenv(harnesses_pkg.RUNTIME_ENV, "probe")
+
+    assert harnesses_pkg.discover_workspace(tmp_path) == (
+        workspace.resolve(),
+        "probe",
+    )
+
+
+def test_discover_workspace_is_fail_soft(tmp_path: Path, monkeypatch) -> None:
+    user = tmp_path / "harnesses"
+    _write(
+        user,
+        "boom.py",
+        'NAME = "boom"\nGLOBAL_CONFIGS = ["~/boom.json"]\nROOT_KEY = "mcpServers"\n'
+        "def resolve_workspace(cwd):\n    raise RuntimeError('nope')\n",
+    )
+    _write(
+        user,
+        "notdir.py",
+        'NAME = "notdir"\nGLOBAL_CONFIGS = ["~/notdir.json"]\nROOT_KEY = "mcpServers"\n'
+        "def resolve_workspace(cwd):\n    return cwd / 'missing'\n",
+    )
+    _write(
+        user,
+        "badhook.py",
+        'NAME = "badhook"\nGLOBAL_CONFIGS = ["~/badhook.json"]\n'
+        'ROOT_KEY = "mcpServers"\nresolve_workspace = 42\n',
+    )
+
+    for name in ("boom", "notdir", "unknown"):
+        monkeypatch.setenv(harnesses_pkg.RUNTIME_ENV, name)
+        assert harnesses_pkg.discover_workspace(tmp_path) is None
+
+    names = {spec.name for spec in load_harnesses(user_dirs=[user])}
+    assert "boom" in names
+    assert "badhook" not in names
+
+
+def test_default_user_dirs_accept_an_explicit_workspace(tmp_path: Path) -> None:
+    assert tmp_path.resolve() / "harnesses" in default_user_harness_dirs(
+        tmp_path.resolve()
+    )
 
 
 def test_candidates_expand_global_and_local_scopes(tmp_path: Path) -> None:

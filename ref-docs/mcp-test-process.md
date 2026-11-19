@@ -350,8 +350,10 @@ The secondary agent follows the handoff. Order matters:
 1. **Preflight:** server listed and connected; exactly three tools; record PID + start time.
    - One launch can appear as several processes: on Windows the venv `pythonw.exe` → the base
      `pythonw.exe`; on POSIX `uv.exe` → the venv `python.exe` trampoline → the base interpreter.
-     Count *server instances* by the `index.db` lock / parent chain, not by a raw `python.exe`
-     count, and include `pythonw.exe` in the filter.
+     The sidecar daemon is the exception: it is spawned as `sys._base_executable` with the
+     reader's `sys.path` (ISS-016), so it has no launcher parent. Count *server instances* by the
+     `index.db` lock / parent chain, not by a raw `python.exe` count, and include `pythonw.exe` in
+     the filter.
 2. **`get_status`:** paste the full JSON; stop if `workspace` is wrong.
 3. **Index the workspace:** poll until counts are stable; record the timeline and
    `pending_embeddings`/`vectors_indexed`. Do not rely on `vector_store_ok` alone for vector

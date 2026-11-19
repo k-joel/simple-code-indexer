@@ -84,3 +84,43 @@ def test_spawn_daemon_uses_a_windowless_console(
     flags = calls[0]["creationflags"]
     assert flags & client._CREATE_NO_WINDOW
     assert flags & client._CREATE_NEW_PROCESS_GROUP
+
+
+def test_daemon_command_skips_the_windows_venv_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_packages = tmp_path / "site-packages"
+    monkeypatch.setattr(client.sys, "platform", "win32")
+    monkeypatch.setattr(
+        client.sys, "executable", str(tmp_path / "venv" / "pythonw.exe")
+    )
+    monkeypatch.setattr(
+        client.sys, "_base_executable", str(tmp_path / "base" / "pythonw.exe")
+    )
+    monkeypatch.setattr(client.sys, "path", [str(site_packages)])
+
+    command = client._daemon_command(tmp_path)
+
+    assert command[0] == str(tmp_path / "base" / "pythonw.exe")
+    assert command[1] == "-c"
+    assert repr(str(site_packages)) in command[2]
+    assert command[3:] == ["--workspace", str(tmp_path)]
+
+
+def test_daemon_command_falls_back_to_the_venv_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = str(tmp_path / "venv" / "pythonw.exe")
+    monkeypatch.setattr(client.sys, "platform", "win32")
+    monkeypatch.setattr(client.sys, "executable", executable)
+    monkeypatch.setattr(client.sys, "_base_executable", executable)
+
+    command = client._daemon_command(tmp_path)
+
+    assert command == [
+        executable,
+        "-m",
+        "simple_code_indexer.sidecar.daemon",
+        "--workspace",
+        str(tmp_path),
+    ]

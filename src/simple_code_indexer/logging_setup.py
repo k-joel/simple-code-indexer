@@ -192,8 +192,9 @@ def log_startup(
     )
     log.info("role=%s mode=%s", role, settings.mode)
     log.info(
-        "workspace=%s index_db=%s vector_store=%s (%s)",
+        "workspace=%s (source=%s) index_db=%s vector_store=%s (%s)",
         settings.workspace_root,
+        settings.workspace_source,
         settings.index_db_path,
         settings.vector_store,
         vector_store.describe(settings),

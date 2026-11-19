@@ -283,7 +283,7 @@ Architectural boundaries:
 
 | In scope | Out of scope |
 |---|---|
-| One workspace per process, taken from the process cwd (`WORKSPACE_ROOT` overrides) | Multi-repo registry, path sandbox, worktree identity |
+| One workspace per process: `WORKSPACE_ROOT`, then the client's MCP roots, then the harness-published workspace, then cwd (ADR-018) | Multi-repo registry, path sandbox, worktree identity |
 | Index-on-save from working-tree bytes | Git readiness, commit gating, provenance |
 | SQLite + FTS5 lexical index | Staged generations, quarantine trees |
 | Direct chunk embeddings; sqlite-vec default, FAISS and Qdrant opt-in | LLM chunk summaries before embedding |
@@ -464,7 +464,7 @@ ordered by path then line.
 
 | Entity | Identity | Key attributes |
 |---|---|---|
-| **Workspace** | one root path per process | resolved process cwd, or `WORKSPACE_ROOT`; indexes under `<workspace>/.simple-ci/` |
+| **Workspace** | one root path per process | `WORKSPACE_ROOT` > MCP roots > harness-published workspace > cwd; indexes under `<workspace>/.simple-ci/` |
 | **File record** | workspace-relative POSIX `path` (unique) | language, size, sha256, mtime, indexed_at |
 | **Symbol** | (`file_id`, name, line) | kind, line_end, signature |
 | **Chunk** | (`file_id`, `chunk_index`) | start_line, end_line, content |
@@ -775,13 +775,14 @@ Package: `src/simple_code_indexer/` (import `simple_code_indexer`).
 | `watcher.py` | one recursive observer, per-path debounce, event filtering |
 | `runtime.py` | `WriterRuntime`: lease, writer thread, watcher, sweeps, heartbeat, services |
 | `workspace_lock.py` | cross-platform advisory file lease |
-| `parent_watch.py` | harness process discovery and liveness watchdog |
+| `parent_watch.py` | harness process discovery (launch chain, raw ancestor walk, ancestor install dirs) and liveness watchdog |
+| `mcp_roots.py` | bounded `roots/list` probe used as the second workspace source |
 | `services.py` | managed Docker container startup and readiness probes |
 | `logging_setup.py` | stderr/file logging, rotation, excepthooks, active log path |
-| `server.py` | MCP stdio server, role selection, tool handlers, status assembly |
+| `server.py` | MCP stdio server, deferred workspace binding (`ServerState`), tool handlers, status assembly |
 | `sidecar/` | daemon, reader session, JSON control protocol, discovery paths, lease registry |
 | `languages/` | generated `catalog.py`, `LanguageSpec`, specialized extractors |
-| `harnesses/` | MCP-client plugins for the setup wizard |
+| `harnesses/` | MCP-client plugins: install entries + runtime workspace hooks |
 | `setup_wizard/` | prompts, probes, GPU detection, compose/model provisioning, install/uninstall |
 
 Repo-root entry points:
@@ -847,8 +848,36 @@ stored vectors change, so query-prompt edits do not force a re-embed.
 `allowed_filenames` (exact names such as `Dockerfile`). `ignore_dirs` is fixed:
 `.git`, `.index`, `.simple-ci`, `__pycache__`, `.venv`, `node_modules`.
 
-An inferred workspace that is the user's home directory is refused with a
-`ConfigError`; an explicit `WORKSPACE_ROOT` still opts in.
+An inferred workspace that cannot be a project root is refused with a
+`ConfigError`: the user's home directory, or the installation directory of a
+live ancestor process (`config._implausible_reason`, using
+`parent_watch.ancestor_install_dirs`). An explicit `WORKSPACE_ROOT` or a
+client-published MCP root still opts in.
+
+Workspace resolution order (`config.resolve_workspace_root`, ADR-018):
+
+1. `WORKSPACE_ROOT` — explicit escape hatch.
+2. **MCP `roots/list`** — the connected client's own folder list, first
+   existing `file:` root. A server-initiated request, so it is asked only after
+   the handshake (`notifications/initialized`, with the first `tools/*` call as
+   a fallback), bounded by `SIMPLE_CI_ROOTS_TIMEOUT_S` (default 1 s, `0`
+   disables), gated on the client declaring `roots` and on the connection having
+   a back-channel (the 2026-era protocol forbids server-initiated requests).
+3. **Harness-published workspace** — `harnesses.discover_workspace` asks the
+   plugin named by the entry's `SIMPLE_CI_HARNESS` env value. Today only
+   `commandcode` implements it (its `~/.commandcode/ide/*.json` window files,
+   matched by live ancestry). When the cwd is implausible (home or an ancestor's
+   install directory) an entry without the marker — installed before the marker
+   existed — asks **every** plugin that declares a resolver instead, so a
+   `run_server.py` code update is enough and no setup re-run is needed.
+4. Process cwd — only when it is plausible; otherwise the `ConfigError` above
+   names the directory and the sources that were tried.
+
+`Settings.workspace_source` records `env` / `roots` / `harness:<name>` / `cwd`
+and is surfaced as `get_status.workspace_source` and in the startup banner.
+Because roots needs a session, `server.ServerState` defers `load_settings()`,
+the file log, and the writer/reader start until the MCP session exists; tool
+handlers await `ensure_started`.
 
 ### 7.2 `db.py`
 
@@ -1051,9 +1080,12 @@ so a killed writer never leaves a stale lock (only the file).
   server/harness metadata, the watched server process, and the live connection.
 - Daemon spawn uses `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` on Windows
   (plus `CREATE_BREAKAWAY_FROM_JOB` with a fallback) and `start_new_session=True`
-  on POSIX. `DETACHED_PROCESS` is deliberately not used: the venv `python.exe`
-  redirector spawns the real interpreter without creation flags, which would
-  allocate a visible console window.
+  on POSIX. On Windows `_daemon_command` runs `sys._base_executable` with the
+  reader's resolved `sys.path` instead of the venv `pythonw.exe`, whose redirector
+  would keep a second process alive for the daemon's lifetime.
+  `DETACHED_PROCESS` is deliberately not used: a redirector (the fallback path)
+  spawns the real interpreter without creation flags, which would allocate a
+  visible console window.
 
 ### 7.11 `server.py`
 
@@ -1079,7 +1111,13 @@ so a killed writer never leaves a stale lock (only the file).
 session. It walks the launch chain upward, skipping boundary processes
 (shells, terminals, system processes), `uv`/`uvx`, and the venv `python.exe`
 trampoline (recognized by image path on Windows or by a launcher parent), then
-watches the first remaining process. Nothing above the harness is watched. When
+watches the first remaining process. A shell is crossed **only** while
+everything below it is our own launch plumbing, because the VS Code extension
+spawns stdio children with `shell: true` (`harness -> cmd.exe -> uv/python ->
+server`); a shell reached above the harness still ends the walk, so a
+terminal-launched server has no harness. `parent_watch.ancestor_chain()` exposes
+the raw, boundary-free ancestor walk that harness workspace discovery uses.
+Nothing above the harness is watched. When
 it disappears, `server._serve` runs role cleanup and exits with `os._exit(0)`:
 `stdio_server`'s stdin reader blocks in a non-cancellable worker thread, so
 returning from the serve loop could hang on the open pipe. The daemon
@@ -1120,11 +1158,15 @@ A harness plugin is a plain module loaded from `src/simple_code_indexer/harnesse
 `<repo>/harnesses/`, or `<workspace>/harnesses/`; a user plugin overrides a builtin by `NAME`. It
 declares `NAME`, `LABEL`, detection dirs/binaries, global config paths, format
 (`json`, `toml`, or `yaml`), the config root key, and optional
-`entry`/`render`/`remove` callables. Writer helpers parse/merge without
-destroying unrelated keys; JSONC comments are lost on rewrite, so the writer
-backs up the file and refuses to rewrite an unparsable document. TOML harness
-configs are merged with marker comments rather than a round-trip, because the
-parser cannot write. Bad plugins are skipped.
+`entry`/`render`/`remove` callables. A plugin may also implement
+`resolve_workspace(cwd) -> Path | None`; it must then put
+`SIMPLE_CI_HARNESS=<NAME>` into its entry env (the reserved `RUNTIME_ENV` key),
+which is how the server knows which single plugin to ask at runtime. That key is
+install-scoped — never a path — so ADR-015 still holds. Writer helpers
+parse/merge without destroying unrelated keys; JSONC comments are lost on
+rewrite, so the writer backs up the file and refuses to rewrite an unparsable
+document. TOML harness configs are merged with marker comments rather than a
+round-trip, because the parser cannot write. Bad plugins are skipped.
 
 The setup wizard:
 
@@ -1152,8 +1194,11 @@ Harness launch commands preserve the harness cwd: `uv run --project <install>
 launcher owns dependency updates. Entries are **workspace-free**
 ([ADR-015](DECISIONS.md#adr-015-harness-entries-are-global-only-no-per-project-data)):
 they carry the install-scoped launcher only — never `WORKSPACE_ROOT`, `cwd`,
-`INDEX_DB`, or `FAISS_PATH` — because the workspace is inferred from the spawn
-cwd at runtime.
+`INDEX_DB`, or `FAISS_PATH` — because the workspace is resolved at runtime
+(ADR-018). The only entry env the wizard may write for a resolver harness is the
+stable `SIMPLE_CI_HARNESS=<NAME>` marker. Because the server resolves the
+workspace after the MCP handshake (roots first), the harness cwd is one source
+among four, not the definition.
 
 ---
 
@@ -1253,6 +1298,7 @@ message.
   "data_formats_excluded": 49,
   "grammars_ready": 36,
   "workspace": "d:/projects/my-app",
+  "workspace_source": "harness:commandcode",
   "index_db": "d:/projects/my-app/.simple-ci/index.db",
   "config_file": "C:/Users/me/.simple-ci/config.yaml",
   "config_files": ["C:/Users/me/.simple-ci/config.yaml"],
@@ -1286,6 +1332,8 @@ message.
   `.gitignore` (0 before the first sweep completes).
 - `config_file` is null when no config file exists; `config_files` has 0 or 1
   entries.
+- `workspace_source` is `env` (`WORKSPACE_ROOT`), `roots` (the client's
+  `roots/list`), `harness:<name>` (a plugin-published workspace), or `cwd`.
 - `log_file` is the active reader/embedded file; `writer_log_file` names the
   writer-side file (the daemon's `writer.log`, or `embed.log` in embedded mode).
 - `role` is `reader` or `writer`. Readers merge the daemon RPC (`sessions`,
@@ -1328,7 +1376,8 @@ are the observability surface. Logs never contain file contents or chunk text �
 only paths, sizes, line ranges, counts, scores, and truncated query text.
 `LAST_OK` flags, sweep stats, and writer heartbeat metadata feed status without
 extra RPCs. `get_status` is the primary way to verify which workspace a live
-harness actually spawned.
+harness actually spawned; `get_status.workspace_source` names the source that
+won (`env`, `roots`, `harness:<name>`, or `cwd`).
 
 ### 9.4 Security boundaries
 

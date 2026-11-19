@@ -156,6 +156,18 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 - [ref-docs/acp-test-process.md](../ref-docs/acp-test-process.md) documents that automated run,
   and [ref-docs/opencode-acp-mode.md](../ref-docs/opencode-acp-mode.md) documents ACP mode itself
   (transport, editor setup, MCP injection, permissions, troubleshooting).
+- The workspace can come from the client's MCP `roots/list`, from a harness plugin, or from cwd
+  (ADR-018). `roots/list` is probed once after the handshake (`SIMPLE_CI_ROOTS_TIMEOUT_S`, default
+  `1`, `0` disables; skipped for `WORKSPACE_ROOT`, clients without `roots`, and connections without
+  a back-channel). `get_status.workspace_source` reports which source won (`env`, `roots`,
+  `harness:<name>`, `cwd`).
+- Harness plugins may implement `resolve_workspace(cwd)` and mark their entry with the stable
+  `SIMPLE_CI_HARNESS=<NAME>` env value; the server then asks only that plugin for the workspace.
+  `harnesses/commandcode.py` uses it to read `~/.commandcode/ide/*.json` and match the publishing
+  window's extension-host pid against its live ancestors. The marker is install-scoped, not a path
+  (ADR-015 still holds) and optional at runtime: an entry without it falls back to asking every
+  resolver when cwd is implausible. Re-run `python setup.py --harnesses commandcode` to add it to
+  an existing install (the fast path).
 
 ### Changed
 
@@ -183,6 +195,16 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   retrieval check. OpenCode's configured MCP entry is masked for checkout-only runs and restored
   afterwards; the procedure is verified with both `faiss` and `sqlite-vec`. See
   [ref-docs/acp-test-process.md](../ref-docs/acp-test-process.md).
+- The server now resolves the workspace and starts the writer/reader **after** the MCP handshake
+  (`notifications/initialized`, with the first `tools/*` call as a fallback), because `roots/list`
+  is only legal on an initialized session. The startup banner and the file log therefore begin
+  once the workspace is known; lines logged earlier (for example `parent watchdog: watching …`)
+  go to stderr only. A server that never receives a handshake never opens an index.
+- The sidecar writer daemon now runs as a single process on Windows:
+  `sidecar.client._daemon_command` launches `sys._base_executable` with the reader's resolved
+  `sys.path` instead of the venv's `pythonw.exe` redirector, which kept a second Python process
+  alive for the daemon's whole lifetime. One workspace costs one fewer Python process; readers
+  (owned by the harness) and the per-consumer MCP clients are unchanged (ISS-016).
 
 ### Removed
 
@@ -202,6 +224,22 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   `.ini`, `.rst`, and the rest. `.txt` matters most: it maps to `vimdoc`, so a registered `.txt`
   would have parsed `requirements.txt` and `LICENSE.txt` as Vim documentation. `CMakeLists.txt`
   still resolves to `cmake` because filename matching runs first.
+- The Command Code VS Code extension no longer indexes the editor installation directory. Its
+  stdio children inherit `C:\Program Files\Microsoft VS Code` as cwd; the server now asks the
+  client's MCP roots, then the Command Code plugin (which matches the per-window
+  `~/.commandcode/ide/*.json` entry by live ancestry), and only then falls back to cwd (ISS-014).
+- The parent watchdog arms when a harness spawns the server through a shell (`shell: true` on
+  Windows inserts `cmd.exe` between the extension host and our interpreter). A shell is now
+  transparent while everything below it is our own launch plumbing; a terminal-launched server
+  still has no harness to watch (ISS-015).
+- Workspace discovery no longer requires the installed entry to carry the `SIMPLE_CI_HARNESS`
+  marker. `run_server.py` updates the code but not `~/.commandcode/mcp.json`, so an install that
+  had not re-run setup kept resolving to the editor's installation directory and silently indexed
+  nothing. When the cwd is implausible — the user home or a live ancestor's executable directory
+  (`parent_watch.ancestor_install_dirs`) — every plugin with a resolver is asked; a plausible cwd
+  is never overridden, so a terminal launch still indexes where it was started. If nothing
+  publishes a workspace, `load_settings` raises a `ConfigError` naming the directory and the
+  remedy instead of building an empty index where it cannot even write the log.
 
 - `docs/RUNBOOK.md`: numbered operator procedures (`RUN-001` upward) for service probes, the
   quality gate, live MCP verification, index rebuilds, sidecar shutdown, and log reading. The

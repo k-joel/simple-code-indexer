@@ -11,6 +11,7 @@ import time
 import uuid
 from multiprocessing.connection import Client
 from multiprocessing.context import AuthenticationError
+from pathlib import Path
 from typing import Any
 
 from simple_code_indexer import parent_watch, workspace_lock
@@ -30,6 +31,29 @@ _SPAWN_CLAIM_MAX_AGE_S = 600.0
 _CREATE_NO_WINDOW = 0x08000000
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
 _CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
+
+def _daemon_command(workspace_root: Path) -> list[str]:
+    """Argv for the detached daemon, skipping the Windows venv launcher.
+
+    A venv's ``pythonw.exe`` is a redirector that re-executes the base
+    interpreter and lives as long as its child, so launching the daemon through
+    it keeps two OS processes alive per workspace. ``sys._base_executable`` is
+    the real interpreter, and ``sys.path`` already resolves the venv's entries
+    (the installed package comes from a ``.pth``), so the daemon can run there
+    directly. Falls back to ``sys.executable`` when there is no distinct base.
+    """
+    arguments = ["--workspace", str(workspace_root)]
+    base = getattr(sys, "_base_executable", "") if sys.platform == "win32" else ""
+    if base and os.path.normcase(base) != os.path.normcase(sys.executable):
+        entries = [str(Path(entry).resolve()) for entry in sys.path if entry]
+        bootstrap = (
+            f"import sys; sys.path[:0] = {entries!r}; "
+            "from simple_code_indexer.sidecar.daemon import main; "
+            "raise SystemExit(main())"
+        )
+        return [base, "-c", bootstrap, *arguments]
+    return [sys.executable, "-m", "simple_code_indexer.sidecar.daemon", *arguments]
 
 
 class ReaderSession:
@@ -310,13 +334,7 @@ class ReaderSession:
         env = dict(os.environ)
         env["WORKSPACE_ROOT"] = str(root)
         env["INDEX_DB"] = str(self.settings.index_db_path.resolve())
-        command = [
-            sys.executable,
-            "-m",
-            "simple_code_indexer.sidecar.daemon",
-            "--workspace",
-            str(root),
-        ]
+        command = _daemon_command(root)
         options: dict[str, Any] = {
             "cwd": str(root),
             "env": env,

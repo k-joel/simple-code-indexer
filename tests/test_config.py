@@ -82,12 +82,107 @@ def test_defaults_come_from_the_process_cwd(monkeypatch) -> None:
 
 
 def test_inferred_home_workspace_is_refused(tmp_path: Path, monkeypatch) -> None:
+    from simple_code_indexer import harnesses
+
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(harnesses, "discover_workspace", lambda *a, **k: None)
     monkeypatch.chdir(home)
     with pytest.raises(ConfigError, match="user home directory"):
+        load_settings()
+
+
+def test_an_implausible_cwd_asks_legacy_entries_for_a_workspace(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from simple_code_indexer import config, harnesses
+
+    cwd = tmp_path / "editor"
+    cwd.mkdir()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+
+    def reason(path: Path) -> str | None:
+        return "an editor installation directory" if path == cwd.resolve() else None
+
+    monkeypatch.setattr(config, "_implausible_reason", reason)
+    calls: list[bool] = []
+
+    def fake(cwd_arg: Path, *, require_marker: bool = True):
+        calls.append(require_marker)
+        return None if require_marker else (workspace, "commandcode")
+
+    monkeypatch.setattr(harnesses, "discover_workspace", fake)
+
+    settings = load_settings()
+
+    assert settings.workspace_root == workspace.resolve()
+    assert settings.workspace_source == "harness:commandcode"
+    assert calls == [True, False]
+
+
+def test_a_plausible_cwd_is_not_overridden_by_a_legacy_entry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from simple_code_indexer import config, harnesses
+
+    workspace = tmp_path / "published"
+    workspace.mkdir()
+    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.setattr(config, "_implausible_reason", lambda path: None)
+    calls: list[bool] = []
+
+    def fake(cwd_arg: Path, *, require_marker: bool = True):
+        calls.append(require_marker)
+        return None if require_marker else (workspace, "commandcode")
+
+    monkeypatch.setattr(harnesses, "discover_workspace", fake)
+
+    settings = load_settings()
+
+    assert settings.workspace_root == Path.cwd().resolve()
+    assert settings.workspace_source == "cwd"
+    assert calls == [True]
+
+
+def test_an_ancestor_install_directory_is_implausible(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from simple_code_indexer import config, parent_watch
+
+    install = tmp_path / "Microsoft VS Code"
+    install.mkdir()
+    monkeypatch.setattr(
+        parent_watch,
+        "ancestor_install_dirs",
+        lambda *a, **k: ((install, "Code.exe"),),
+    )
+
+    assert config._implausible_reason(install) == "the Code.exe installation directory"
+    assert config._implausible_reason(tmp_path) is None
+
+
+def test_an_editor_install_cwd_is_refused_when_no_harness_publishes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from simple_code_indexer import config, harnesses
+
+    cwd = tmp_path / "editor"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.setattr(harnesses, "discover_workspace", lambda *a, **k: None)
+    monkeypatch.setattr(
+        config,
+        "_implausible_reason",
+        lambda path: "the Code.exe installation directory",
+    )
+
+    with pytest.raises(ConfigError, match="Code.exe installation directory"):
         load_settings()
 
 
@@ -102,6 +197,76 @@ def test_explicit_workspace_root_may_be_the_home_directory(
     settings = load_settings()
     assert settings.workspace_root == home.resolve()
     assert settings.index_db_path == home.resolve() / ".simple-ci" / "index.db"
+
+
+def test_workspace_source_defaults_to_the_cwd(monkeypatch) -> None:
+    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    settings = load_settings()
+    assert settings.workspace_source == "cwd"
+
+
+def test_harness_published_workspace_wins_over_the_cwd(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from simple_code_indexer import harnesses
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.setattr(
+        harnesses, "discover_workspace", lambda cwd: (workspace, "commandcode")
+    )
+
+    settings = load_settings()
+
+    assert settings.workspace_root == workspace.resolve()
+    assert settings.workspace_source == "harness:commandcode"
+
+
+def test_mcp_roots_beat_the_harness_published_workspace(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from simple_code_indexer import harnesses
+
+    roots = tmp_path / "roots"
+    roots.mkdir()
+    published = tmp_path / "published"
+    published.mkdir()
+    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.setattr(
+        harnesses, "discover_workspace", lambda cwd: (published, "commandcode")
+    )
+
+    settings = load_settings(mcp_workspace=roots)
+
+    assert settings.workspace_root == roots.resolve()
+    assert settings.workspace_source == "roots"
+
+
+def test_workspace_root_env_beats_mcp_roots(tmp_path: Path, monkeypatch) -> None:
+    env_root = tmp_path / "env"
+    env_root.mkdir()
+    roots = tmp_path / "roots"
+    roots.mkdir()
+    monkeypatch.setenv("WORKSPACE_ROOT", str(env_root))
+
+    settings = load_settings(mcp_workspace=roots)
+
+    assert settings.workspace_root == env_root.resolve()
+    assert settings.workspace_source == "env"
+
+
+def test_a_published_home_workspace_is_allowed(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.chdir(home)
+
+    settings = load_settings(mcp_workspace=home)
+
+    assert settings.workspace_root == home.resolve()
+    assert settings.workspace_source == "roots"
 
 
 def test_env_overrides(monkeypatch) -> None:
