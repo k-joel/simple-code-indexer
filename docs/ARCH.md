@@ -1128,8 +1128,11 @@ spawns stdio children with `shell: true` (`harness -> cmd.exe -> uv/python ->
 server`); a shell reached above the harness still ends the walk, so a
 terminal-launched server has no harness. `parent_watch.ancestor_chain()` exposes
 the raw, boundary-free ancestor walk that harness workspace discovery uses.
-Nothing above the harness is watched. When
-it disappears, `server._serve` runs role cleanup and exits with `os._exit(0)`:
+Nothing above the harness is watched. Liveness is a process handle on Windows,
+and on Linux the `/proc/<pid>/stat` start time plus state (a zombie counts as
+dead, because `kill(pid, 0)` still succeeds for one); other POSIX hosts fall
+back to `kill(pid, 0)`. When the harness disappears, `server._serve` runs role
+cleanup and exits with `os._exit(0)`:
 `stdio_server`'s stdin reader blocks in a non-cancellable worker thread, so
 returning from the serve loop could hang on the open pipe. The daemon
 intentionally has no parent watchdog because it must outlive the reader that

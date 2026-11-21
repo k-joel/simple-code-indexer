@@ -289,14 +289,21 @@ else:
             table[pid] = (ppid, parts[2].strip())
         return table
 
-    def _start_marker(pid: int) -> str | None:
-        """Linux start time (jiffies since boot); PID reuse changes it."""
+    def _proc_stat(pid: int) -> tuple[str, str] | None:
+        """(state, start time) from /proc; None where /proc is unavailable."""
         try:
             stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
         except OSError:
             return None
         fields = stat.rpartition(")")[2].split()
-        return fields[19] if len(fields) > 19 else None
+        if len(fields) <= 19:
+            return None
+        return fields[0], fields[19]
+
+    def _start_marker(pid: int) -> str | None:
+        """Linux start time (jiffies since boot); PID reuse changes it."""
+        entry = _proc_stat(pid)
+        return entry[1] if entry is not None else None
 
     def _image_path(pid: int) -> str | None:
         # uv typically execs the venv interpreter on POSIX: no trampoline.
@@ -313,11 +320,14 @@ else:
         return None
 
     def _alive(process: WatchedProcess) -> bool:
-        if (
-            process._start_marker is not None
-            and _start_marker(process.pid) != process._start_marker
-        ):
-            return False
+        entry = _proc_stat(process.pid)
+        if entry is not None:
+            state, start = entry
+            if state in {"Z", "X"}:
+                # Exited but not reaped: kill(pid, 0) still succeeds.
+                return False
+            if process._start_marker is not None and start != process._start_marker:
+                return False
         try:
             os.kill(process.pid, 0)
         except ProcessLookupError:

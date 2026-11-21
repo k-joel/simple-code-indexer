@@ -105,7 +105,7 @@ def _dedupe(paths: list[str]) -> list[str]:
     seen: set[str] = set()
     ordered: list[str] = []
     for raw in paths:
-        path = Path(raw).as_posix()
+        path = Path(raw.replace("\\", "/")).as_posix()
         if path in seen:
             continue
         seen.add(path)

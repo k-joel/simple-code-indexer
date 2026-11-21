@@ -256,6 +256,10 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ### Fixed
 
+- The parent watchdog now recognizes an exited-but-unreaped harness on Linux. A killed
+  harness that its parent has not yet reaped is a zombie, and `kill(pid, 0)` still succeeds
+  for it, so the server could outlive its harness indefinitely; liveness now also reads the
+  `/proc/<pid>/stat` state and treats `Z`/`X` as dead.
 - Shutdown no longer leaves the `service-probe` thread running. The writer runtime owns the
   thread, signals it through the shared stop event, and joins it; `embed_texts` aborts its
   retries and backoff on that signal, so probe requests and log records cannot outlive the

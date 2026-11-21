@@ -28,6 +28,19 @@ _ENV_EXCLUDES = (
     "SIMPLE_CI_PARENT_WATCH",
 )
 
+# The shell/boundary tables are platform-specific, so the fake process names
+# must come from the running host or the test asserts the wrong classification.
+if sys.platform == "win32":
+    SHELL_NAME = "cmd.exe"
+    ROOT_NAME = "explorer.exe"
+    HARNESS_NAME = "Code.exe"
+    TRAMPOLINE_NAME = "pythonw.exe"
+else:
+    SHELL_NAME = "bash"
+    ROOT_NAME = "init"
+    HARNESS_NAME = "code"
+    TRAMPOLINE_NAME = "python"
+
 
 class FakeProcess:
     """Duck-typed ProcessRef so the watchdog loop needs no real processes."""
@@ -193,8 +206,8 @@ def test_a_shell_launched_server_has_no_harness() -> None:
     root = os.getpid()
     table = _table(
         (root, 90, "server"),
-        (90, 80, "pwsh.exe"),
-        (80, 70, "explorer.exe"),
+        (90, 80, SHELL_NAME),
+        (80, 70, ROOT_NAME),
     )
     seen: list[int] = []
     assert _lookup(table, seen) is None
@@ -206,11 +219,11 @@ def test_a_shell_between_the_plumbing_and_the_harness_is_transparent() -> None:
     root = os.getpid()
     table = _table(
         (root, 90, "server"),
-        (90, 80, "pythonw.exe"),  # venv trampoline
-        (80, 70, "cmd.exe"),  # shell: true shim
-        (70, 60, "Code.exe"),  # extension host: the harness
-        (60, 50, "Code.exe"),  # VS Code main
-        (50, 40, "explorer.exe"),
+        (90, 80, TRAMPOLINE_NAME),  # venv trampoline
+        (80, 70, SHELL_NAME),  # shell: true shim
+        (70, 60, HARNESS_NAME),  # extension host: the harness
+        (60, 50, HARNESS_NAME),  # VS Code main
+        (50, 40, ROOT_NAME),
     )
     seen: list[int] = []
     harness = _lookup(table, seen, frozenset({90}))
@@ -224,8 +237,8 @@ def test_a_shell_above_the_harness_is_not_walked_through() -> None:
     table = _table(
         (root, 90, "server"),
         (90, 80, "opencode-cli.exe"),
-        (80, 70, "cmd.exe"),
-        (70, 60, "explorer.exe"),
+        (80, 70, SHELL_NAME),
+        (70, 60, ROOT_NAME),
     )
     seen: list[int] = []
     harness = _lookup(table, seen)
@@ -260,23 +273,37 @@ def test_ancestor_install_dirs_maps_ancestors_to_executable_dirs() -> None:
     root = os.getpid()
     table = _table(
         (root, 90, "server"),
-        (90, 80, "pythonw.exe"),
-        (80, 70, "cmd.exe"),
-        (70, 60, "Code.exe"),
-        (60, 50, "Code.exe"),
+        (90, 80, TRAMPOLINE_NAME),
+        (80, 70, SHELL_NAME),
+        (70, 60, HARNESS_NAME),
+        (60, 50, HARNESS_NAME),
     )
-    images = {
-        90: r"C:\venv\Scripts\pythonw.exe",
-        80: r"C:\Windows\System32\cmd.exe",
-        70: r"C:\Program Files\Microsoft VS Code\Code.exe",
-        60: r"C:\Program Files\Microsoft VS Code\Code.exe",
-    }
+    if sys.platform == "win32":
+        images = {
+            90: r"C:\venv\Scripts\pythonw.exe",
+            80: r"C:\Windows\System32\cmd.exe",
+            70: r"C:\Program Files\Microsoft VS Code\Code.exe",
+            60: r"C:\Program Files\Microsoft VS Code\Code.exe",
+        }
+        expected = (
+            (Path(r"C:\venv\Scripts"), "pythonw.exe"),
+            (Path(r"C:\Windows\System32"), "cmd.exe"),
+            (Path(r"C:\Program Files\Microsoft VS Code"), "Code.exe"),
+        )
+    else:
+        images = {
+            90: "/usr/local/venv/bin/python",
+            80: "/bin/bash",
+            70: "/opt/code/code",
+            60: "/opt/code/code",
+        }
+        expected = (
+            (Path("/usr/local/venv/bin"), "python"),
+            (Path("/bin"), "bash"),
+            (Path("/opt/code"), "code"),
+        )
 
-    assert parent_watch.ancestor_install_dirs(table, executable=images.get) == (
-        (Path(r"C:\venv\Scripts"), "pythonw.exe"),
-        (Path(r"C:\Windows\System32"), "cmd.exe"),
-        (Path(r"C:\Program Files\Microsoft VS Code"), "Code.exe"),
-    )
+    assert parent_watch.ancestor_install_dirs(table, executable=images.get) == expected
 
 
 def test_watched_process_reports_exit() -> None:
@@ -289,6 +316,18 @@ def test_watched_process_reports_exit() -> None:
         _terminate_tree(process)
     _wait_for(lambda: not watched.alive(), timeout=10.0, label="process exit")
     watched.close()
+
+
+def test_watched_process_reports_exit_before_it_is_reaped() -> None:
+    """A killed child is a zombie until its parent waits: POSIX kill(0) succeeds."""
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.2)"])
+    watched = parent_watch.watch_process(process.pid, "exiting")
+    assert watched is not None
+    try:
+        _wait_for(lambda: not watched.alive(), timeout=10.0, label="zombie exit")
+    finally:
+        process.wait(timeout=10)
+        watched.close()
 
 
 def test_watchdog_returns_the_dead_ancestor() -> None:
