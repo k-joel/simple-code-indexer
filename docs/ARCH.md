@@ -712,16 +712,27 @@ Global state (one per user):
   qdrant_storage/             # Qdrant data when that backend is managed
 ```
 
-Per-user install (what harness entries launch):
+Per-user install — the uv tool environment harness entries launch
+([ADR-019](DECISIONS.md#adr-019-pypi-distribution-uv-tool-install-replaces-the-git-copy-install)):
 
 ```
-%APPDATA%/simple-code-indexer/                 # Windows
-~/Library/Application Support/simple-code-indexer/   # macOS
-$XDG_DATA_HOME/simple-code-indexer/            # Linux, else ~/.local/share/...
-  run_server.py
-  src/simple_code_indexer/...
-  .venv/                       # synced environment
+%APPDATA%/uv/tools/simple-code-indexer/                   # Windows
+~/Library/Application Support/uv/tools/simple-code-indexer/   # macOS
+$XDG_DATA_HOME/uv/tools/simple-code-indexer/             # Linux, else ~/.local/share/uv/tools/...
+  Scripts/pythonw.exe        # Windows: windowless, spawnable by a GUI harness
+  bin/python                 # POSIX
+  Lib/site-packages/simple_code_indexer/...   # installed from the wheel
 ```
+
+`uv tool dir` reports the base directory; never hardcode it.
+
+The install spec is `install.install_spec()`: a source checkout is installed **by
+path**, so a local install works before the project is published; only a wheel
+install — where no checkout exists — pins `simple-code-indexer==<version>`. The
+path is handed to `uv tool install` with or without `--editable`: editable (the
+default) links the working tree, a wheel build (`--wheel`) installs a copy. Both
+land in the same environment root, so the harness entry is identical and only
+`uv-receipt.toml` records which flavour is live.
 
 Per workspace (gitignore `.simple-ci/`):
 
@@ -778,6 +789,7 @@ Package: `src/simple_code_indexer/` (import `simple_code_indexer`).
 | `parent_watch.py` | harness process discovery (launch chain, raw ancestor walk, ancestor install dirs) and liveness watchdog |
 | `mcp_roots.py` | bounded `roots/list` probe used as the second workspace source |
 | `services.py` | managed Docker container startup and readiness probes |
+| `cli.py` | console entry point: `setup` / `serve` / `uninstall` / `status` / `version` subcommands |
 | `logging_setup.py` | stderr/file logging, rotation, excepthooks, active log path |
 | `server.py` | MCP stdio server, deferred workspace binding (`ServerState`), tool handlers, status assembly |
 | `sidecar/` | daemon, reader session, JSON control protocol, discovery paths, lease registry |
@@ -787,14 +799,13 @@ Package: `src/simple_code_indexer/` (import `simple_code_indexer`).
 
 Repo-root entry points:
 
-- `setup.py` — interactive setup launcher. Not a setuptools script; it finds or
-  installs `uv`, syncs the checkout, and hands over to
-  `simple_code_indexer.setup_wizard` while preserving the caller's cwd.
-- `run_server.py` — launcher used by harness entries in the installed copy.
-  Runs `git pull --ff-only --autostash` and `uv sync` when `HEAD` moved, then
-  imports and runs the server **without changing cwd**, so workspace inference
-  still works. Both steps are bounded and fail-soft; `SIMPLE_CI_GIT_PULL=0`
-  disables the pull.
+- `setup.py` — clone-time bootstrap only. Not a setuptools script; it finds or
+  installs `uv`, syncs the checkout (an editable install), and hands over to
+  `simple_code_indexer.setup_wizard` while preserving the caller's cwd. A
+  published install never needs it: `uvx simple-code-indexer setup` is the
+  supported entry point.
+- `tools/release.py` — version bump, changelog cut, tag, push, plus the
+  `--verify-tag` / `--check-pypi` guards the release workflow runs.
 
 ### 7.1 Configuration
 
@@ -868,8 +879,8 @@ Workspace resolution order (`config.resolve_workspace_root`, ADR-018):
    `commandcode` implements it (its `~/.commandcode/ide/*.json` window files,
    matched by live ancestry). When the cwd is implausible (home or an ancestor's
    install directory) an entry without the marker — installed before the marker
-   existed — asks **every** plugin that declares a resolver instead, so a
-   `run_server.py` code update is enough and no setup re-run is needed.
+   existed — asks **every** plugin that declares a resolver instead, so shipping
+   a new version of the package is enough and no setup re-run is needed.
 4. Process cwd — only when it is plausible; otherwise the `ConfigError` above
    names the directory and the sources that were tried.
 
@@ -1179,21 +1190,22 @@ The setup wizard:
   provisions services;
 - writes **one** global `~/.simple-ci/config.yaml`, merging a legacy local file
   and deleting it;
-- copies the working tree (including `.git` on first install) to the per-user
-  app directory and syncs its environment;
+- installs the tool with `uv tool install`, editable when a checkout is detectable
+  (the default) or as a built wheel with `--wheel`;
 - writes the server entry into selected harness configs at global scope and
-  records `setup.install_root` plus `setup.harnesses`;
-- supports `--install-only` and record-driven `--uninstall` (harness entries,
-  install copy, config, docker assets, model cache; never workspace indexes).
-  `--no-git-pull` (debug) is the one exception to "copy and nothing else": it
-  also rewrites every recorded entry to carry `SIMPLE_CI_GIT_PULL=0`.
+  records `setup.install_kind` (`editable`/`wheel`) / `setup.tool_env` plus
+  `setup.harnesses`;
+- supports `--install-only` (install + repoint the recorded entries) and
+  record-driven `--uninstall` (harness entries, uv tool environment, config,
+  docker assets, model cache; never workspace indexes).
 
-Harness launch commands preserve the harness cwd: `uv run --project <install>
---no-sync python run_server.py` on POSIX, and the venv's windowless
-`pythonw.exe run_server.py` on Windows. `--no-sync` keeps launches fast; the
-launcher owns dependency updates. Entries are **workspace-free**
+Harness launch commands preserve the harness cwd and are the same for both install
+flavours: the uv tool environment's `bin/python -m simple_code_indexer serve` on
+POSIX and its windowless `Scripts/pythonw.exe -m simple_code_indexer serve` on
+Windows. Entries are
+**workspace-free**
 ([ADR-015](DECISIONS.md#adr-015-harness-entries-are-global-only-no-per-project-data)):
-they carry the install-scoped launcher only — never `WORKSPACE_ROOT`, `cwd`,
+they carry the install-scoped interpreter only — never `WORKSPACE_ROOT`, `cwd`,
 `INDEX_DB`, or `FAISS_PATH` — because the workspace is resolved at runtime
 (ADR-018). The only entry env the wizard may write for a resolver harness is the
 stable `SIMPLE_CI_HARNESS=<NAME>` marker. Because the server resolves the
@@ -1420,22 +1432,22 @@ won (`env`, `roots`, `harness:<name>`, or `cwd`).
 ## 11. Install and launch architecture
 
 ```
-checkout ──python setup.py──► per-user install copy + synced .venv
-                                   │
-                                   ├─ ~/.simple-ci/config.yaml
-                                   ├─ ~/.simple-ci/docker/... (managed services)
-                                   └─ harness entry → run_server.py
-                                                        │
-                                                        ├─ git pull --ff-only --autostash (bounded, fail-soft)
-                                                        ├─ uv sync when HEAD moved
-                                                        └─ server.main() in the harness cwd
+uvx simple-code-indexer setup ──► uv tool install simple-code-indexer==<version>
+                                     │
+                                     ├─ ~/.simple-ci/config.yaml
+                                     ├─ ~/.simple-ci/docker/... (managed services)
+                                     └─ harness entry → <tool-env>/pythonw.exe -m simple_code_indexer serve
+                                                                          │
+                                                                          └─ server.main() in the harness cwd
 ```
 
-The install copy is the stable launch target: deleting the checkout does not
-break harness entries, and updates arrive through the launcher's pull. The
-launcher must not change cwd; all workspace inference depends on it. The wizard
-is also the only supported place that writes harness entries, config, compose
-files, and model downloads.
+The uv tool environment is the stable launch target: it is version-pinned, needs
+no checkout, and is removed with `uv tool uninstall` (which `uninstall` runs).
+The launcher must not change cwd; all workspace inference depends on it.
+`--editable` (the default from a checkout) and `--wheel` install into that same
+environment, so flipping between a live working tree and a built artifact never
+rewrites an entry. The wizard is the only supported place that
+writes harness entries, config, compose files, and model downloads.
 
 ---
 

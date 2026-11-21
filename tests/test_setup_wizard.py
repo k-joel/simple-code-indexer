@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 import yaml
 
-from simple_code_indexer import configfile, model_prompts
+from simple_code_indexer import configfile, logging_setup, model_prompts
 from simple_code_indexer import harnesses as harnesses_pkg
 from simple_code_indexer.config import ipv4_loopback, load_settings
 from simple_code_indexer.harnesses import load_harnesses
@@ -96,11 +96,13 @@ class FakeRunner(Runner):
         results: dict[tuple[str, ...], CommandResult] | None = None,
         default: CommandResult | None = None,
         console_rc: int = 0,
+        creates_tool_env: Path | None = None,
     ) -> None:
         self.which_map = which_map or {}
         self.results = results or {}
         self.default = default or CommandResult(1)
         self.console_rc = console_rc
+        self.creates_tool_env = creates_tool_env
         self.calls: list[list[str]] = []
         self.console_calls: list[list[str]] = []
 
@@ -109,6 +111,8 @@ class FakeRunner(Runner):
 
     def run(self, argv: list[str], *, timeout: float = 15.0) -> CommandResult:
         self.calls.append(list(argv))
+        if self.creates_tool_env is not None and argv[1:3] == ["tool", "install"]:
+            self.creates_tool_env.mkdir(parents=True, exist_ok=True)
         for prefix, result in self.results.items():
             if tuple(argv[: len(prefix)]) == prefix:
                 return result
@@ -170,8 +174,48 @@ def _workspace(tmp_path: Path) -> tuple[Path, Path, Path]:
     home.mkdir(exist_ok=True)
     repo = tmp_path / "repo"
     repo.mkdir(exist_ok=True)
-    (repo / "run_server.py").write_text("# launcher\n", encoding="utf-8")
+    (repo / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
     return project, home, repo
+
+
+def _tool_runner(tmp_path: Path, *, preinstalled: bool = True) -> FakeRunner:
+    """A runner whose `uv tool dir` reports a directory this test owns."""
+    tool_root = tmp_path / "tools" / install_mod.TOOL_NAME
+    if preinstalled:
+        tool_root.mkdir(parents=True, exist_ok=True)
+    return FakeRunner(
+        which_map={"uv": "/usr/bin/uv"},
+        results={
+            ("/usr/bin/uv", "tool", "dir"): CommandResult(0, str(tmp_path / "tools"))
+        },
+        default=CommandResult(0),
+        creates_tool_env=tool_root,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _fake_tool_install(request, tmp_path, monkeypatch):
+    """Stub the uv tool install seam unless the test asserts the install argv.
+
+    Every wizard run installs the tool, but almost no test cares: patch the two
+    install-module functions so a run needs no uv and no real environment. Tests
+    that do care declare the `real_install` fixture to opt out.
+    """
+    if "real_install" in request.fixturenames:
+        return
+    root = tmp_path / "toolenv"
+    root.mkdir()
+    monkeypatch.setattr(install_mod, "tool_env_root", lambda runner: root)
+
+    def fake_ensure_tool(runner, *, spec, editable, output):
+        return root
+
+    monkeypatch.setattr(install_mod, "ensure_tool", fake_ensure_tool)
+
+
+@pytest.fixture
+def real_install() -> None:
+    """Opt out of `_fake_tool_install` and use the real install seam."""
 
 
 def _wizard(
@@ -183,7 +227,6 @@ def _wizard(
     **options,
 ) -> tuple[Wizard, Path, Path]:
     project, home, repo = _workspace(tmp_path)
-    options.setdefault("no_install", True)
     options.setdefault("harnesses", "none")
     wizard = Wizard(
         cwd=project,
@@ -562,7 +605,6 @@ def test_download_menu_marks_downloaded_models(tmp_path: Path, monkeypatch) -> N
         prompts=prompts,
         runner=_docker_runner(),
         http=FakeHttp(),
-        no_install=True,
         harnesses="none",
     )
 
@@ -634,7 +676,6 @@ def test_existing_global_setup_is_reused(tmp_path: Path, monkeypatch) -> None:
         prompts=prompts,
         runner=_docker_runner(),
         http=FakeHttp(dim=768),
-        no_install=True,
         harnesses="none",
         config_mode="use",
     )
@@ -705,7 +746,6 @@ def test_model_flag_bypasses_the_reuse_prompt(tmp_path: Path, monkeypatch) -> No
         runner=_docker_runner(),
         http=FakeHttp(),
         model="qwen3-embedding-0.6b",
-        no_install=True,
         harnesses="none",
     )
 
@@ -729,7 +769,6 @@ def test_dry_run_writes_nothing_and_runs_no_commands(tmp_path: Path) -> None:
         http=FakeHttp(),
         dry_run=True,
         assume_yes=True,
-        no_install=True,
         harnesses="none",
     )
 
@@ -941,111 +980,175 @@ def test_docker_installed_but_stopped_offers_to_start(
     assert started == [True]
 
 
-def test_install_copies_repo_and_points_entries_at_the_install(
-    tmp_path: Path, monkeypatch
+def test_install_editable_points_entries_at_the_tool_environment(
+    tmp_path: Path, real_install
 ) -> None:
     project, _home, repo = _workspace(tmp_path)
-    (repo / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
-    (repo / ".git").mkdir()
-    (repo / ".git" / "config").write_text("[core]\n", encoding="utf-8")
-    (repo / ".venv").mkdir()
-    (repo / ".venv" / "marker").write_text("x", encoding="utf-8")
-    (repo / "__pycache__").mkdir()
-    (repo / "__pycache__" / "x.pyc").write_text("x", encoding="utf-8")
-    install_dir = tmp_path / "install"
-    synced: list[Path] = []
-    monkeypatch.setattr(
-        install_mod,
-        "sync_env",
-        lambda runner, target, output: synced.append(target) or True,
-    )
+    tools = tmp_path / "tools" / install_mod.TOOL_NAME
+    tools.mkdir(parents=True)
+    runner = _tool_runner(tmp_path)
     wizard = Wizard(
         cwd=project,
         home=_home,
         repo_root=repo,
         prompts=ScriptedPrompter(),
-        runner=FakeRunner(which_map={"uv": "/usr/bin/uv"}),
-        install_dir=install_dir,
+        runner=runner,
         platform="win32",
     )
 
     result = wizard._step_install()
 
-    assert (install_dir / "run_server.py").is_file()
-    assert (install_dir / ".git" / "config").is_file()
-    assert not (install_dir / ".venv").exists()
-    assert not (install_dir / "__pycache__").exists()
-    assert result.root == install_dir
+    assert result.root == tools
     assert result.server_command == [
-        str(install_dir / ".venv" / "Scripts" / "pythonw.exe"),
-        str(install_dir / "run_server.py"),
+        str(tools / "Scripts" / "pythonw.exe"),
+        "-m",
+        "simple_code_indexer",
+        "serve",
     ]
-    assert synced == [install_dir]
-
-    (install_dir / ".git" / "config").write_text(
-        "[core]\n\tinstalled=true\n", encoding="utf-8"
+    install_call = next(
+        call for call in runner.calls if call[:3] == ["/usr/bin/uv", "tool", "install"]
     )
+    # A source checkout links itself, so setup works before the first publish.
+    assert install_call[-1] == str(repo.resolve())
+    assert "--editable" in install_call
+    assert wizard._record_tool_env == tools
+    assert wizard._record_install_kind == "editable"
+
+
+def test_install_wheel_produces_the_same_entry_as_editable(
+    tmp_path: Path, real_install
+) -> None:
+    """The whole point: switching flavour must never change the harness entry."""
+    project, _home, repo = _workspace(tmp_path)
+    tools = tmp_path / "tools" / install_mod.TOOL_NAME
+    tools.mkdir(parents=True)
+    editable = Wizard(
+        cwd=project,
+        home=_home,
+        repo_root=repo,
+        prompts=ScriptedPrompter(),
+        runner=_tool_runner(tmp_path),
+        platform="win32",
+    )._step_install()
+    wheel = Wizard(
+        cwd=project,
+        home=_home,
+        repo_root=repo,
+        prompts=ScriptedPrompter(),
+        runner=_tool_runner(tmp_path),
+        platform="win32",
+        editable=False,
+    )._step_install()
+
+    assert editable.server_command == wheel.server_command
+    assert editable.root == wheel.root == tools
+
+
+def test_install_wheel_builds_the_local_tree(tmp_path: Path, real_install) -> None:
+    project, _home, repo = _workspace(tmp_path)
+    tools = tmp_path / "tools" / install_mod.TOOL_NAME
+    tools.mkdir(parents=True)
+    runner = _tool_runner(tmp_path)
+    wizard = Wizard(
+        cwd=project,
+        home=_home,
+        repo_root=repo,
+        prompts=ScriptedPrompter(),
+        runner=runner,
+        platform="win32",
+        editable=False,
+    )
+
     wizard._step_install()
-    assert "installed=true" in (install_dir / ".git" / "config").read_text(
-        encoding="utf-8"
+
+    install_call = next(
+        call for call in runner.calls if call[:3] == ["/usr/bin/uv", "tool", "install"]
+    )
+    assert install_call[-1] == str(repo.resolve())
+    assert "--editable" not in install_call
+    assert "--refresh" in install_call
+    assert wizard._record_install_kind == "wheel"
+
+
+def test_install_without_a_checkout_pins_the_published_version(
+    tmp_path: Path, real_install
+) -> None:
+    """Editable needs a tree to link, so a wheel run falls back to PyPI."""
+    tool_root = tmp_path / "tools" / install_mod.TOOL_NAME
+    tool_root.mkdir(parents=True)
+    runner = _tool_runner(tmp_path)
+    prompts = ScriptedPrompter()
+    wizard = Wizard(
+        cwd=tmp_path,
+        home=tmp_path / "home",
+        prompts=prompts,
+        runner=runner,
+        platform="win32",
     )
 
+    wizard._step_install()
 
-def test_install_only_copies_the_checkout_and_writes_no_config(
-    tmp_path: Path,
+    install_call = next(
+        call for call in runner.calls if call[:3] == ["/usr/bin/uv", "tool", "install"]
+    )
+    assert (
+        install_call[-1]
+        == f"{install_mod.TOOL_NAME}=={logging_setup.package_version()}"
+    )
+    assert "--editable" not in install_call
+    assert any("No source checkout found" in line for line in prompts.messages)
+    assert wizard._record_install_kind == "wheel"
+
+
+def test_install_only_installs_the_tool_and_writes_no_config(
+    tmp_path: Path, monkeypatch, real_install
 ) -> None:
     _project, home, repo = _workspace(tmp_path)
-    (repo / "setup.py").write_text("# setup\n", encoding="utf-8")
-    target = tmp_path / "install"
+    tools = tmp_path / "tools" / install_mod.TOOL_NAME
+    tools.mkdir(parents=True)
+    calls: list[list[str]] = []
 
-    code = wizard_run(
-        [
-            "--install-only",
-            "--repo-root",
-            str(repo),
-            "--install-dir",
-            str(target),
-        ]
-    )
+    class RecordingRunner(Runner):
+        def which(self, name: str) -> str | None:
+            return "/usr/bin/uv" if name == "uv" else None
+
+        def run(self, argv: list[str], *, timeout: float = 15.0) -> CommandResult:
+            calls.append(list(argv))
+            if argv[1:3] == ["tool", "dir"]:
+                return CommandResult(0, str(tmp_path / "tools"))
+            return CommandResult(0)
+
+    monkeypatch.setattr(provision, "Runner", RecordingRunner)
+
+    code = wizard_run(["--install-only", "--repo-root", str(repo)])
 
     assert code == 0
-    assert (target / "run_server.py").is_file()
-    assert (target / "setup.py").is_file()
     assert not (home / ".simple-ci").exists()
+    assert any(call[:3] == ["/usr/bin/uv", "tool", "install"] for call in calls)
 
 
-def test_install_only_defaults_to_the_per_user_app_directory(
-    tmp_path: Path, monkeypatch
+def test_install_only_dry_run_runs_nothing(
+    tmp_path: Path, monkeypatch, real_install
 ) -> None:
     _project, _home, repo = _workspace(tmp_path)
-    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    monkeypatch.setenv("HOME", str(tmp_path / "user"))
-    monkeypatch.setenv("USERPROFILE", str(tmp_path / "user"))
-    target = install_mod.install_root(home=Path.home(), platform=sys.platform)
+    calls: list[list[str]] = []
 
-    assert wizard_run(["--install-only", "--repo-root", str(repo)]) == 0
+    class RecordingRunner(Runner):
+        def which(self, name: str) -> str | None:
+            return "/usr/bin/uv" if name == "uv" else None
 
-    assert (target / "run_server.py").is_file()
+        def run(self, argv: list[str], *, timeout: float = 15.0) -> CommandResult:
+            calls.append(list(argv))
+            return CommandResult(0)
 
+    monkeypatch.setattr(provision, "Runner", RecordingRunner)
 
-def test_install_only_dry_run_copies_nothing(tmp_path: Path) -> None:
-    _project, _home, repo = _workspace(tmp_path)
-    target = tmp_path / "install"
-
-    code = wizard_run(
-        [
-            "--install-only",
-            "--dry-run",
-            "--repo-root",
-            str(repo),
-            "--install-dir",
-            str(target),
-        ]
-    )
+    code = wizard_run(["--install-only", "--dry-run", "--repo-root", str(repo)])
 
     assert code == 0
-    assert not target.exists()
+    assert not any(
+        call[1:3] in (["tool", "install"], ["tool", "uninstall"]) for call in calls
+    )
 
 
 def test_install_only_rejects_setup_flags() -> None:
@@ -1055,9 +1158,7 @@ def test_install_only_rejects_setup_flags() -> None:
         wizard_run(["--install-only", "--uninstall"])
 
 
-def test_no_git_pull_writes_the_env_pin_into_every_entry(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_an_entry_carries_no_env(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(harnesses_pkg, "_which", lambda _name: None)
     project, home, repo = _workspace(tmp_path)
     (home / ".cursor").mkdir()
@@ -1071,41 +1172,8 @@ def test_no_git_pull_writes_the_env_pin_into_every_entry(
         repo_root=repo,
         prompts=ScriptedPrompter(multis=[[cursor_index]]),
         runner=FakeRunner(),
-        no_install=True,
-        no_git_pull=True,
     )
-    result = install_mod.InstallResult(
-        root=repo,
-        launcher=repo / "run_server.py",
-        uv="/usr/bin/uv",
-        platform="linux",
-    )
-
-    wizard._step_harnesses(result)
-
-    entry = json.loads((home / ".cursor" / "mcp.json").read_text(encoding="utf-8"))[
-        "mcpServers"
-    ]["simple-code-indexer"]
-    assert entry["env"] == {"SIMPLE_CI_GIT_PULL": "0"}
-
-
-def test_without_no_git_pull_the_entry_carries_no_env(tmp_path: Path) -> None:
-    project, home, repo = _workspace(tmp_path)
-    wizard = Wizard(
-        cwd=project,
-        home=home,
-        repo_root=repo,
-        prompts=ScriptedPrompter(),
-        runner=FakeRunner(),
-        no_install=True,
-        harnesses="cursor",
-    )
-    result = install_mod.InstallResult(
-        root=repo,
-        launcher=repo / "run_server.py",
-        uv="/usr/bin/uv",
-        platform="linux",
-    )
+    result = install_mod.InstallResult(root=tmp_path / "tool-env", platform="linux")
 
     wizard._step_harnesses(result)
 
@@ -1113,17 +1181,16 @@ def test_without_no_git_pull_the_entry_carries_no_env(tmp_path: Path) -> None:
         "mcpServers"
     ]["simple-code-indexer"]
     assert "env" not in entry
+    assert entry["command"] == str(tmp_path / "tool-env" / "bin" / "python")
+    assert entry["args"] == ["-m", "simple_code_indexer", "serve"]
 
 
-def test_install_only_no_git_pull_refreshes_the_recorded_entries(
-    tmp_path: Path, monkeypatch
+def test_install_only_refreshes_the_recorded_entries(
+    tmp_path: Path, monkeypatch, real_install
 ) -> None:
     _project, home, repo = _workspace(tmp_path)
-    target = tmp_path / "install"
-    target.mkdir()
-    (target / install_mod.LAUNCHER_FILENAME).write_text(
-        "# launcher\n", encoding="utf-8"
-    )
+    tools = tmp_path / "tools" / install_mod.TOOL_NAME
+    tools.mkdir(parents=True)
     config = home / ".simple-ci" / "config.yaml"
     config.parent.mkdir(parents=True)
     cursor_config = home / ".cursor" / "mcp.json"
@@ -1136,7 +1203,6 @@ def test_install_only_no_git_pull_refreshes_the_recorded_entries(
             {
                 "version": 1,
                 "setup": {
-                    "install_root": str(target),
                     "harnesses": [{"name": "cursor", "config": str(cursor_config)}],
                 },
             }
@@ -1145,112 +1211,33 @@ def test_install_only_no_git_pull_refreshes_the_recorded_entries(
     )
     monkeypatch.setattr(configfile, "global_config_path", lambda home=None: config)
 
-    code = wizard_run(
-        [
-            "--install-only",
-            "--no-git-pull",
-            "--repo-root",
-            str(repo),
-            "--install-dir",
-            str(target),
-        ]
-    )
+    class ToolRunner(Runner):
+        def which(self, name: str) -> str | None:
+            return "/usr/bin/uv" if name == "uv" else None
 
-    assert code == 0
-    document = json.loads(cursor_config.read_text(encoding="utf-8"))
-    assert document["mcpServers"]["other"] == {"command": "x"}
-    entry = document["mcpServers"]["simple-code-indexer"]
-    assert entry["env"] == {"SIMPLE_CI_GIT_PULL": "0"}
-    assert str(target / install_mod.LAUNCHER_FILENAME) in entry["args"]
+        def run(self, argv: list[str], *, timeout: float = 15.0) -> CommandResult:
+            if argv[1:3] == ["tool", "dir"]:
+                return CommandResult(0, str(tmp_path / "tools"))
+            return CommandResult(0)
 
+    monkeypatch.setattr(provision, "Runner", ToolRunner)
 
-def test_install_only_no_git_pull_is_idempotent(tmp_path: Path, monkeypatch) -> None:
-    _project, home, repo = _workspace(tmp_path)
-    target = tmp_path / "install"
-    target.mkdir()
-    (target / install_mod.LAUNCHER_FILENAME).write_text(
-        "# launcher\n", encoding="utf-8"
-    )
-    config = home / ".simple-ci" / "config.yaml"
-    config.parent.mkdir(parents=True)
-    cursor_config = home / ".cursor" / "mcp.json"
-    cursor_config.parent.mkdir(parents=True)
-    config.write_text(
-        yaml.safe_dump(
-            {
-                "version": 1,
-                "setup": {
-                    "install_root": str(target),
-                    "harnesses": [{"name": "cursor", "config": str(cursor_config)}],
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(configfile, "global_config_path", lambda home=None: config)
-    argv = [
-        "--install-only",
-        "--no-git-pull",
-        "--repo-root",
-        str(repo),
-        "--install-dir",
-        str(target),
-    ]
-
-    assert wizard_run(argv) == 0
+    opts = ["--install-only", "--repo-root", str(repo)]
+    assert wizard_run(opts) == 0
     first = cursor_config.read_text(encoding="utf-8")
-    assert not list(cursor_config.parent.glob("mcp.json.bak.*"))
-    assert wizard_run(argv) == 0
+    assert wizard_run(opts) == 0
     assert cursor_config.read_text(encoding="utf-8") == first
 
-
-def test_install_only_no_git_pull_reports_the_recorded_install(
-    tmp_path: Path, monkeypatch
-) -> None:
-    _project, home, repo = _workspace(tmp_path)
-    recorded = tmp_path / "recorded"
-    target = tmp_path / "install"
-    target.mkdir()
-    (target / install_mod.LAUNCHER_FILENAME).write_text(
-        "# launcher\n", encoding="utf-8"
+    document = json.loads(first)
+    assert document["mcpServers"]["other"] == {"command": "x"}
+    entry = document["mcpServers"]["simple-code-indexer"]
+    expected = (
+        tools / "Scripts" / "pythonw.exe"
+        if sys.platform == "win32"
+        else tools / "bin" / "python"
     )
-    config = home / ".simple-ci" / "config.yaml"
-    config.parent.mkdir(parents=True)
-    cursor_config = home / ".cursor" / "mcp.json"
-    cursor_config.parent.mkdir(parents=True)
-    cursor_config.write_text("{}", encoding="utf-8")
-    config.write_text(
-        yaml.safe_dump(
-            {
-                "version": 1,
-                "setup": {
-                    "install_root": str(recorded),
-                    "harnesses": [{"name": "cursor", "config": str(cursor_config)}],
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(configfile, "global_config_path", lambda home=None: config)
-
-    assert (
-        wizard_run(
-            [
-                "--install-only",
-                "--no-git-pull",
-                "--repo-root",
-                str(repo),
-                "--install-dir",
-                str(target),
-            ]
-        )
-        == 0
-    )
-
-    entry = json.loads(cursor_config.read_text(encoding="utf-8"))["mcpServers"][
-        "simple-code-indexer"
-    ]
-    assert str(recorded / install_mod.LAUNCHER_FILENAME) in entry["args"]
+    assert entry["command"] == str(expected)
+    assert "env" not in entry
 
 
 def test_harness_install_merges_and_backs_up(tmp_path: Path, monkeypatch) -> None:
@@ -1274,12 +1261,7 @@ def test_harness_install_merges_and_backs_up(tmp_path: Path, monkeypatch) -> Non
         prompts=prompts,
         runner=FakeRunner(),
     )
-    result = install_mod.InstallResult(
-        root=repo,
-        launcher=repo / "run_server.py",
-        uv="/usr/bin/uv",
-        platform="linux",
-    )
+    result = install_mod.InstallResult(root=repo, platform="linux")
 
     wizard._step_harnesses(result)
 
@@ -1287,15 +1269,8 @@ def test_harness_install_merges_and_backs_up(tmp_path: Path, monkeypatch) -> Non
     assert document["theme"] == "dark"
     assert document["mcpServers"]["other"] == {"command": "x"}
     entry = document["mcpServers"]["simple-code-indexer"]
-    assert entry["command"] == "/usr/bin/uv"
-    assert entry["args"] == [
-        "run",
-        "--project",
-        str(repo),
-        "--no-sync",
-        "python",
-        str(repo / "run_server.py"),
-    ]
+    assert entry["command"] == str(repo / "bin" / "python")
+    assert entry["args"] == ["-m", "simple_code_indexer", "serve"]
     assert list((home / ".cursor").glob("mcp.json.bak.*"))
     assert not (project / ".cursor" / "mcp.json").exists()
 
@@ -1315,21 +1290,15 @@ def test_harness_install_is_recorded_in_the_config(tmp_path: Path) -> None:
     target = home / ".cursor" / "mcp.json"
     setup = _global(home)["setup"]
     assert setup["harnesses"] == [{"name": "cursor", "config": str(target)}]
-    assert "install_root" not in setup
 
 
-def test_the_install_copy_is_recorded(tmp_path: Path, monkeypatch) -> None:
-    project, home, repo = _workspace(tmp_path)
-    install_dir = tmp_path / "install"
-    monkeypatch.setattr(install_mod, "sync_env", lambda runner, target, output: True)
-    wizard = Wizard(
-        cwd=project,
-        home=home,
-        repo_root=repo,
+def test_the_tool_environment_is_recorded(tmp_path: Path, real_install) -> None:
+    tools = tmp_path / "tools" / install_mod.TOOL_NAME
+    tools.mkdir(parents=True)
+    wizard, _project, home = _wizard(
+        tmp_path,
         prompts=ScriptedPrompter(),
-        runner=_docker_runner(),
-        http=FakeHttp(),
-        install_dir=install_dir,
+        runner=_tool_runner(tmp_path),
         harnesses="none",
         embedding_url=EMBED_URL,
         vector_store="faiss",
@@ -1337,80 +1306,27 @@ def test_the_install_copy_is_recorded(tmp_path: Path, monkeypatch) -> None:
 
     assert wizard.run() == 0
 
-    assert _global(home)["setup"]["install_root"] == str(install_dir.resolve())
-    assert (install_dir / "run_server.py").is_file()
+    setup = _global(home)["setup"]
+    assert setup["install_kind"] == "editable"
+    assert "install_mode" not in setup
+    assert setup["tool_env"] == str(tools)
 
 
-def _recorded_install(tmp_path: Path, home: Path) -> Path:
-    old = tmp_path / "old-install"
-    old.mkdir()
-    (old / install_mod.LAUNCHER_FILENAME).write_text("# launcher\n", encoding="utf-8")
-    config = home / ".simple-ci" / "config.yaml"
-    config.parent.mkdir(parents=True)
-    config.write_text(
-        yaml.safe_dump({"version": 1, "setup": {"install_root": str(old)}}),
-        encoding="utf-8",
-    )
-    return old
+def test_the_summary_shows_the_install_kind(tmp_path: Path, real_install) -> None:
+    """Guards the anti-drift line: an editable install must not be invisible."""
+    for editable, expected in ((True, "editable"), (False, "wheel")):
+        prompts = ScriptedPrompter()
+        wizard, _project, _home = _wizard(
+            tmp_path,
+            prompts=prompts,
+            runner=_tool_runner(tmp_path),
+            editable=editable,
+            embedding_url=EMBED_URL,
+            vector_store="faiss",
+        )
 
-
-def _moved_install_wizard(
-    tmp_path: Path, monkeypatch, prompts: ScriptedPrompter, **options
-) -> tuple[Wizard, Path, Path]:
-    project, home, repo = _workspace(tmp_path)
-    monkeypatch.setattr(install_mod, "sync_env", lambda runner, target, output: True)
-    options.setdefault("install_dir", tmp_path / "new-install")
-    wizard = Wizard(
-        cwd=project,
-        home=home,
-        repo_root=repo,
-        prompts=prompts,
-        runner=_docker_runner(),
-        http=FakeHttp(),
-        harnesses="none",
-        embedding_url=EMBED_URL,
-        vector_store="faiss",
-        **options,
-    )
-    return wizard, home, options["install_dir"]
-
-
-def test_a_changed_install_dir_removes_the_old_copy(
-    tmp_path: Path, monkeypatch
-) -> None:
-    prompts = ScriptedPrompter()
-    wizard, home, new = _moved_install_wizard(tmp_path, monkeypatch, prompts)
-    old = _recorded_install(tmp_path, home)
-
-    assert wizard.run() == 0
-
-    assert not old.exists()
-    assert _global(home)["setup"]["install_root"] == str(new.resolve())
-    assert (new / "run_server.py").is_file()
-
-
-def test_declining_removal_keeps_the_old_copy(tmp_path: Path, monkeypatch) -> None:
-    prompts = ScriptedPrompter(yes=[False])
-    wizard, home, _new = _moved_install_wizard(tmp_path, monkeypatch, prompts)
-    old = _recorded_install(tmp_path, home)
-
-    assert wizard.run() == 0
-
-    assert (old / install_mod.LAUNCHER_FILENAME).is_file()
-    assert any("Kept" in message for message in prompts.messages)
-
-
-def test_dry_run_keeps_the_old_install_copy(tmp_path: Path, monkeypatch) -> None:
-    prompts = ScriptedPrompter()
-    wizard, home, _new = _moved_install_wizard(
-        tmp_path, monkeypatch, prompts, dry_run=True
-    )
-    old = _recorded_install(tmp_path, home)
-
-    assert wizard.run() == 0
-
-    assert old.is_dir()
-    assert any("Would delete the previous install copy" in m for m in prompts.messages)
+        assert wizard.run() == 0
+        assert f"  kind:         {expected}" in prompts.messages
 
 
 def test_deselecting_a_harness_removes_its_entry_and_backup(tmp_path: Path) -> None:
@@ -1497,12 +1413,7 @@ def test_a_recorded_harness_path_that_moved_is_cleaned_up(
         runner=FakeRunner(),
     )
     wizard._record_harnesses = [{"name": "cursor", "config": str(stale)}]
-    result = install_mod.InstallResult(
-        root=repo,
-        launcher=repo / "run_server.py",
-        uv="/usr/bin/uv",
-        platform="linux",
-    )
+    result = install_mod.InstallResult(root=repo, platform="linux")
 
     wizard._step_harnesses(result)
 
@@ -1510,7 +1421,9 @@ def test_a_recorded_harness_path_that_moved_is_cleaned_up(
     assert not stale.exists()
     assert not stale.parent.exists()
     document = json.loads(target.read_text(encoding="utf-8"))
-    assert document["mcpServers"]["simple-code-indexer"]["command"] == "/usr/bin/uv"
+    assert document["mcpServers"]["simple-code-indexer"]["command"] == str(
+        repo / "bin" / "python"
+    )
     assert wizard._record_harnesses == [{"name": "cursor", "config": str(target)}]
 
 
@@ -1569,38 +1482,6 @@ def test_embedding_url_flag_forces_a_url(tmp_path: Path) -> None:
     assert document["embedding"]["base_url"] == EMBED_URL
     assert document["embedding"]["dim"] == DIM
     assert "service" not in document["embedding"]
-
-
-def test_no_install_entries_point_at_the_checkout(tmp_path: Path) -> None:
-    wizard, _project, home = _wizard(
-        tmp_path,
-        prompts=ScriptedPrompter(),
-        runner=_docker_runner(),
-        embedding_url=EMBED_URL,
-        vector_store="faiss",
-        harnesses="cursor",
-    )
-
-    assert wizard.run() == 0
-
-    target = home / ".cursor" / "mcp.json"
-    document = json.loads(target.read_text(encoding="utf-8"))
-    entry = document["mcpServers"]["simple-code-indexer"]
-    if sys.platform == "win32":
-        assert entry["command"] == str(
-            wizard.repo_root / ".venv" / "Scripts" / "pythonw.exe"
-        )
-        assert entry["args"] == [str(wizard.repo_root / "run_server.py")]
-    else:
-        assert entry["command"] == "/usr/bin/uv"
-        assert entry["args"] == [
-            "run",
-            "--project",
-            str(wizard.repo_root),
-            "--no-sync",
-            "python",
-            str(wizard.repo_root / "run_server.py"),
-        ]
 
 
 def test_legacy_models_directory_is_migrated(tmp_path: Path) -> None:

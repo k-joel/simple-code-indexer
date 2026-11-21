@@ -176,8 +176,8 @@ def discover_workspace(
     The entry names its plugin through `RUNTIME_ENV`; only that plugin is
     asked, and only it can answer (ADR-018). ``require_marker=False`` asks every
     plugin that declares a resolver (the marked one first): an entry installed
-    before the marker existed then keeps working after `run_server.py` updates
-    the code, with no setup re-run. Fail-soft: an unknown plugin, a resolver
+    before the marker existed then keeps working after a package update, with no
+    setup re-run. Fail-soft: an unknown plugin, a resolver
     that raises, or a result that is not an existing directory all fall through
     to the caller's next workspace source.
     """
@@ -231,11 +231,19 @@ def _ask_resolver(spec: HarnessSpec, cwd: Path) -> tuple[Path, str] | None:
 
 
 def _repo_harnesses_dir() -> Path | None:
+    """`<checkout>/harnesses`, or None when running from an installed wheel.
+
+    The check mirrors `setup_wizard._default_repo_root`: the parent must hold this
+    package's own `src/` tree. A plain `pyproject.toml` search would adopt the
+    enclosing project of an installed package (`.venv/Lib/site-packages/...`) and
+    load its drop-ins. Falling back to `Path.cwd() / "harnesses"` would make the
+    workspace directory appear twice in the search path.
+    """
     here = Path(__file__).resolve()
     for parent in here.parents:
-        if (parent / "pyproject.toml").is_file():
+        if (parent / "src" / "simple_code_indexer" / "__init__.py").is_file():
             return parent / "harnesses"
-    return Path.cwd() / "harnesses"
+    return None
 
 
 def _load_dir(specs: dict[str, HarnessSpec], directory: Path, *, prefix: str) -> None:

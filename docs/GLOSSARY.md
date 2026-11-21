@@ -182,9 +182,10 @@ service degrades to lexical-only search instead of blocking the session.
 _Avoid_: sidecar, dependency, docker service (in prose)
 
 **Setup wizard**:
-The interactive flow started by `python setup.py`: installs `uv`, chooses an embedding
-endpoint (existing or downloaded), chooses sqlite-vec, FAISS, or Qdrant, probes the vector
-dimension, registers the server with detected harnesses, and writes `config.yaml`.
+The interactive flow started by `simple-code-indexer setup` (`uvx …` or `uv run …`): installs the
+pinned wheel as a uv tool, chooses an embedding endpoint (existing or downloaded), chooses
+sqlite-vec, FAISS, or Qdrant, probes the vector dimension, registers the server with detected
+harnesses, and writes `config.yaml`.
 _Avoid_: installer, bootstrap, setup script (as a noun for the logic)
 
 **Collection name**:

@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from simple_code_indexer.setup_wizard import install, uninstall
 from simple_code_indexer.setup_wizard import run as wizard_run
+from simple_code_indexer.setup_wizard import uninstall
 from simple_code_indexer.setup_wizard.prompts import Prompter
 from simple_code_indexer.setup_wizard.provision import CommandResult, Runner
 
@@ -56,11 +56,8 @@ def _write_config(
     path: Path,
     *,
     harnesses: Iterable[dict[str, str]] = (),
-    install_root: Path | None = None,
 ) -> None:
     setup: dict[str, object] = {}
-    if install_root is not None:
-        setup["install_root"] = str(install_root)
     records = list(harnesses)
     if records:
         setup["harnesses"] = records
@@ -81,14 +78,10 @@ def _write_config(
     )
 
 
-def _prepare(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+def _prepare(tmp_path: Path) -> tuple[Path, Path, Path]:
     home = tmp_path / "home"
     home.mkdir()
-    install_dir = tmp_path / "install"
-    install_dir.mkdir()
-    (install_dir / install.LAUNCHER_FILENAME).write_text(
-        "# launcher\n", encoding="utf-8"
-    )
+
     target = home / ".cursor" / "mcp.json"
     target.parent.mkdir(parents=True)
     target.write_text(
@@ -113,9 +106,8 @@ def _prepare(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     _write_config(
         global_dir / "config.yaml",
         harnesses=[{"name": "cursor", "config": str(target)}],
-        install_root=install_dir,
     )
-    return home, install_dir, target, compose
+    return home, target, compose
 
 
 def _uninstaller(
@@ -128,7 +120,6 @@ def _uninstaller(
 ) -> uninstall.Uninstaller:
     return uninstall.Uninstaller(
         home=home,
-        repo_root=tmp_path / "repo",
         prompts=prompts or ScriptedPrompter(),
         runner=runner or FakeRunner(),
         platform="win32",
@@ -137,7 +128,7 @@ def _uninstaller(
 
 
 def test_uninstall_removes_everything_the_install_created(tmp_path: Path) -> None:
-    home, install_dir, target, compose = _prepare(tmp_path)
+    home, target, compose = _prepare(tmp_path)
     runner = FakeRunner()
 
     code = _uninstaller(home, tmp_path, runner=runner, assume_yes=True).run()
@@ -147,7 +138,6 @@ def test_uninstall_removes_everything_the_install_created(tmp_path: Path) -> Non
     assert document == {"mcpServers": {"other": {"command": "x"}}, "theme": "dark"}
     assert not list(target.parent.glob("mcp.json.bak.*"))
     assert not (home / ".simple-ci").exists()
-    assert not install_dir.exists()
     assert ["docker", "compose", "-f", str(compose), "down", "--remove-orphans"] in (
         runner.calls
     )
@@ -156,7 +146,7 @@ def test_uninstall_removes_everything_the_install_created(tmp_path: Path) -> Non
 def test_keep_models_leaves_the_cache_and_the_global_directory(
     tmp_path: Path,
 ) -> None:
-    home, install_dir, _target, _compose = _prepare(tmp_path)
+    home, _target, _compose = _prepare(tmp_path)
 
     code = _uninstaller(home, tmp_path, assume_yes=True, keep_models=True).run()
 
@@ -164,11 +154,10 @@ def test_keep_models_leaves_the_cache_and_the_global_directory(
     assert (home / ".simple-ci" / "model" / "x.gguf").is_file()
     assert not (home / ".simple-ci" / "config.yaml").exists()
     assert not (home / ".simple-ci" / "docker").exists()
-    assert not install_dir.exists()
 
 
 def test_dry_run_deletes_nothing_and_runs_no_commands(tmp_path: Path) -> None:
-    home, install_dir, target, _compose = _prepare(tmp_path)
+    home, target, _compose = _prepare(tmp_path)
     runner = FakeRunner()
 
     code = _uninstaller(
@@ -179,13 +168,13 @@ def test_dry_run_deletes_nothing_and_runs_no_commands(tmp_path: Path) -> None:
     assert (home / ".simple-ci" / "config.yaml").is_file()
     assert (home / ".simple-ci" / "docker" / "docker-compose.yml").is_file()
     assert (home / ".simple-ci" / "model" / "x.gguf").is_file()
-    assert install_dir.is_dir()
     assert target.is_file()
-    assert runner.calls == []
+    # `uv tool dir` is a read-only probe; nothing may actually change state.
+    assert all(call[1:3] == ["tool", "dir"] for call in runner.calls)
 
 
 def test_declining_the_prompt_changes_nothing(tmp_path: Path) -> None:
-    home, install_dir, target, _compose = _prepare(tmp_path)
+    home, target, _compose = _prepare(tmp_path)
     prompts = ScriptedPrompter(yes=[False])
 
     code = _uninstaller(home, tmp_path, prompts=prompts).run()
@@ -193,7 +182,6 @@ def test_declining_the_prompt_changes_nothing(tmp_path: Path) -> None:
     assert code == 0
     assert "Cancelled." in prompts.messages
     assert (home / ".simple-ci" / "config.yaml").is_file()
-    assert install_dir.is_dir()
     assert target.is_file()
 
 
@@ -206,28 +194,6 @@ def test_a_missing_install_is_a_no_op(tmp_path: Path) -> None:
 
     assert code == 0
     assert "Nothing to remove." in prompts.messages
-
-
-def test_the_source_checkout_is_never_deleted(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    home.mkdir()
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / "run_server.py").write_text("# launcher\n", encoding="utf-8")
-    _write_config(home / ".simple-ci" / "config.yaml", install_root=repo)
-    prompts = ScriptedPrompter()
-
-    code = _uninstaller(
-        home,
-        tmp_path,
-        prompts=prompts,
-        runner=FakeRunner(docker=False),
-        assume_yes=True,
-    ).run()
-
-    assert code == 0
-    assert (repo / "run_server.py").is_file()
-    assert any("working checkout" in message for message in prompts.messages)
 
 
 def test_a_config_that_only_held_the_entry_is_deleted_with_its_directory(
@@ -307,7 +273,7 @@ def test_a_recorded_config_that_is_gone_is_tolerated(tmp_path: Path) -> None:
 
 
 def test_docker_unavailable_still_deletes_the_docker_assets(tmp_path: Path) -> None:
-    home, install_dir, _target, _compose = _prepare(tmp_path)
+    home, _target, _compose = _prepare(tmp_path)
     prompts = ScriptedPrompter()
 
     code = _uninstaller(
@@ -321,7 +287,6 @@ def test_docker_unavailable_still_deletes_the_docker_assets(tmp_path: Path) -> N
     assert code == 0
     assert any("Docker is not running" in message for message in prompts.messages)
     assert not (home / ".simple-ci").exists()
-    assert not install_dir.exists()
 
 
 def test_a_failed_harness_edit_keeps_the_record_for_a_retry(tmp_path: Path) -> None:
@@ -345,28 +310,6 @@ def test_a_failed_harness_edit_keeps_the_record_for_a_retry(tmp_path: Path) -> N
     assert code == 1
     assert config.is_file()
     assert any("Could not update" in message for message in prompts.messages)
-
-
-def test_a_failed_install_deletion_still_deletes_the_config(
-    tmp_path: Path, monkeypatch
-) -> None:
-    home, install_dir, _target, _compose = _prepare(tmp_path)
-    real_rmtree = uninstall.shutil.rmtree
-
-    def fail_the_install(path, *args, **kwargs):
-        if Path(path).resolve() == install_dir.resolve():
-            raise OSError("directory is in use")
-        return real_rmtree(path, *args, **kwargs)
-
-    monkeypatch.setattr(uninstall.shutil, "rmtree", fail_the_install)
-    prompts = ScriptedPrompter()
-
-    code = _uninstaller(home, tmp_path, prompts=prompts, assume_yes=True).run()
-
-    assert code == 1
-    assert not (home / ".simple-ci" / "config.yaml").exists()
-    assert install_dir.is_dir()
-    assert not any("Keeping" in message for message in prompts.messages)
 
 
 def test_keep_models_requires_uninstall() -> None:

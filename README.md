@@ -51,53 +51,90 @@ embedding endpoint, which the wizard can start for you in Docker.
 
 ## Quick start
 
-Prerequisites: **Python 3.12+** and **git**. **Docker Desktop** is optional — only needed to
-download an embedding model or run Qdrant; an embedding endpoint you already run elsewhere
-works too. The installer installs `uv` when missing.
+Prerequisites: **[uv](https://docs.astral.sh/uv/)** (the setup command installs it
+when missing) and **Python 3.12+**, which `uv` will fetch. **Docker Desktop** is
+optional — only needed to download an embedding model or run Qdrant; an embedding
+endpoint you already run elsewhere works too.
 
 ```bash
-git clone https://github.com/k-joel/simple-code-indexer.git simple-code-indexer
-cd simple-code-indexer
-python setup.py
+uvx simple-code-indexer setup
 ```
 
-That launches the interactive wizard. Useful variants:
+That installs a version-pinned environment with `uv tool install` and launches the
+interactive wizard. Useful variants:
 
 ```bash
-python setup.py --dry-run                                 # print every action, change nothing
-python setup.py --yes                                     # accept all recommended defaults
-python setup.py --yes --model embeddinggemma2 --gpu auto  # one model, GPU autodetected
-python setup.py --yes --model qwen3-embedding-4b --vector-store faiss
+uvx simple-code-indexer setup --dry-run                          # print every action, change nothing
+uvx simple-code-indexer setup --yes                              # accept all recommended defaults
+uvx simple-code-indexer setup --yes --model embeddinggemma2 --gpu auto
+uvx simple-code-indexer setup --yes --model qwen3-embedding-4b --vector-store faiss
 ```
 
 The wizard:
 
-1. installs/starts Docker if it is missing (only needed for model downloads or Qdrant),
-2. picks an embedding source: an existing container or URL, or a downloadable model
-   (EmbeddingGemma 2, Qwen3-Embedding 0.6B, Qwen3-Embedding 4B, Nomic Embed Code), probing the
-   real embedding dimension from the endpoint,
-3. picks the vector store: **sqlite-vec** (recommended — vectors inside `index.db`, no Docker),
+1. installs the pinned wheel into a uv tool environment and points every harness
+   entry at that environment's interpreter,
+2. installs/starts Docker if it is missing (only needed for model downloads or Qdrant),
+3. picks an embedding source: an existing container or URL, or a downloadable model
+   (EmbeddingGemma 2, Qwen3-Embedding 0.6B, Qwen3-Embedding 4B, Nomic Embed Code), probing
+   the real embedding dimension from the endpoint,
+4. picks the vector store: **sqlite-vec** (recommended — vectors inside `index.db`, no Docker),
    **FAISS** (a separate local file), or **Qdrant**,
-4. selects which harnesses to configure (global scope; restart each harness afterwards),
-5. copies the repo to a per-user install directory and points the harness entries at it; the
-   launcher self-updates via `git pull` on each start.
+5. selects which harnesses to configure (global scope; restart each harness afterwards).
 
-Everything the wizard writes — config, services, models, install copy — is global. The server
-creates `<project>/.simple-ci/` (index + vectors) only when it runs in a project.
+Everything the wizard writes — config, services, models, tool environment — is global. The
+server creates `<project>/.simple-ci/` (index + vectors) only when it runs in a project.
+
+### From a source checkout (no publishing needed)
+
+```bash
+git clone https://github.com/k-joel/simple-code-indexer.git simple-code-indexer
+cd simple-code-indexer
+uv sync                             # editable install of the package
+uv run simple-code-indexer setup    # wizard; installs this checkout as a uv tool
+```
+
+`simple-code-indexer install` does the install step alone — it installs **this checkout** with
+`uv tool install --editable <path>` and exits, installing `uv` first if it is missing. That
+replaces the old `python setup.py` bootstrap; there is no committed launcher script any more.
+
+Where it lands (`uv tool dir` prints the environment root, `uv tool dir --bin` the
+executables directory):
+
+```
+%APPDATA%\uv\tools\simple-code-indexer\                 # Windows
+~/Library/Application Support/uv/tools/simple-code-indexer/   # macOS
+$XDG_DATA_HOME/uv/tools/simple-code-indexer/            # Linux, else ~/.local/share/uv/tools/...
+  Scripts\pythonw.exe        # Windows entry interpreter (windowless)
+  bin/python                 # POSIX entry interpreter
+  Lib\site-packages\simple_code_indexer\   # the installed copy
+```
+
+The default is an **editable** install: a `.pth` in that environment points at the checkout, so
+edits are live without reinstalling. `simple-code-indexer install --wheel` (or `setup --wheel`)
+builds and installs a real wheel instead — the prod-validation switch — and a run with no
+source checkout (e.g. `uvx`) always takes that path, pinned to the published version.
+
+Both flavours reuse the same environment, so the harness entry never changes: switching is just
+another `install`, which force-reinstalls. `uv-receipt.toml` inside the environment records which
+one is live (`editable = …` means your working tree is being served), and
+`simple-code-indexer status` reports it as `install_kind`. An editable install stops working if
+you delete the checkout; the wheel flavour does not.
 
 ### Verify the install
 
 ```bash
-uv run python tests/service_probe.py   # expect: embeddings OK dim=<n>, PROBE OK
-uv run python tests/mcp_probe.py     # exercises all three tools over stdio, expect PROBE OK
+uvx simple-code-indexer status          # workspace, index counts, vector store
+uv run python tests/service_probe.py    # expect: embeddings OK dim=<n>, PROBE OK
+uv run python tests/mcp_probe.py        # exercises all three tools over stdio, expect PROBE OK
 ```
 
 ### Uninstall
 
 ```bash
-python setup.py --uninstall --dry-run             # show the plan first
-python setup.py --uninstall --yes                 # remove install copy, config, services, entries
-python setup.py --uninstall --yes --keep-models  # same, but keep the downloaded GGUFs
+uvx simple-code-indexer uninstall --dry-run             # show the plan first
+uvx simple-code-indexer uninstall --yes                 # remove the tool env, config, services, entries
+uvx simple-code-indexer uninstall --yes --keep-models   # same, but keep the downloaded GGUFs
 ```
 
 Uninstall is record-driven: it removes exactly what setup wrote. Workspace `.simple-ci/`
@@ -108,6 +145,7 @@ indexes, externally managed containers, and endpoints you configured yourself ar
 After the wizard finishes, **restart your harness** (MCP entries are read at session start),
 open a project, and ask in plain language: *"where is the writer lease acquired?"* The agent
 calls one of three tools:
+
 
 | Tool | What it does |
 |---|---|
@@ -183,7 +221,7 @@ Where things land:
 | `~/.simple-ci/config.yaml` | The only config file |
 | `~/.simple-ci/model/` | Downloaded GGUF models |
 | `~/.simple-ci/docker/` | Generated compose file + GPU bootstrap script |
-| Per-user app dir (e.g. `%APPDATA%\simple-code-indexer`) | Installed copy the harnesses launch |
+| uv tool environment (`uv tool dir`) | The pinned install the harnesses launch |
 | `<project>/.simple-ci/index.db` | SQLite index (per workspace), including the default vector table |
 | `<project>/.simple-ci/vectors.faiss` | FAISS vectors (per workspace, `vector_store: faiss` only) |
 | `<project>/.simple-ci/log/` | `writer.log` + `reader.log` (sidecar) or `embed.log` (embedded) |
@@ -230,7 +268,24 @@ uv run pyright      # typecheck
 uv run pytest       # tests
 ```
 
-See [AGENTS.md](AGENTS.md) for the full dev loop.
+See [AGENTS.md](AGENTS.md) for the full dev loop. `uv sync` installs the package
+editably, so `uv run simple-code-indexer …` and `python -m simple_code_indexer …`
+run your working tree.
+
+## Releasing
+
+Releases are tag-driven and publish through PyPI Trusted Publishing, so no token is
+stored in the repository.
+
+```bash
+python tools/release.py --bump patch     # bump, cut the CHANGELOG, commit, tag, push
+```
+
+The tag triggers `.github/workflows/release.yml`, which builds once, verifies the tag
+matches `pyproject.toml`, and publishes to PyPI (gated by the `pypi` environment) and
+TestPyPI (on manual dispatch). `pyproject.toml` holds the version because `uv_build`
+needs static metadata; `tools/release.py --verify-tag` enforces that the tag agrees.
+A published version can never be re-uploaded — ship a new patch and yank the bad one.
 
 ## Documentation
 

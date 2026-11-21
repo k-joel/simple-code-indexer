@@ -24,3 +24,8 @@ wheels/
 
 # Project artifacts
 artifacts/
+
+# Secrets (never commit a PyPI token; CI uses Trusted Publishing)
+.env
+.env.*
+*.token

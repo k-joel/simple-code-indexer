@@ -1,8 +1,8 @@
 """Uninstall: reverse a setup run from the record the wizard wrote.
 
-`~/.simple-ci/config.yaml` keeps the path of the per-user install copy and every
-harness config that received the `simple-code-indexer` entry. Removal is
-record-driven: a harness whose config was never recorded stays untouched.
+`~/.simple-ci/config.yaml` keeps every harness config that received the
+`simple-code-indexer` entry. Removal is record-driven: a harness whose config was
+never recorded stays untouched.
 
 The workspace is never touched — `<project>/.simple-ci/` (index and vectors) is
 per-workspace state the server manages, not part of the install.
@@ -36,7 +36,6 @@ class HarnessRecord:
 
 @dataclass(frozen=True, slots=True)
 class InstallRecord:
-    install_root: Path | None = None
     harnesses: tuple[HarnessRecord, ...] = ()
 
 
@@ -49,10 +48,6 @@ def read_record(config_path: Path) -> InstallRecord:
         setup = configfile.get_mapping(raw, "setup")
     except ConfigError:
         return InstallRecord()
-    root: Path | None = None
-    install_root = setup.get("install_root")
-    if isinstance(install_root, str) and install_root.strip():
-        root = Path(install_root).expanduser()
     harnesses: list[HarnessRecord] = []
     items = setup.get("harnesses")
     if isinstance(items, list):
@@ -63,7 +58,7 @@ def read_record(config_path: Path) -> InstallRecord:
             config = item.get("config")
             if isinstance(name, str) and isinstance(config, str) and name and config:
                 harnesses.append(HarnessRecord(name, Path(config).expanduser()))
-    return InstallRecord(root, tuple(harnesses))
+    return InstallRecord(tuple(harnesses))
 
 
 class Uninstaller:
@@ -71,24 +66,20 @@ class Uninstaller:
         self,
         *,
         home: Path | None = None,
-        repo_root: Path | None = None,
         prompts: Prompter | None = None,
         runner: Runner | None = None,
         platform: str = sys.platform,
         config_path: Path | None = None,
-        install_dir: Path | None = None,
         keep_models: bool = False,
         dry_run: bool = False,
         assume_yes: bool = False,
         server_name: str = DEFAULT_SERVER_NAME,
     ) -> None:
         self.home = (home or Path.home()).resolve()
-        self.repo_root = (repo_root or Path.cwd()).resolve()
         self.prompts = prompts or Prompter()
         self.runner = runner or Runner()
         self.platform = platform
         self.config_path = config_path
-        self.install_dir = install_dir
         self.keep_models = keep_models
         self.dry_run = dry_run
         self.assume_yes = assume_yes
@@ -117,14 +108,12 @@ class Uninstaller:
         self.prompts.say()
 
         record = read_record(config_path)
-        install_root = self._install_root(record)
         compose_file = provision.compose_path(self.home)
         docker_dir = provision.global_dir(self.home) / provision.GLOBAL_DOCKER_DIRNAME
         model_dir = provision.model_dir(self.home)
 
         plan = self._plan(
             config_path=config_path,
-            install_root=install_root,
             compose_file=compose_file,
             docker_dir=docker_dir,
             model_dir=model_dir,
@@ -147,7 +136,7 @@ class Uninstaller:
 
         harness_failures = self._remove_harnesses(record)
         self._compose_down(compose_file)
-        self._delete_tree(install_root, "install copy")
+        install.remove_tool(self.runner, self.prompts.say)
         if harness_failures:
             self.prompts.say(
                 f"Keeping {config_path} so a re-run can retry the harness edits."
@@ -173,7 +162,6 @@ class Uninstaller:
         self,
         *,
         config_path: Path,
-        install_root: Path | None,
         compose_file: Path,
         docker_dir: Path,
         model_dir: Path,
@@ -190,8 +178,8 @@ class Uninstaller:
                 plan.append(f"remove the MCP entry from {item.config} ({item.name})")
         if compose_file.is_file():
             plan.append(f"stop the compose services from {compose_file}")
-        if install_root is not None:
-            plan.append(f"delete the install copy {install_root}")
+        if install.tool_env_root(self.runner) is not None:
+            plan.append(f"remove the uv tool environment ({install.TOOL_NAME})")
         if config_path.is_file():
             plan.append(f"delete {config_path}")
         if docker_dir.is_dir():
@@ -204,31 +192,6 @@ class Uninstaller:
         return plan
 
     # -- steps -----------------------------------------------------------
-
-    def _install_root(self, record: InstallRecord) -> Path | None:
-        if self.install_dir is not None:
-            candidate = self.install_dir.expanduser()
-        elif record.install_root is not None:
-            candidate = record.install_root
-        else:
-            candidate = install.install_root(home=self.home, platform=self.platform)
-        root = candidate.resolve()
-        if not root.is_dir():
-            return None
-        for protected in (self.repo_root, Path.cwd().resolve()):
-            if root == protected or root in protected.parents:
-                self.prompts.say(
-                    f"Skipping {root}: it contains the working checkout, "
-                    "so it is not an install copy."
-                )
-                return None
-        if not (root / install.LAUNCHER_FILENAME).is_file():
-            self.prompts.say(
-                f"Skipping {root}: it does not look like an install copy "
-                f"(no {install.LAUNCHER_FILENAME})."
-            )
-            return None
-        return root
 
     def _remove_harnesses(self, record: InstallRecord) -> int:
         """Remove the recorded entries; returns how many edits failed."""

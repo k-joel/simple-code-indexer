@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from simple_code_indexer.errors import ConfigError
 from simple_code_indexer.setup_wizard import install
 from simple_code_indexer.setup_wizard.provision import CommandResult, Runner
 
@@ -10,116 +13,261 @@ class FakeRunner(Runner):
     def __init__(self, *, uv: str | None = "/uv") -> None:
         self.uv = uv
         self.calls: list[list[str]] = []
+        self.tool_dir = "/tools"
         self.result = CommandResult(0)
+        self.responses: dict[tuple[str, ...], CommandResult] = {}
+        self.creates_tool_env = False
+        self.console_calls: list[list[str]] = []
+        self.console_rc = 0
 
     def which(self, name: str) -> str | None:
         return self.uv if name == "uv" else None
 
+    def run_console(self, argv: list[str], *, timeout: float = 900.0) -> int:
+        self.console_calls.append(list(argv))
+        return self.console_rc
+
     def run(self, argv: list[str], *, timeout: float = 15.0) -> CommandResult:
         self.calls.append(list(argv))
+        for key, result in self.responses.items():
+            if tuple(argv[: len(key)]) == key:
+                return result
+        if argv[1:3] == ["tool", "dir"]:
+            return CommandResult(0, self.tool_dir + "\n")
+        if argv[1:3] == ["tool", "install"] and self.creates_tool_env:
+            (Path(self.tool_dir) / install.TOOL_NAME).mkdir(parents=True, exist_ok=True)
         return self.result
 
 
-def test_install_root_per_platform(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    environ = {"APPDATA": str(tmp_path / "appdata")}
-
-    assert install.install_root(home=home, platform="win32", env=environ) == (
-        tmp_path / "appdata" / "simple-code-indexer"
-    )
-    assert install.install_root(home=home, platform="darwin", env={}) == (
-        home / "Library" / "Application Support" / "simple-code-indexer"
-    )
-    assert install.install_root(
-        home=home, platform="linux", env={"XDG_DATA_HOME": str(tmp_path / "xdg")}
-    ) == (tmp_path / "xdg" / "simple-code-indexer")
-    assert install.install_root(home=home, platform="linux", env={}) == (
-        home / ".local" / "share" / "simple-code-indexer"
-    )
-
-
-def test_install_root_falls_back_to_appdata_under_home(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-
-    assert install.install_root(home=home, platform="win32", env={}) == (
-        home / "AppData" / "Roaming" / "simple-code-indexer"
-    )
-
-
-def test_target_root_prefers_an_explicit_install_dir(tmp_path: Path) -> None:
-    explicit = tmp_path / "explicit"
-
-    assert install.target_root(
-        home=tmp_path, install_dir=explicit, platform="win32"
-    ) == (explicit.resolve())
-
-
-def test_copy_repo_includes_git_and_excludes_build_state(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    (source / ".git").mkdir(parents=True)
-    (source / ".git" / "config").write_text("[core]\n", encoding="utf-8")
-    (source / ".venv").mkdir()
-    (source / ".venv" / "marker").write_text("x", encoding="utf-8")
-    (source / "__pycache__").mkdir()
-    (source / "__pycache__" / "x.pyc").write_text("x", encoding="utf-8")
-    (source / "src").mkdir()
-    (source / "src" / "app.py").write_text("print('x')\n", encoding="utf-8")
-    target = tmp_path / "target"
-
-    install.copy_repo(source, target)
-
-    assert (target / ".git" / "config").is_file()
-    assert (target / "src" / "app.py").is_file()
-    assert not (target / ".venv").exists()
-    assert not (target / "__pycache__").exists()
-
-    (target / ".git" / "config").write_text(
-        "[core]\n\tinstalled=true\n", encoding="utf-8"
-    )
-    install.copy_repo(source, target)
-    assert "installed=true" in (target / ".git" / "config").read_text(encoding="utf-8")
-
-
-def test_sync_env_runs_uv_sync_for_the_target(tmp_path: Path) -> None:
+def test_ensure_uv_returns_an_existing_uv() -> None:
     runner = FakeRunner()
     messages: list[str] = []
 
-    assert install.sync_env(runner, tmp_path, messages.append) is True
-    assert runner.calls == [["/uv", "sync", "--project", str(tmp_path)]]
-    assert messages and "Syncing" in messages[0]
-
-    runner.result = CommandResult(1, "", "boom")
-    assert install.sync_env(runner, tmp_path, messages.append) is False
+    assert install.ensure_uv(runner, output=messages.append) == "/uv"
+    assert runner.console_calls == []
+    assert messages == []
 
 
-def test_server_command_uses_pythonw_on_windows() -> None:
-    result = install.InstallResult(
-        root=Path("C:/install"),
-        launcher=Path("C:/install/run_server.py"),
-        uv="/uv",
-        platform="win32",
+def test_ensure_uv_installs_when_missing() -> None:
+    """The deleted setup.py bootstrap is now in the package: uv installs uv."""
+    runner = FakeRunner(uv=None)
+    messages: list[str] = []
+
+    def which(name: str) -> str | None:
+        # The installer puts uv on PATH; the re-check observes it.
+        return "/uv" if runner.console_calls else None
+
+    runner.which = which  # type: ignore[method-assign]
+
+    assert install.ensure_uv(runner, output=messages.append) == "/uv"
+    assert runner.console_calls and "astral.sh" in " ".join(runner.console_calls[0])
+    assert any("installing" in message for message in messages)
+
+
+def test_ensure_uv_reports_a_failed_installer() -> None:
+    runner = FakeRunner(uv=None)
+    runner.console_rc = 1
+    messages: list[str] = []
+
+    assert install.ensure_uv(runner, output=messages.append) is None
+    assert any("failed" in message for message in messages)
+
+
+def test_the_running_checkout_is_detected() -> None:
+    """An editable install must find its own tree, so no --repo-root is needed."""
+    from simple_code_indexer.setup_wizard import _default_repo_root
+
+    root = _default_repo_root()
+
+    assert root is not None
+    assert (root / "src" / "simple_code_indexer" / "__init__.py").is_file()
+    assert (root / "pyproject.toml").is_file()
+
+
+def test_an_unrelated_project_above_site_packages_is_not_a_checkout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A bare pyproject.toml must not be adopted; only our own src/ counts.
+
+    `harnesses._repo_harnesses_dir` carries the same check as
+    `setup_wizard._default_repo_root`, and is a plain module we can patch.
+    """
+    from simple_code_indexer import harnesses as harnesses_pkg
+
+    project = tmp_path / "someapp"
+    site = project / ".venv" / "Lib" / "site-packages" / "simple_code_indexer"
+    site.mkdir(parents=True)
+    (project / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    fake_module = site / "__init__.py"
+    fake_module.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(harnesses_pkg, "__file__", str(fake_module))
+
+    assert harnesses_pkg._repo_harnesses_dir() is None
+
+
+def test_install_spec_from_a_checkout_editable_names_the_checkout(
+    tmp_path: Path,
+) -> None:
+    """Unpublished installs must not need PyPI: link the checkout instead."""
+    assert install.install_spec(tmp_path, "0.1.0", editable=True) == str(tmp_path)
+
+
+def test_install_spec_from_a_checkout_wheel_builds_the_local_tree(
+    tmp_path: Path,
+) -> None:
+    """Prod validation still builds the local tree rather than hitting PyPI."""
+    assert install.install_spec(tmp_path, "0.1.0", editable=False) == str(tmp_path)
+
+
+def test_install_spec_without_a_checkout_pins_the_published_version() -> None:
+    assert (
+        install.install_spec(None, "0.1.0", editable=False)
+        == "simple-code-indexer==0.1.0"
     )
 
-    assert result.server_command == [
-        str(Path("C:/install") / ".venv" / "Scripts" / "pythonw.exe"),
-        str(Path("C:/install/run_server.py")),
-    ]
+
+def test_install_spec_without_a_checkout_cannot_be_editable() -> None:
+    """There is nothing to link, so fail loudly instead of installing a wheel."""
+    with pytest.raises(ConfigError):
+        install.install_spec(None, "0.1.0", editable=True)
 
 
-def test_server_command_launches_through_uv_on_posix() -> None:
-    result = install.InstallResult(
-        root=Path("C:/install"),
-        launcher=Path("C:/install/run_server.py"),
-        uv="/uv",
-        platform="linux",
+def test_ensure_tool_installs_and_returns_the_environment(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    runner.tool_dir = str(tmp_path / "tools")
+    runner.creates_tool_env = True
+    messages: list[str] = []
+
+    root = install.ensure_tool(
+        runner,
+        spec="simple-code-indexer==1.2.3",
+        editable=False,
+        output=messages.append,
     )
 
-    assert result.server_command == [
+    assert root == tmp_path / "tools" / install.TOOL_NAME
+    assert ["/uv", "tool", "install", "simple-code-indexer==1.2.3"] in runner.calls
+    assert any("Installing" in message for message in messages)
+
+
+def test_ensure_tool_forces_an_editable_reinstall_when_present(
+    tmp_path: Path,
+) -> None:
+    """--force is what lets one env flip flavours without changing the entry."""
+    runner = FakeRunner()
+    runner.tool_dir = str(tmp_path / "tools")
+    runner.creates_tool_env = True
+    (tmp_path / "tools" / install.TOOL_NAME).mkdir(parents=True)
+
+    install.ensure_tool(
+        runner,
+        spec=str(tmp_path),
+        editable=True,
+        output=lambda _: None,
+    )
+
+    assert [
         "/uv",
-        "run",
-        "--project",
-        str(Path("C:/install")),
-        "--no-sync",
-        "python",
-        str(Path("C:/install/run_server.py")),
+        "tool",
+        "install",
+        "--editable",
+        "--force",
+        str(tmp_path),
+    ] in runner.calls
+
+
+def test_ensure_tool_refreshes_a_wheel_reinstall_when_present(
+    tmp_path: Path,
+) -> None:
+    """--refresh busts the local-build cache; editable has nothing to refresh."""
+    runner = FakeRunner()
+    runner.tool_dir = str(tmp_path / "tools")
+    runner.creates_tool_env = True
+    (tmp_path / "tools" / install.TOOL_NAME).mkdir(parents=True)
+
+    install.ensure_tool(
+        runner,
+        spec="simple-code-indexer==1.2.3",
+        editable=False,
+        output=lambda _: None,
+    )
+
+    assert [
+        "/uv",
+        "tool",
+        "install",
+        "--force",
+        "--refresh",
+        "simple-code-indexer==1.2.3",
+    ] in runner.calls
+
+
+def test_ensure_tool_raises_when_uv_fails() -> None:
+    runner = FakeRunner()
+    runner.result = CommandResult(1, "", "boom")
+
+    try:
+        install.ensure_tool(
+            runner,
+            spec="simple-code-indexer==1.2.3",
+            editable=False,
+            output=lambda _: None,
+        )
+    except Exception as exc:  # noqa: BLE001 - the type is asserted below
+        assert "uv tool install failed" in str(exc)
+    else:
+        raise AssertionError("ensure_tool should raise on a non-zero exit")
+
+
+def test_remove_tool_is_a_noop_when_absent(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    runner.tool_dir = str(tmp_path / "tools")
+
+    assert install.remove_tool(runner, lambda _: None) is False
+    assert ["/uv", "tool", "uninstall", install.TOOL_NAME] not in runner.calls
+
+
+def test_remove_tool_uninstalls(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    runner.tool_dir = str(tmp_path / "tools")
+    (tmp_path / "tools" / install.TOOL_NAME).mkdir(parents=True)
+    messages: list[str] = []
+
+    assert install.remove_tool(runner, messages.append) is True
+    assert ["/uv", "tool", "uninstall", install.TOOL_NAME] in runner.calls
+    assert messages
+
+
+def test_server_command_uses_pythonw_on_windows(tmp_path: Path) -> None:
+    result = install.InstallResult(root=tmp_path, platform="win32")
+
+    assert result.server_command == [
+        str(tmp_path / "Scripts" / "pythonw.exe"),
+        "-m",
+        "simple_code_indexer",
+        "serve",
     ]
+
+
+def test_server_command_uses_the_env_python_on_posix(tmp_path: Path) -> None:
+    result = install.InstallResult(root=tmp_path, platform="linux")
+
+    assert result.server_command == [
+        str(tmp_path / "bin" / "python"),
+        "-m",
+        "simple_code_indexer",
+        "serve",
+    ]
+
+
+def test_prune_empty_dirs_stops_at_the_boundary(tmp_path: Path) -> None:
+    stop = tmp_path
+    deep = tmp_path / "a" / "b" / "c"
+    deep.mkdir(parents=True)
+
+    removed = install.prune_empty_dirs(deep, stop=stop)
+
+    assert deep in removed
+    assert not (tmp_path / "a").exists()
+    assert stop.is_dir()

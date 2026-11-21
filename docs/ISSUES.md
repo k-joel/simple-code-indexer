@@ -97,3 +97,29 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   `catalog.VERSION` unchanged (no index migration needed). Verify each node type against the real
   grammar before committing.
 
+### ISS-014: Two sidecar daemon tests flake under full-suite load
+
+- **Symptom**: `tests/test_sidecar_daemon.py::test_a_new_session_during_grace_keeps_the_daemon` (and
+  once `test_concurrent_readers_share_one_daemon`) fails intermittently when the whole suite runs on a
+  loaded machine, and always passes when that file runs alone.
+- **Where flagged**: 2026-11-20, during the PyPI packaging session (three full runs: two green, one
+  failing).
+- **Cause**: `tests/test_sidecar_daemon.py:160-166` gives the daemon a 3 s `idle_grace_s` and sleeps
+  0.5 s before the second session. Under load the first daemon's heartbeat reap or the spawn lock can
+  take longer than that, so the second `_start` spawns a new daemon instead of joining the existing
+  one.
+- **Suggested fix**: raise `idle_grace_s` for that test (e.g. 30 s, like the neighbouring respawn
+  test) and keep the short sleep, or replace the fixed sleep with a `_wait_until` on the first
+  session's registration.
+
+### ISS-015: `ref-docs/mcp-test-process.md` still describes the deleted install flow
+
+- **Symptom**: the mandatory pre-test procedure references flags and paths that no longer exist
+  (`python setup.py --install-only`, the `%APPDATA%\simple-code-indexer` install copy, a
+  `run_server.py` launcher, `setup.install_root`), so an operator following it cannot verify a run.
+- **Where flagged**: 2026-11-21, during the editable-install migration.
+- **Cause**: `ref-docs/mcp-test-process.md:170-202` predates ADR-019 (PyPI + `uv tool install`) and
+  was not rewritten when the copy model was deleted.
+- **Suggested fix**: rewrite §4.2/§4.3 for the uv tool environment (`simple-code-indexer install`,
+  `uv tool dir`, `<tool-env>` entry) and drop the copy/`.venv`/`run_server.py` rows from the checklist.
+

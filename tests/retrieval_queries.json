@@ -194,9 +194,9 @@
       "tags": ["setup", "install"]
     },
     {
-      "id": "q33-launcher-pull",
-      "query": "how does the MCP launcher run git pull before starting the server",
-      "expected_files": ["run_server.py"],
+      "id": "q33-cli-subcommands",
+      "query": "how does the console script dispatch the setup, serve and uninstall subcommands",
+      "expected_files": ["src/simple_code_indexer/cli.py"],
       "tags": ["install", "launcher"]
     },
     {

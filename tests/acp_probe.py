@@ -8,8 +8,7 @@ Options:
     --agent PATH|NAME   ACP agent launcher (default: opencode, then the OpenCode
                         desktop bundle's opencode-cli.exe on Windows)
     --agent-args JSON   Arguments for the agent (default: ["acp"])
-    --install PATH      Installed copy (default: %APPDATA%/simple-code-indexer,
-                        or the platform install root)
+    --install PATH      uv tool environment (default: `uv tool dir` + simple-code-indexer)
     --model ID          Pin the session model via session/set_config_option
     --timeout S         Per-prompt bound (default 180)
     --tool-format FMT   Tool-name template (default is inferred: `{name}_{tool}`
@@ -50,14 +49,23 @@ _UPDATES: list[str] = []
 
 
 def _install_root(explicit: str | None) -> Path:
+    """The uv tool environment (or an explicit --install path)."""
     if explicit:
         return Path(explicit).expanduser().resolve()
-    if sys.platform == "win32":
-        return Path(os.environ.get("APPDATA", "")) / "simple-code-indexer"
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "simple-code-indexer"
-    data = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
-    return Path(data) / "simple-code-indexer"
+    import subprocess
+
+    completed = subprocess.run(
+        ["uv", "tool", "dir"], capture_output=True, text=True, check=False
+    )
+    if completed.returncode != 0 or not completed.stdout.strip():
+        raise SystemExit("could not resolve `uv tool dir`; pass --install <path>")
+    root = Path(completed.stdout.strip().splitlines()[0]) / "simple-code-indexer"
+    if not root.is_dir():
+        raise SystemExit(
+            f"{root} is missing; run `uvx simple-code-indexer setup` first "
+            "or pass --install <path>"
+        )
+    return root
 
 
 def _find_agent(explicit: str | None) -> str:
@@ -104,28 +112,15 @@ def _tool_format(agent: str, explicit: str | None) -> str:
 def _mcp_server(install: Path) -> dict[str, Any]:
     """The per-session MCP server entry; the workspace stays implicit (cwd)."""
     if sys.platform == "win32":
-        exe = install / ".venv" / "Scripts" / "pythonw.exe"
+        exe = install / "Scripts" / "pythonw.exe"
         if not exe.exists():
-            exe = install / ".venv" / "Scripts" / "python.exe"
-        command, args = str(exe), [str(install / "run_server.py")]
+            exe = install / "Scripts" / "python.exe"
     else:
-        command, args = (
-            "uv",
-            [
-                "run",
-                "--project",
-                str(install),
-                "--no-sync",
-                "python",
-                str(install / "run_server.py"),
-            ],
-        )
+        exe = install / "bin" / "python"
     return {
         "name": SERVER_NAME,
-        "command": command,
-        "args": args,
-        # Test the installed snapshot, not a pull that may have moved underneath it.
-        "env": [{"name": "SIMPLE_CI_GIT_PULL", "value": "0"}],
+        "command": str(exe),
+        "args": ["-m", "simple_code_indexer", "serve"],
     }
 
 

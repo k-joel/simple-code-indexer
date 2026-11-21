@@ -233,7 +233,8 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 - **Context:** Every setting used to come from an environment variable, so a fresh clone required
   hand-editing a harness config with machine-specific paths and knowing which services to start. Nothing
   recorded which container backed an endpoint, so the server could not bring services up itself.
-- **Decision:** `setup.py` is the install path: it installs `uv` when missing, syncs, and runs an
+- **Decision:** One command, `simple-code-indexer setup`, is the install path: it installs `uv` when
+  missing, installs the pinned wheel as a uv tool, and runs an
   interactive wizard that configures the embedding endpoint, provisions Docker containers when asked,
   probes the embedding dimension, writes `~/.simple-ci/config.yaml`, and registers detected harnesses.
   A `service` block names a container the writer starts and waits for at boot. Harness support is a
@@ -244,8 +245,8 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 - **Consequences:** `pyyaml` is a runtime dependency. The wizard and service manager take injectable
   runners/probers so tests need neither Docker nor network. Managed services are **fail-soft**: startup can
   block up to `startup_timeout_s`, but Docker being unavailable never refuses to serve — lexical search
-  still works and `get_status` reports the state. `setup.py` is not a setuptools script (`uv_build` ignores
-  it); the name exists because the workflow is `git clone && python setup.py`.
+  still works and `get_status` reports the state. The original `git clone && python setup.py` entry point
+  is gone (ADR-019); the bootstrap now lives in the package as `cli.py` + `install.ensure_uv`.
 
 ## ADR-009: FAISS is the primary vector store, Qdrant opt-in
 
@@ -292,7 +293,7 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   changing just the query instruction does not. Models live in `~/.simple-ci/model/`; AMD/Intel
   passthrough on WSL2 is best-effort, with `--gpu cpu` as the escape hatch.
 
-## ADR-011: Global-only config, per-user install, self-updating launcher
+## ADR-011: Global-only config, one machine-wide settings file
 
 - **Context:** Three problems: (1) the project-local config drifted from the deployment model, silently
   overriding the machine-wide embedding endpoint, while the only per-project setting was `vector_store`;
@@ -301,20 +302,50 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   `termios` at module load and raises `NotImplementedError` on Windows.
 - **Decision:** **One** config file, `~/.simple-ci/config.yaml` (`SIMPLE_CI_CONFIG` replaces discovery).
   Project-local configs are never read; the wizard merges a legacy one into the global file and removes it.
-  `setup_wizard/install.py` copies the working tree (including `.git`) to the per-user app directory, and
-  harness entries launch that copy's `run_server.py` — `uv run --project <install> --no-sync python
-  run_server.py` on POSIX, the venv's windowless `pythonw.exe` on Windows so no console window flashes. The
-  launcher does `git pull --ff-only --autostash` (bounded at 20 s) and `uv sync` only when `HEAD` moved.
   Menus use `questionary`, with numbered `input()` prompts as the non-interactive fallback
   (`SIMPLE_CI_NO_TUI=1`).
 - **Consequences:** `--scope` is gone (passing it is a parser error); `get_status.config_files` has 0 or 1
   entries. `vector_store` and `faiss.path` live globally, while the SQLite DB and FAISS file stay
-  per-workspace, so isolation is unchanged. Harness entries reference an absolute install path, so moving
-  or deleting the install directory requires re-running `setup.py`. `setup.py` itself must run the venv
-  interpreter directly, never `uv run --project`: that changes cwd, and the wizard has to configure the
-  caller's cwd (the project being indexed). The launcher imports and runs the server in-process for the
-  same reason. `SIMPLE_CI_GIT_PULL=0` disables the pull. Keep `pull --ff-only --autostash`; a
-  `git reset --hard` on every launch would discard edits in the installed copy.
+  per-workspace, so isolation is unchanged. The wizard must configure the caller's cwd (the project being
+  indexed) rather than its own location, so it resolves the workspace from cwd and reads the checkout
+  separately. The installer and launcher wiring this ADR originally described is superseded by ADR-019.
+
+## ADR-019: PyPI distribution; `uv tool install` replaces the git-copy install
+
+- **Context:** The install model was "copy the git working tree into `%APPDATA%/simple-code-indexer` and let a
+  `run_server.py` launcher `git pull` on every start". That is incompatible with publishing: a wheel contains
+  only `src/simple_code_indexer/**`, so no `run_server.py`, no `.git`, no `uv.lock`. Three forces made the
+  copy model actively harmful: (1) it required a git checkout as the distribution unit, which PyPI cannot
+  express; (2) `git pull` at launch meant an unpinned, untraceable version served every session, the exact
+  problem ADR-011 set out to fix; (3) `_default_repo_root()` fell back to `Path.cwd()` when no
+  `pyproject.toml` was above the package, so from an installed wheel the wizard would have copied the
+  *user's project* into the install directory.
+- **Decision:** The **wheel is the distribution unit** and `uv tool install` is the install mechanism.
+  `uvx simple-code-indexer setup` installs a pinned `simple-code-indexer==<version>` into the uv tool
+  environment and writes harness entries that launch that environment directly:
+  `<tool-env>/Scripts/pythonw.exe -m simple_code_indexer serve` on Windows (windowless, so a GUI harness
+  gets no console window), `<tool-env>/bin/python -m simple_code_indexer serve` on POSIX. The console script
+  is `simple-code-indexer` with subcommands `setup`, `install`, `serve`, `uninstall`, `status`, `version`;
+  `serve` is the default so a bare invocation still starts the MCP server. There are two install flavours
+  into that one environment: **editable** (`uv tool install --editable <checkout>`, the default whenever a
+  source checkout is detectable) links the working tree, and **wheel** (`--wheel`, or any run without a
+  checkout) builds/installs a real wheel — the prod-validation switch. Both leave the environment root and
+  therefore the harness entry byte-identical; only the uv receipt (`editable = …` vs `directory = …`) records
+  which is live. `--install-mode`, `checkout` mode and its `uv run --project` entry form are deleted.
+- **Consequences:** Releases are tag-driven: `tools/release.py --bump` updates `pyproject.toml` + `uv.lock`,
+  moves the CHANGELOG section, commits and pushes the tag; `.github/workflows/release.yml` builds once and
+  publishes through PyPI Trusted Publishing (OIDC, no stored token). `pyproject.toml` is the source of truth
+  for the version because `uv_build` needs static metadata — the tag must match it, and
+  `release.py --verify-tag` enforces that as the first CI step. `run_server.py`, `copy_repo`, `sync_env` and
+  `SIMPLE_CI_GIT_PULL` are deleted, along with every piece of the legacy install-copy
+  machinery (`install_root`, `target_root`, `legacy_install_root`, `--install-dir`): a copy that
+  predates this decision is simply left for the user to delete, never detected or removed by the
+  wizard or `--uninstall`. `setup.py` is deleted too; `simple-code-indexer install` replaces its
+  bootstrap, and the wizard finds a source checkout itself (`_default_repo_root`, which requires
+  this package's own `src/` tree — it now decides *which tree gets linked*, so it must stay strict).
+  Harness entries still carry no
+  workspace data (ADR-015). Because `uvx` environments live in the uv cache, `uv cache clean` can strand a
+  `uvx`-launched process; tool environments are unaffected, which is why entries launch one.
 
 ## ADR-012: Role-specific per-workspace log files
 

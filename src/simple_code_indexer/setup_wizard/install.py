@@ -1,138 +1,186 @@
-"""Install the repo into a stable per-user directory.
+"""Install the tool into a uv-managed environment and build the launch command.
 
-Harness entries launch ``run_server.py`` through ``uv run --project <install>
---no-sync``, so they survive deleting the original checkout and can self-update
-with ``git pull`` on every launch.
+Every install is a ``uv tool install``: one persistent, isolated environment
+under the uv tool directory, which the harness entries launch directly.
+
+The environment root does not depend on the flavour, so the entry never changes:
+
+- **editable** (the default from a source checkout) links the working tree into
+  the environment, so edits are live without reinstalling.
+- **wheel** builds and installs a wheel — from the checkout, or the pinned
+  published version when there is no checkout. This is the prod-validation
+  switch, and the one flavour that survives deleting the checkout.
+
+Only ``uv-receipt.toml`` records which is installed.
 """
 
 from __future__ import annotations
 
-import os
-import shutil
 import sys
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from simple_code_indexer.setup_wizard.provision import Runner
+from simple_code_indexer.errors import ConfigError
+from simple_code_indexer.setup_wizard.provision import CommandResult, Runner
 
-APP_DIRNAME = "simple-code-indexer"
-LAUNCHER_FILENAME = "run_server.py"
+TOOL_NAME = "simple-code-indexer"
+TOOL_TIMEOUT_S = 900.0
 
-_IGNORED: tuple[str, ...] = (
-    ".venv",
-    "__pycache__",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".simple-ci",
-    ".index",
-    "artifacts",
-    ".mimocode",
-    ".commandcode",
-    ".kilo",
-    "build",
-    "dist",
-    "*.egg-info",
-    "*.pyc",
-)
+# Interpreter launched by harness entries. `-m` rather than the console-script
+# shim: on Windows pythonw.exe is windowless, so a GUI harness does not get a
+# console window for the whole session.
+ENTRY_MODULE = "simple_code_indexer"
+
+
+def tool_dir(runner: Runner) -> Path | None:
+    """``uv tool dir``; None when uv cannot report it."""
+    uv = runner.which("uv") or "uv"
+    result: CommandResult = runner.run([uv, "tool", "dir"])
+    if result.returncode != 0:
+        return None
+    reported = result.stdout.strip().splitlines()
+    if not reported:
+        return None
+    return Path(reported[0].strip()).expanduser()
+
+
+def tool_env_root(runner: Runner) -> Path | None:
+    """The installed tool environment, or None when the tool is not installed."""
+    base = tool_dir(runner)
+    if base is None:
+        return None
+    root = base / TOOL_NAME
+    return root if root.is_dir() else None
+
+
+def ensure_uv(runner: Runner, *, output) -> str | None:
+    """Find `uv`, installing it from astral.sh when missing.
+
+    This is the one thing the deleted `setup.py` bootstrap provided that a plain
+    `uv tool install` cannot: you need uv to install uv.
+    """
+    found = runner.which("uv")
+    if found is not None:
+        return found
+    output("uv was not found; installing it from astral.sh ...")
+    if sys.platform == "win32":
+        command = [
+            "powershell",
+            "-ExecutionPolicy",
+            "ByPass",
+            "-c",
+            "irm https://astral.sh/uv/install.ps1 | iex",
+        ]
+    else:
+        command = ["sh", "-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"]
+    if runner.run_console(command, timeout=TOOL_TIMEOUT_S) != 0:
+        output(
+            "The uv installer failed. Install uv manually: https://docs.astral.sh/uv/"
+        )
+        return None
+    found = runner.which("uv")
+    if found is None:
+        output(
+            "uv is still not on PATH; add its install directory and re-run "
+            "(https://docs.astral.sh/uv/)"
+        )
+    return found
+
+
+def install_spec(repo_root: Path | None, version: str, *, editable: bool) -> str:
+    """The ``uv tool install`` target.
+
+    Editable installs must name a directory, so they require a checkout. Without
+    one — running from a published wheel — there is nothing to link and nothing
+    local to build, so pin the published version.
+    """
+    if editable and repo_root is None:
+        raise ConfigError("editable installs need a source checkout")
+    if repo_root is not None:
+        return str(repo_root)
+    return f"{TOOL_NAME}=={version}"
+
+
+def ensure_tool(
+    runner: Runner,
+    *,
+    spec: str,
+    editable: bool,
+    output,
+) -> Path:
+    """Install (or reinstall) the tool and return its environment root.
+
+    An existing environment is always force-reinstalled: that is what lets the
+    *same* environment flip between an editable link and a built wheel without
+    touching the entry path the harnesses recorded.
+
+    ``--refresh`` applies to wheel installs only. It busts uv's local-build
+    cache, which is keyed on ``pyproject.toml``/``setup.py``/``setup.cfg`` and
+    the presence of ``src`` rather than on file contents, so without it a
+    source-only edit can reuse a stale wheel. Editable installs write a ``.pth``
+    and never build anything, so there is nothing to refresh.
+    """
+    uv = runner.which("uv") or "uv"
+    argv = [uv, "tool", "install"]
+    existing = tool_env_root(runner) is not None
+    if editable:
+        argv.append("--editable")
+    if existing:
+        argv.append("--force")
+    if existing and not editable:
+        argv.append("--refresh")
+    argv.append(spec)
+    output(f"Installing {spec} with uv tool ...")
+    result = runner.run(argv, timeout=TOOL_TIMEOUT_S)
+    if result.returncode != 0:
+        for stream in (result.stdout, result.stderr):
+            if stream.strip():
+                output(stream.strip())
+        raise ConfigError(f"uv tool install failed for {spec}")
+    root = tool_env_root(runner)
+    if root is None:
+        raise ConfigError(f"uv tool install reported success but {TOOL_NAME} is absent")
+    return root
+
+
+def remove_tool(runner: Runner, output) -> bool:
+    """Uninstall the tool environment; False when it was not installed."""
+    if tool_env_root(runner) is None:
+        return False
+    uv = runner.which("uv") or "uv"
+    output(f"Removing the uv tool environment for {TOOL_NAME} ...")
+    result = runner.run([uv, "tool", "uninstall", TOOL_NAME], timeout=TOOL_TIMEOUT_S)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        output(
+            f"uv tool uninstall failed for {TOOL_NAME}"
+            + (f": {detail}" if detail else "")
+        )
+        return False
+    return True
 
 
 @dataclass(frozen=True, slots=True)
 class InstallResult:
     root: Path
-    launcher: Path
-    uv: str = "uv"
     platform: str = sys.platform
 
     @property
-    def server_command(self) -> list[str]:
-        """Launch the installed copy, preserving the caller's cwd.
-
-        On Windows the venv ``pythonw.exe`` is used directly: ``uv.exe`` and
-        ``python.exe`` are console applications, and a GUI harness that spawns
-        one without ``CREATE_NO_WINDOW`` gets a visible console window that
-        lives as long as the server. ``pythonw`` is windowless and still speaks
-        MCP over the inherited stdio pipes.
-        """
+    def interpreter(self) -> Path:
+        """The windowless interpreter a GUI harness can spawn without a console."""
         if self.platform == "win32":
-            pythonw = self.root / ".venv" / "Scripts" / "pythonw.exe"
-            return [str(pythonw), str(self.launcher)]
-        return [
-            self.uv,
-            "run",
-            "--project",
-            str(self.root),
-            "--no-sync",
-            "python",
-            str(self.launcher),
-        ]
+            return self.root / "Scripts" / "pythonw.exe"
+        return self.root / "bin" / "python"
 
+    @property
+    def server_command(self) -> list[str]:
+        """Launch the MCP server, preserving the caller's cwd.
 
-def install_root(
-    *,
-    home: Path | None = None,
-    platform: str = sys.platform,
-    env: Mapping[str, str] | None = None,
-) -> Path:
-    """Per-platform per-user application directory."""
-    environ = os.environ if env is None else env
-    home = home or Path.home()
-    if platform == "win32":
-        appdata = environ.get("APPDATA")
-        base = Path(appdata) if appdata else home / "AppData" / "Roaming"
-        return base / APP_DIRNAME
-    if platform == "darwin":
-        return home / "Library" / "Application Support" / APP_DIRNAME
-    data_home = environ.get("XDG_DATA_HOME")
-    base = Path(data_home) if data_home else home / ".local" / "share"
-    return base / APP_DIRNAME
-
-
-def target_root(
-    *,
-    home: Path | None = None,
-    install_dir: Path | None = None,
-    platform: str = sys.platform,
-) -> Path:
-    """The install target: an explicit --install-dir wins over the per-user default."""
-    if install_dir is not None:
-        return install_dir.expanduser().resolve()
-    return install_root(home=home, platform=platform)
-
-
-def copy_repo(source: Path, target: Path) -> None:
-    """Copy the working tree (including `.git` on the first install)."""
-    ignore = list(_IGNORED)
-    if (target / ".git").exists():
-        ignore.append(".git")
-    target.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(
-        source,
-        target,
-        dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns(*ignore),
-    )
-
-
-def sync_env(
-    runner: Runner,
-    target: Path,
-    output,
-) -> bool:
-    """Run `uv sync` for the installed copy; False on failure."""
-    uv = runner.which("uv") or "uv"
-    output(f"Syncing the installed environment in {target} ...")
-    result = runner.run(
-        [uv, "sync", "--project", str(target)],
-        timeout=600,
-    )
-    if result.returncode != 0:
-        if result.stdout.strip():
-            output(result.stdout.strip())
-        if result.stderr.strip():
-            output(result.stderr.strip())
-        return False
-    return True
+        The environment's interpreter runs the module directly, so the same argv
+        works for an editable and a wheel install alike: ``-m`` rather than the
+        console-script shim keeps Windows windowless.
+        """
+        return [str(self.interpreter), "-m", ENTRY_MODULE, "serve"]
 
 
 def prune_empty_dirs(start: Path, *, stop: Path) -> list[Path]:

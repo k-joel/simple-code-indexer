@@ -119,8 +119,49 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ## [Unreleased]
 
+### Changed
+
+- **The project is now published to PyPI and installed with `uv tool install`** (ADR-019).
+  `uvx simple-code-indexer setup` installs a version-pinned environment; harness entries launch
+  its interpreter directly instead of a copy of the git working tree. This removes the
+  self-updating `run_server.py` launcher (`git pull` + `uv sync` on every start) and the
+  `%APPDATA%/simple-code-indexer` install copy.
+- **The legacy install-copy machinery is gone entirely**: `install_root`, `target_root`,
+  `legacy_install_root`, `setup.install_root`, `--install-dir`, and the wizard's migrate/delete
+  path for a pre-PyPI copy. A copy from the old installer is left alone; delete it yourself.
+- **`setup.py` is deleted.** Its only remaining job was passing `--repo-root`, so the wizard now
+  finds a source checkout itself (a parent holding this package's own `src/` tree) and
+  `simple-code-indexer install` replaces the bootstrap, including installing `uv` when missing.
+- **One console command with subcommands**: `setup`, `install`, `serve`, `uninstall`, `status`,
+  `version`. A bare invocation still starts the MCP server, so existing harness entries keep
+  working. `--no-git-pull` and the `SIMPLE_CI_GIT_PULL` pin are
+  gone, as is `--install-dir`. `python -m simple_code_indexer` now works.
+- **`checkout` install mode is removed; an editable `uv tool install` replaces it.** The
+  default from a source checkout is now an editable install (`uv tool install --editable
+  <checkout>`), so edits are live without reinstalling, and `--wheel` builds and installs a real
+  wheel for prod validation. Both land in the *same* uv tool environment, so an install never
+  rewrites a harness entry — you can switch back and forth freely. `--install-mode`,
+  `--no-install`, and `setup.install_mode` (now `setup.install_kind`) are gone, as is the
+  `uv run --project` entry form; the setup summary and `status.install_kind` show which flavour
+  is live. **Existing entries written by a `--install-mode checkout` setup still point at
+  `<repo>/.venv`** — re-run `simple-code-indexer setup` (or `install`) once to repoint them.
+- Package metadata modernised for PyPI: SPDX `license = "Apache-2.0"` + `license-files`
+  (PEP 639), project URLs, keywords, classifiers.
+- `requirements.txt` removed: it was unused and had drifted (missing `sqlite-vec`).
+
 ### Added
 
+- `.github/workflows/ci.yml`: lint/format/typecheck/test on Ubuntu and Windows, plus a `dist`
+  job that builds the wheel and asserts the packaged templates and console script work.
+- **Local installs work before the first publish**: a source checkout is installed by path
+  (`uv tool install <checkout>`), so `python setup.py`
+  needs no PyPI entry. Only a wheel install pins `simple-code-indexer==<version>`
+  (`install.install_spec`).
+- `.github/workflows/release.yml`: tag-driven publishing through PyPI Trusted Publishing (OIDC,
+  no stored token), with a manual TestPyPI rehearsal path and a GitHub release.
+- `tools/release.py`: version bump, CHANGELOG cut, tag, push, and the `--verify-tag` /
+  `--check-pypi` guards the workflow runs.
+- `simple_code_indexer/cli.py` and `simple_code_indexer/__main__.py`.
 - **sqlite-vec is the new default vector store** (ADR-017). Vectors live in a `vec_chunks`
   table inside the existing `index.db`, so a file update and its vectors commit in one
   transaction and there is no second file to keep in sync. `vector_store: faiss` and

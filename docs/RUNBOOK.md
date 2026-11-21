@@ -104,6 +104,10 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 | [005](#run-005-operator-stop-a-sidecar-writer-daemon) | Stop a sidecar writer daemon |
 | [006](#run-006-safe-read-the-sidecar-session-timeline) | Read the sidecar session timeline |
 | [007](#run-007-safe-regenerate-the-language-catalog) | Regenerate the language catalog |
+| [008](#run-008-operator-rehearse-a-release-on-testpypi) | Rehearse a release on TestPyPI |
+| [009](#run-009-destructive-publish-a-release-to-pypi) | Publish a release to PyPI |
+| [010](#run-010-operator-install-the-editable-development-environment) | Install the editable development environment |
+| [011](#run-011-operator-validate-the-prod-wheel-install) | Validate the prod wheel install |
 
 ## RUN-001 (SAFE): Probe the backing services
 
@@ -207,7 +211,7 @@ Tests the MCP stdio contract and index-on-save behavior without a harness. Run i
 
    The probe creates `watch_probe_tmp_<pid>.cpp`, waits for the watcher, saves the file, polls `symbol_lookup`, and removes the file. Expect `PROBE OK`.
 
-4. Read the final status. Expect `writer_ok: true` and `watcher_alive: true`. A nonzero `pending_embeddings` means vectors are still being written and is not a failure. `workspace_source` names the resolved source (`env`, `roots`, `harness:<name>`, `cwd`); a harness whose entry predates ADR-018 reports `cwd` until `python setup.py --harnesses <name>` rewrites it.
+4. Read the final status. Expect `writer_ok: true` and `watcher_alive: true`. A nonzero `pending_embeddings` means vectors are still being written and is not a failure. `workspace_source` names the resolved source (`env`, `roots`, `harness:<name>`, `cwd`); a harness whose entry predates ADR-018 reports `cwd` until `simple-code-indexer setup --harnesses <name>` rewrites it.
 
 **Troubleshooting**
 
@@ -217,12 +221,12 @@ Tests the MCP stdio contract and index-on-save behavior without a harness. Run i
 - **`PROBE FAIL: ... not indexed within 5 s of save`**: check `.gitignore` and `IGNORE_DIRS`, then search `writer.log` for a full-queue warning. Lexical indexing does not require the embedding endpoint.
 - **Semantic search returns hits with `ready: false`**: vectors are still being written. Wait for `pending_embeddings` to reach 0.
 - **`another simple-code-indexer already owns …index.db`**: only possible in `mode: embedded` (or when a legacy embedded writer holds the lease). In the default sidecar mode a second session is a read-only reader. Fix: leave the second session running in sidecar mode; use `mode: embedded` only for single-session diagnosis.
-- **`get_status` reports the editor installation directory as the workspace**: the client spawns stdio children without a `cwd` (ISS-014). Check `workspace_source`: `roots` or `harness:<name>` should replace `cwd`. An entry without the `SIMPLE_CI_HARNESS` marker still gets `harness:<name>` (every resolver is asked when the cwd is an editor install), so a persistent `cwd` there means the plugin's discovery found no live window — check `~/.commandcode/ide/*.json` contains this window's extension-host pid. `load_settings` now refuses such a cwd with a `ConfigError` instead of building an empty index; re-run `python setup.py --harnesses <name>` for the marker fast path, or set `WORKSPACE_ROOT` for a one-off diagnosis (remove it afterwards).
-- **`config_file: null` in `get_status`**: `~/.simple-ci/config.yaml` does not exist, and project-local configs are ignored. Fix: run `python setup.py` or create the global file.
+- **`get_status` reports the editor installation directory as the workspace**: the client spawns stdio children without a `cwd` (ISS-014). Check `workspace_source`: `roots` or `harness:<name>` should replace `cwd`. An entry without the `SIMPLE_CI_HARNESS` marker still gets `harness:<name>` (every resolver is asked when the cwd is an editor install), so a persistent `cwd` there means the plugin's discovery found no live window — check `~/.commandcode/ide/*.json` contains this window's extension-host pid. `load_settings` now refuses such a cwd with a `ConfigError` instead of building an empty index; re-run `simple-code-indexer setup --harnesses <name>` for the marker fast path, or set `WORKSPACE_ROOT` for a one-off diagnosis (remove it afterwards).
+- **`config_file: null` in `get_status`**: `~/.simple-ci/config.yaml` does not exist, and project-local configs are ignored. Fix: run `simple-code-indexer setup` or create the global file.
 
 ## RUN-004 (DESTRUCTIVE): Rebuild a workspace index from scratch
 
-Deletes one workspace's derived `.simple-ci/` data and rebuilds it through startup reconciliation. Source files, the global configuration, the install copy, and other workspaces are untouched.
+Deletes one workspace's derived `.simple-ci/` data and rebuilds it through startup reconciliation. Source files, the global configuration, the uv tool environment, and other workspaces are untouched.
 
 1. Confirm the target workspace and index path:
 
@@ -378,3 +382,185 @@ Rebuilds `src/simple_code_indexer/languages/catalog.py` from the pack's publishe
 - **`cannot resolve display name '...'`**: the upstream table gained a language whose display name is not a valid grammar name. Add it to `ALIASES` with the pack's name (verify with `tree_sitter_language_pack.has_language`).
 - **`parsed only N language rows; table layout changed?`**: the docs page markup changed. Re-check `parse_table` against the saved page, using `--table <saved.html>` to iterate offline.
 - **`catalog is stale` right after regenerating**: the file was formatted or hand-edited. The generated output is authoritative — re-run the tool rather than editing `catalog.py`.
+
+## RUN-008 (OPERATOR): Rehearse a release on TestPyPI
+
+Exercises the exact publish path without touching PyPI. Requires the `testpypi` GitHub environment and a pending Trusted Publisher registered at <https://test.pypi.org/manage/account/publishing/> (project `simple-code-indexer`, workflow `release.yml`, environment `testpypi`).
+
+1. Confirm the build is sound locally:
+
+   ```
+   uv build --no-sources
+   uv run --isolated --no-project --with ./dist/*.whl simple-code-indexer version
+   ```
+
+2. Confirm the version is unpublished on both indexes:
+
+   ```
+   uv run python tools/release.py --check-pypi
+   curl -s -o NUL -w "%{http_code}" https://test.pypi.org/pypi/simple-code-indexer/json
+   ```
+
+3. Run the workflow by hand — Actions → **Release** → *Run workflow* on `master`. No tag exists, so only the `build` and `publish-testpypi` jobs run.
+
+4. Install from TestPyPI into a scratch environment. The extra index is required: TestPyPI holds the package but none of its dependencies.
+
+   ```
+   uvx --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ --from "simple-code-indexer==$(uv run python -c "import re,pathlib; print(re.search(r'version = \"([^\"]+)\"', pathlib.Path('pyproject.toml').read_text()).group(1))")" simple-code-indexer version
+   ```
+
+**Troubleshooting**
+
+- **`invalid-publisher` / 403**: the pending publisher's repository, workflow filename, or environment name does not match `release.yml`. They must match exactly.
+- **`File already exists`**: TestPyPI cannot re-upload a version. Bump with `uv run python tools/release.py --bump patch` (which also needs `git push`) or rehearse with a `rc` version.
+- **Dependency resolution fails**: add `--extra-index-url https://pypi.org/simple/`; TestPyPI only mirrors the project itself.
+
+## RUN-009 (DESTRUCTIVE): Publish a release to PyPI
+
+Irreversible: a published version can never be re-uploaded. Requires the `pypi` environment with required reviewers, a green CI run on `master`, and a pending Trusted Publisher on PyPI.
+
+1. Confirm CI is green on `master`, then cut the release. This bumps `pyproject.toml` + `uv.lock`, moves the CHANGELOG section, commits, tags `v<version>`, and pushes:
+
+   ```
+   uv run python tools/release.py --bump patch
+   ```
+
+   Preview first with `--dry-run` if the version arithmetic is in doubt.
+
+2. Watch Actions → **Release**. `build` verifies the tag against `pyproject.toml` (`tools/release.py --verify-tag`) and smoke-tests both distributions; `publish-pypi` waits for the `pypi` environment approval; `github-release` attaches the artifacts and generated notes.
+
+3. Verify the served version, which is what a harness entry will launch:
+
+   ```
+   uvx simple-code-indexer version
+   uvx simple-code-indexer setup --dry-run
+   ```
+
+4. Repoint an existing dev install at the published version. `setup` always force-reinstalls the
+   tool environment, so no extra flag is needed — but it picks **editable** while a checkout is
+   detectable. Run from outside a checkout, or force the prod flavour with `--wheel` (details in
+   RUN-010 and RUN-011):
+
+   ```
+   uvx simple-code-indexer setup
+   uvx simple-code-indexer setup --wheel
+   ```
+
+   Either way the harness entry is unchanged. `simple-code-indexer status` reports
+   `install_kind`; `uv-receipt.toml` in the tool environment is the ground truth.
+
+**Troubleshooting**
+
+- **`tag ... does not match pyproject version`**: `pyproject.toml` is the source of truth. Tag from `tools/release.py`, never by hand.
+- **`<version> is already on PyPI`**: some files uploaded before the failure. Yank the release on PyPI and publish the next patch; do not reuse the version.
+- **A bad release shipped**: use PyPI's *Yank* (it hides the version without freeing it), fix, then `--bump patch`.
+
+## RUN-010 (OPERATOR): Install the editable development environment
+
+Installs this checkout as a **uv tool** and links it, so the harnesses you already configured serve your working tree and source edits are live without reinstalling. It does not run the wizard, write config, or touch a workspace index. Rollback: `simple-code-indexer uninstall --yes`.
+
+1. Confirm the checkout is what will be linked — detection is strict (it requires this package's own `src/` tree) and refuses to guess:
+
+   ```
+   uv run simple-code-indexer install --dry-run
+   ```
+
+   Expected: `Would install <repo> with uv tool (editable)`. A different path means `_default_repo_root()` found the wrong tree; stop and pass `--repo-root <repo>` explicitly.
+
+2. Install (or reinstall) the editable environment. Run it from the repo root; this is the whole update step after a `git pull`:
+
+   ```
+   uv run simple-code-indexer install
+   ```
+
+   Expected: `Installed (editable): <tool-env>`, and any recorded harness entries are rewritten to that environment.
+
+3. Prove the environment serves the working tree, not a copy:
+
+   ```
+   uv tool dir
+   $envDir = Join-Path $(uv tool dir) 'simple-code-indexer'
+   Get-Content (Join-Path $envDir 'uv-receipt.toml')
+   ```
+
+   Expected: `requirements = [{ name = "simple-code-indexer", editable = "<repo>" }]`. A `directory = "<repo>"` line instead means a wheel is installed — that is RUN-011, not this one.
+
+4. Confirm the interpreter resolves the tree rather than a copy:
+
+   ```
+   & (Join-Path $envDir 'Scripts\python.exe') -c "import simple_code_indexer, pathlib; print(pathlib.Path(simple_code_indexer.__file__).resolve())"
+   ```
+
+   Expected: a path under `<repo>\src\simple_code_indexer\`. A `site-packages` path means the environment is not editable.
+
+5. Restart the harness so it relaunches the entry. Existing sessions keep the old process until they restart.
+
+**Troubleshooting**
+
+- **`No source checkout found; installing the published wheel.`**: nothing to link, so this run silently took the wheel path. If you meant dev, pass `--repo-root <repo>`.
+- **`uv tool install failed for <spec>`**: uv printed the build log above the error. Fix the build first; the resolver is usually a `pyproject.toml`/`uv.lock` mismatch.
+- **Edits still not visible**: the harness is running the previous process. Restart it, then re-check step 4.
+- **`ImportError`/`ModuleNotFoundError` after deleting or moving the checkout**: this flavour cannot survive losing its tree by design. Re-clone and repeat step 2, or switch to RUN-011.
+
+## RUN-011 (OPERATOR): Validate the prod wheel install
+
+Builds a real wheel from this checkout, installs it into the **same** uv tool environment, and confirms the harness entry still points at it — so this is how you test the artifact users get. It does not publish, run the wizard, or touch a workspace index. Rollback: re-run RUN-010 step 2 to restore the editable link.
+
+1. Snapshot the current entry so you can prove it does not move:
+
+   ```
+   $envDir = Join-Path $(uv tool dir) 'simple-code-indexer'
+   $py = Join-Path $envDir 'Scripts\pythonw.exe'
+   $before = (Get-FileHash $py -Algorithm SHA256).Hash
+   ```
+
+2. Install the built wheel (builds `<repo>` and force-reinstalls; `--refresh` busts uv's stale local-build cache):
+
+   ```
+   uv run simple-code-indexer install --wheel
+   ```
+
+   Expected: `Installed (wheel): <tool-env>` — the same root as RUN-010.
+
+3. Confirm the receipt and the import path flipped to the built copy:
+
+   ```
+   Get-Content (Join-Path $envDir 'uv-receipt.toml')
+   & (Join-Path $envDir 'Scripts\python.exe') -c "import simple_code_indexer, pathlib; print(pathlib.Path(simple_code_indexer.__file__).resolve())"
+   ```
+
+   Expected: `directory = "<repo>"`, and an import path under the tool environment's `Lib\site-packages\simple_code_indexer\`.
+
+4. Prove the entry is byte-identical across the flavour change (this is the guarantee the whole model rests on):
+
+   ```
+   (Get-FileHash $py -Algorithm SHA256).Hash -eq $before
+   ```
+
+   Expected: `True`.
+
+5. Smoke the entry the harness actually launches, under redirected pipes (`pythonw` detaches from a console):
+
+   ```
+   Start-Process -FilePath $py -ArgumentList '-m','simple_code_indexer','version' -RedirectStandardOutput $env:TEMP\out.txt -RedirectStandardError $env:TEMP\err.txt -Wait -PassThru | Select-Object ExitCode
+   Get-Content $env:TEMP\out.txt
+   ```
+
+   Expected: `ExitCode 0` and the version from `pyproject.toml`.
+
+6. Read the live flavour from the ground truth, then restore dev if this was a one-off:
+
+   ```
+   Select-String -Path (Join-Path $envDir 'uv-receipt.toml') -Pattern 'directory|editable'
+   uv run simple-code-indexer install
+   ```
+
+   Expected: `directory = "<repo>"` (wheel) before the restore; after it the receipt shows `editable = "<repo>"` again. `status.install_kind` reports the same thing, but only after a full `setup` recorded it — `install` repoints entries and writes no config.
+
+**Troubleshooting**
+
+- **`install_kind` is `null`**: `install` repoints entries but writes no config, so nothing recorded a kind. Run `setup` once, or read `uv-receipt.toml` directly.
+- **Entry hash differs after step 4**: something rewrote the entry — usually a `setup` run against a different harness config. Re-run `setup` and compare again; treat any remaining difference as a defect.
+- **`--refresh` did not pick up a source-only edit**: uv's build cache is keyed on `pyproject.toml`/`setup.py`/`setup.cfg` and the presence of `src`, not file contents. `ensure_tool` already passes `--refresh`; if it still serves stale code, clear the cache with `uv cache clean`.
+- **Wheel install says `No source checkout found`**: uvx/wheel runs have nothing local to build, so it pins `simple-code-indexer==<version>` from PyPI. Use RUN-010 if you meant to test this tree.
+- **Import still resolves to `<repo>\src\...`**: the force-reinstall did not flip the flavour. Confirm the command exited 0, then repeat step 2.

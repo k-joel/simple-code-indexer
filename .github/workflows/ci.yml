@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is not optional: pythonw.exe, CREATE_NO_WINDOW and named pipes
+        # are all win32-only code paths the suite exercises.
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install the project (editable)
+        # `uv sync` installs the project itself editable, so the suite runs
+        # against the working tree, not a copy.
+        run: uv sync --locked
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Typecheck
+        run: uv run pyright
+
+      - name: Test
+        run: uv run pytest -p no:cacheprovider
+
+  dist:
+    name: Distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Build
+        # --no-sources: build exactly what PyPI would receive.
+        run: uv build --no-sources
+
+      - name: Wheel ships its runtime data
+        run: |
+          uv run --isolated --no-project --with ./dist/*.whl python - <<'PY'
+          from simple_code_indexer.setup_wizard.provision import template_text
+
+          assert template_text("docker-compose.yml")
+          assert template_text("gpu_init.sh")
+          import simple_code_indexer.__main__  # noqa: F401
+          import simple_code_indexer.cli  # noqa: F401
+          import simple_code_indexer.server  # noqa: F401
+          import simple_code_indexer.sidecar.daemon  # noqa: F401
+          print("wheel imports OK")
+          PY
+
+      - name: Console script works
+        run: |
+          uv run --isolated --no-project --with ./dist/*.whl simple-code-indexer version
+          uv run --isolated --no-project --with ./dist/*.whl simple-code-indexer setup --help
+          uv run --isolated --no-project --with ./dist/*.tar.gz simple-code-indexer version
+
+      - name: Store distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

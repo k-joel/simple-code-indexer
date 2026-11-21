@@ -11,13 +11,17 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from simple_code_indexer import configfile, model_prompts, sqlite_vec_store
+from simple_code_indexer import (
+    configfile,
+    logging_setup,
+    model_prompts,
+    sqlite_vec_store,
+)
 from simple_code_indexer.errors import ConfigError
 from simple_code_indexer.harnesses import HarnessSpec, load_harnesses
 from simple_code_indexer.setup_wizard import (
@@ -38,7 +42,6 @@ DEFAULT_EMBED_MODEL = "Qwen3-Embedding-4B-Q6_K"
 DEFAULT_EMBED_DIM = 2560
 DEFAULT_STARTUP_TIMEOUT_S = 120.0
 DEFAULT_SWEEP_SECONDS = 45.0
-GIT_PULL_ENV = "SIMPLE_CI_GIT_PULL"
 
 
 class SetupAborted(Exception):
@@ -52,11 +55,21 @@ class ExistingSetup:
     qdrant: dict[str, Any] | None
 
 
-def _default_repo_root() -> Path:
+def _default_repo_root() -> Path | None:
+    """The source checkout, when the running package *is* that checkout.
+
+    Detection is deliberately strict: the parent must contain this package's own
+    module tree. A plain `pyproject.toml` search is not enough, because an
+    installed package almost always lives inside *some* project
+    (`.venv/Lib/site-packages/...`), and adopting that project would make the
+    wizard build and install the wrong tree. A wheel has no `src/` beside it, so
+    this returns None there. Never fall back to `Path.cwd()`: the cwd is the
+    user's project, which is what gets indexed, not what gets installed.
+    """
     for parent in Path(__file__).resolve().parents:
-        if (parent / "pyproject.toml").is_file():
+        if (parent / "src" / "simple_code_indexer" / "__init__.py").is_file():
             return parent
-    return Path.cwd()
+    return None
 
 
 def _stored_prompt(
@@ -93,14 +106,12 @@ class Wizard:
         embedding_url: str | None = None,
         embedding_model: str | None = None,
         harnesses: str | None = None,
-        install_dir: Path | None = None,
-        no_install: bool = False,
-        no_git_pull: bool = False,
+        editable: bool = True,
         sweep_seconds: float | None = None,
     ) -> None:
         self.cwd = (cwd or Path.cwd()).resolve()
         self.home = (home or Path.home()).resolve()
-        self.repo_root = (repo_root or _default_repo_root()).resolve()
+        self.repo_root = repo_root.resolve() if repo_root is not None else None
         self.prompts = prompts or Prompter()
         self.runner = runner or provision.Runner()
         self.http = http or probe.Http()
@@ -117,14 +128,12 @@ class Wizard:
         self.embedding_url = embedding_url
         self.embedding_model = embedding_model
         self.harnesses = harnesses
-        self.install_dir = install_dir
-        self.no_install = no_install
-        self.no_git_pull = no_git_pull
-        self.harness_env = {GIT_PULL_ENV: "0"} if no_git_pull else {}
+        self.editable = editable
         self.sweep_seconds = sweep_seconds
         self._docker_checked: bool | None = None
         self._written_harnesses: list[tuple[HarnessSpec, Path]] = []
-        self._record_install_root: Path | None = None
+        self._record_tool_env: Path | None = None
+        self._record_install_kind: str | None = None
         self._record_harnesses: list[dict[str, str]] = []
 
     def run(self) -> int:
@@ -1132,9 +1141,6 @@ class Wizard:
             setup = configfile.get_mapping(raw, "setup")
         except ConfigError:
             return
-        install_root = setup.get("install_root")
-        if isinstance(install_root, str) and install_root.strip():
-            self._record_install_root = Path(install_root).expanduser()
         items = setup.get("harnesses")
         if not isinstance(items, list):
             return
@@ -1179,8 +1185,10 @@ class Wizard:
         for key in ("model_key", "model_file", "gpu"):
             if embedding.get(key):
                 setup[key] = embedding[key]
-        if self._record_install_root is not None:
-            setup["install_root"] = str(self._record_install_root)
+        if self._record_tool_env is not None:
+            if self._record_install_kind is not None:
+                setup["install_kind"] = self._record_install_kind
+            setup["tool_env"] = str(self._record_tool_env)
         if self._record_harnesses:
             setup["harnesses"] = [dict(item) for item in self._record_harnesses]
         if setup:
@@ -1207,80 +1215,30 @@ class Wizard:
     # -- install ---------------------------------------------------------
 
     def _step_install(self) -> install.InstallResult:
-        uv = self.runner.which("uv") or "uv"
-        if self.no_install:
-            result = install.InstallResult(
-                root=self.repo_root,
-                launcher=self.repo_root / install.LAUNCHER_FILENAME,
-                uv=uv,
-                platform=self.platform,
-            )
-            self.prompts.say(f"Using the source checkout: {self.repo_root}")
-            return result
-        target = install.target_root(
-            home=self.home, install_dir=self.install_dir, platform=self.platform
-        )
-        if target == self.repo_root:
-            self.prompts.say(f"Already running from the install directory: {target}")
-            return install.InstallResult(
-                root=target,
-                launcher=target / install.LAUNCHER_FILENAME,
-                uv=uv,
-                platform=self.platform,
-            )
-        self.prompts.say(f"Installing to {target} ...")
-        if self.dry_run:
-            self.prompts.say(f"Would copy {self.repo_root} to {target}")
-            self.prompts.say(f"Would run uv sync --project {target}")
-        else:
-            install.copy_repo(self.repo_root, target)
-            if not install.sync_env(self.runner, target, self.prompts.say):
-                raise SetupAborted(f"uv sync failed in {target}")
-        self._remove_previous_install(target)
-        result = install.InstallResult(
-            root=target,
-            launcher=target / install.LAUNCHER_FILENAME,
-            uv=uv,
-            platform=self.platform,
-        )
-        self._record_install_root = target
-        self.prompts.say(f"Installed: {target}")
-        return result
-
-    def _remove_previous_install(self, target: Path) -> None:
-        """Delete the copy a previous run recorded when --install-dir moved it."""
-        previous = self._record_install_root
-        if previous is None:
-            return
-        previous = previous.expanduser().resolve()
-        if previous == target or not previous.is_dir():
-            return
-        for protected in (self.repo_root, self.cwd):
-            if previous == protected or previous in protected.parents:
-                self.prompts.say(
-                    f"Skipping {previous}: it contains the working checkout."
-                )
-                return
-        if not (previous / install.LAUNCHER_FILENAME).is_file():
+        version = logging_setup.package_version()
+        editable = self.editable and self.repo_root is not None
+        if self.editable and self.repo_root is None:
             self.prompts.say(
-                f"Skipping {previous}: it does not look like an install copy "
-                f"(no {install.LAUNCHER_FILENAME})."
+                "No source checkout found; installing the published wheel."
             )
-            return
-        if not self._ask_yes_no(
-            f"Remove the previous install copy at {previous}?", default=True
-        ):
-            self.prompts.say(f"Kept {previous}; remove it by hand if it is not needed.")
-            return
+        spec = install.install_spec(self.repo_root, version, editable=editable)
+        kind = "editable" if editable else "wheel"
         if self.dry_run:
-            self.prompts.say(f"Would delete the previous install copy {previous}")
-            return
-        try:
-            shutil.rmtree(previous)
-        except OSError as exc:
-            self.prompts.say(f"Could not delete {previous}: {exc}")
-            return
-        self.prompts.say(f"Deleted the previous install copy: {previous}")
+            self.prompts.say(f"Would install {spec} with uv tool ({kind})")
+            root = install.tool_env_root(self.runner)
+            if root is None:
+                raise SetupAborted(f"{spec} is not installed yet and this is a dry run")
+        else:
+            root = install.ensure_tool(
+                self.runner,
+                spec=spec,
+                editable=editable,
+                output=self.prompts.say,
+            )
+        self.prompts.say(f"Installed ({kind}): {root}")
+        self._record_tool_env = root
+        self._record_install_kind = kind
+        return install.InstallResult(root=root, platform=self.platform)
 
     # -- harnesses -------------------------------------------------------
 
@@ -1344,16 +1302,16 @@ class Wizard:
                 kept[spec.name] = str(target)
                 continue
             if self.dry_run:
-                snippet = write.render(spec, SERVER_NAME, command, self.harness_env)
+                snippet = write.render(spec, SERVER_NAME, command, {})
                 self.prompts.say(f"Would update {target}:\n{snippet}")
             else:
                 try:
-                    write.install(spec, target, SERVER_NAME, command, self.harness_env)
+                    write.install(spec, target, SERVER_NAME, command, {})
                 except (TypeError, ValueError, OSError) as exc:
                     self.prompts.say(f"Could not update {target}: {exc}")
                     self.prompts.say(
                         "Add this entry manually:\n"
-                        + write.render(spec, SERVER_NAME, command, self.harness_env)
+                        + write.render(spec, SERVER_NAME, command, {})
                     )
                     if previous is not None and previous.resolve() == resolved:
                         kept[spec.name] = str(previous)
@@ -1432,6 +1390,8 @@ class Wizard:
             )
         )
         self.prompts.say(f"  install:      {install_result.root}")
+        kind = self._record_install_kind or "unknown"
+        self.prompts.say(f"  kind:         {kind}")
         self.prompts.say(f"  compose:      {provision.compose_path(self.home)}")
         self.prompts.say(f"  models:       {provision.model_dir(self.home)}")
         if embedding.get("gpu"):
@@ -1455,44 +1415,56 @@ class Wizard:
 
 
 def _install_only(args: argparse.Namespace) -> int:
-    """Copy the checkout into the install directory without running setup."""
-    repo_root = (args.repo_root or _default_repo_root()).resolve()
-    target = install.target_root(install_dir=args.install_dir)
+    """Install this checkout (or the published wheel) as a uv tool; no prompts."""
     prompts = Prompter()
-    if target == repo_root:
-        prompts.say(f"Already running from the install directory: {target}")
-    elif args.dry_run:
-        prompts.say(f"Would copy {repo_root} to {target}")
-    else:
-        install.copy_repo(repo_root, target)
-        prompts.say(f"Copied {repo_root} to {target}")
-    if not args.no_git_pull:
-        return 0
-    return _repin_recorded_harnesses(target, prompts, dry_run=args.dry_run)
+    runner = provision.Runner()
+    if install.ensure_uv(runner, output=prompts.say) is None:
+        return 1
+    repo_root = args.repo_root
+    if repo_root is None:
+        repo_root = _default_repo_root()
+    editable = not args.wheel and repo_root is not None
+    if not args.wheel and repo_root is None:
+        prompts.say("No source checkout found; installing the published wheel.")
+    spec = install.install_spec(
+        repo_root, logging_setup.package_version(), editable=editable
+    )
+    kind = "editable" if editable else "wheel"
+    if args.dry_run:
+        prompts.say(f"Would install {spec} with uv tool ({kind})")
+        return _repin_recorded_harnesses(prompts, dry_run=True)
+    root = install.ensure_tool(
+        runner,
+        spec=spec,
+        editable=editable,
+        output=prompts.say,
+    )
+    prompts.say(f"Installed ({kind}): {root}")
+    return _repin_recorded_harnesses(prompts, dry_run=False)
 
 
-def _repin_recorded_harnesses(target: Path, prompts: Prompter, *, dry_run: bool) -> int:
-    """Rewrite the recorded entries with the pull pin; returns a failure count."""
+def _repin_recorded_harnesses(prompts: Prompter, *, dry_run: bool) -> int:
+    """Rewrite the recorded entries to the tool environment; returns failures."""
     config_path = configfile.global_config_path()
     record = uninstall.read_record(config_path)
     if not record.harnesses:
         prompts.say(f"No harness entries recorded in {config_path}; nothing to update.")
         return 0
-    # The record names the install the entries already launch; never repoint them
-    # at a target this run merely copied to unless that is the same directory.
-    root = record.install_root or target
-    if root != target:
+    runner = provision.Runner()
+    root = install.tool_env_root(runner)
+    if root is None:
+        if dry_run:
+            prompts.say(
+                f"Would repoint the entries at the {install.TOOL_NAME} uv tool "
+                "environment once it is installed."
+            )
+            return 0
         prompts.say(
-            f"Note: the entries keep launching the recorded install at {root}; "
-            f"run the full setup to move them to {target}."
+            f"{install.TOOL_NAME} is not installed as a uv tool; run the full "
+            "setup (or --install-only) first."
         )
-    result = install.InstallResult(
-        root=root,
-        launcher=root / install.LAUNCHER_FILENAME,
-        uv=shutil.which("uv") or "uv",
-        platform=sys.platform,
-    )
-    env = {GIT_PULL_ENV: "0"}
+        return 1
+    result = install.InstallResult(root=root, platform=sys.platform)
     specs = {spec.name: spec for spec in load_harnesses()}
     failures = 0
     for item in record.harnesses:
@@ -1507,11 +1479,11 @@ def _repin_recorded_harnesses(target: Path, prompts: Prompter, *, dry_run: bool)
         if dry_run:
             prompts.say(
                 f"Would update {item.config}:\n"
-                + write.render(spec, SERVER_NAME, command, env)
+                + write.render(spec, SERVER_NAME, command, {})
             )
             continue
         try:
-            write.install(spec, item.config, SERVER_NAME, command, env)
+            write.install(spec, item.config, SERVER_NAME, command, {})
         except (TypeError, ValueError, OSError) as exc:
             prompts.say(f"Could not update {item.config}: {exc}")
             failures += 1
@@ -1522,7 +1494,7 @@ def _repin_recorded_harnesses(target: Path, prompts: Prompter, *, dry_run: bool)
 
 def run(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="setup.py",
+        prog="simple-code-indexer setup",
         description="Interactive setup for simple-code-indexer.",
     )
     parser.add_argument(
@@ -1590,30 +1562,22 @@ def run(argv: list[str] | None = None) -> int:
         help="'all', 'none', or a comma-separated list of harness names",
     )
     parser.add_argument(
-        "--install-dir",
-        type=Path,
-        default=None,
-        help="override the per-user install directory",
+        "--wheel",
+        action="store_true",
+        help=(
+            "install a built wheel instead of an editable link (prod validation); "
+            "the harness entry is unchanged"
+        ),
     )
     parser.add_argument(
         "--install-only",
         action="store_true",
-        help="copy this checkout to the install directory and exit",
-    )
-    parser.add_argument(
-        "--no-install",
-        action="store_true",
-        help="point harness entries at this checkout instead of copying it",
-    )
-    parser.add_argument(
-        "--no-git-pull",
-        action="store_true",
-        help="write SIMPLE_CI_GIT_PULL=0 into the harness entries (debug)",
+        help="install the uv tool environment and exit (no config or entries)",
     )
     parser.add_argument(
         "--uninstall",
         action="store_true",
-        help="remove the install copy, config, services, models and MCP entries",
+        help="remove the uv tool environment, config, services, models and MCP entries",
     )
     parser.add_argument(
         "--keep-models",
@@ -1646,20 +1610,16 @@ def run(argv: list[str] | None = None) -> int:
         parser.error("--install-only and --uninstall cannot be combined")
     if args.uninstall:
         conflicts = [name for name, value in install_flags.items() if value is not None]
-        if args.no_install:
-            conflicts.append("--no-install")
-        if args.no_git_pull:
-            conflicts.append("--no-git-pull")
+        if args.wheel:
+            conflicts.append("--wheel")
         if conflicts:
             parser.error("--uninstall does not accept " + ", ".join(conflicts))
         return uninstall.Uninstaller(
             home=Path.home(),
-            repo_root=args.repo_root,
             prompts=Prompter(),
             runner=provision.Runner(),
             platform=sys.platform,
             config_path=args.config.expanduser() if args.config else None,
-            install_dir=args.install_dir,
             keep_models=args.keep_models,
             dry_run=args.dry_run,
             assume_yes=args.yes,
@@ -1667,13 +1627,13 @@ def run(argv: list[str] | None = None) -> int:
         ).run()
     if args.install_only:
         conflicts = [name for name, value in install_flags.items() if value is not None]
-        if args.no_install:
-            conflicts.append("--no-install")
         if args.config is not None:
             conflicts.append("--config")
         if conflicts:
             parser.error("--install-only does not accept " + ", ".join(conflicts))
         return _install_only(args)
+    if args.repo_root is None:
+        args.repo_root = _default_repo_root()
     wizard = Wizard(
         cwd=Path.cwd(),
         repo_root=args.repo_root,
@@ -1689,9 +1649,7 @@ def run(argv: list[str] | None = None) -> int:
         embedding_url=args.embedding_url,
         embedding_model=args.embedding_model,
         harnesses=args.harnesses,
-        install_dir=args.install_dir,
-        no_install=args.no_install,
-        no_git_pull=args.no_git_pull,
+        editable=not args.wheel,
         sweep_seconds=args.sweep_seconds,
     )
     return wizard.run()

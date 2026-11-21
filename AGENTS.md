@@ -37,12 +37,18 @@ Read the relevant doc before planning or reporting work:
 
 ```bash
 uv sync
-python setup.py                  # interactive wizard (questionary; installs uv if missing)
-python setup.py --dry-run        # print actions without touching files/containers
-python setup.py --yes --install-dir "$env:TEMP\sci-install"   # non-interactive
-python setup.py --uninstall --dry-run   # show what an uninstall would remove
-python setup.py --uninstall --yes       # remove install copy, config, services, models, MCP entries
-python setup.py --uninstall --keep-models   # same, but keep ~/.simple-ci/model/
+uv run simple-code-indexer setup            # wizard; installs this checkout as a uv tool
+uv run simple-code-indexer setup --dry-run  # print actions without touching files/containers
+uv run simple-code-indexer install          # install/reinstall the tool env, editable (dev default)
+uv run simple-code-indexer install --wheel  # same env, built wheel (prod validation; entry unchanged)
+uv run simple-code-indexer uninstall --dry-run   # show what an uninstall would remove
+uv run simple-code-indexer uninstall --yes       # remove tool env, config, services, models, MCP entries
+uv run simple-code-indexer uninstall --yes --keep-models   # same, but keep ~/.simple-ci/model/
+uvx simple-code-indexer setup    # supported entry point once published
+uvx simple-code-indexer serve    # what harness entries run (stdio MCP)
+uvx simple-code-indexer status   # workspace + index health for the cwd
+uv run simple-code-indexer version      # the checkout's editable install
+python tools/release.py --bump patch    # bump, cut CHANGELOG, tag, push -> CI publishes
 uv run ruff check .              # lint
 uv run ruff format .             # format
 uv run pyright                   # typecheck
@@ -53,7 +59,12 @@ uv run python tests/retrieval_bench.py --workspace . --model embeddinggemma-2 \
   --local-path artifacts/bench/local   # one model, never the live .simple-ci index
 uv run python tests/bench_matrix.py --workspace .                # all models/backends
 uv run python tools/gen_language_catalog.py --check              # catalog drift (needs network)
+uv build --no-sources            # wheel + sdist exactly as PyPI receives them
 ```
+
+**Never run a non-dry-run `setup` or `uninstall` against your real profile**: both are
+machine-wide (global config, uv tool env, harness configs, `~/.simple-ci/`). Redirect
+`HOME`/`USERPROFILE`/`APPDATA`/`LOCALAPPDATA` first, or use `--dry-run`.
 
 Do this before calling work done: **`ruff check` → `pyright` → `pytest`**.
 
@@ -65,17 +76,17 @@ After editing Python: `uv run ruff check --fix <file> && uv run ruff format <fil
 ## Layout
 
 ```
-setup.py                   # wizard launcher (NOT a setuptools script)
-run_server.py              # harness launcher: git pull → uv sync → server (cwd preserved)
 src/simple_code_indexer/   # package (import: simple_code_indexer)
+  cli.py                   # console entry point: setup / install / serve / uninstall / status / version
   languages/               # GENERATED catalog.py + LanguageSpec + specialized extractors
   harnesses/               # MCP-client plugins: install entries + runtime workspace hooks
-  setup_wizard/            # prompts, probes, Docker provisioning, install copy
+  setup_wizard/            # prompts, probes, Docker provisioning, uv tool install/uninstall
   tsutil.py                # tree-sitter node helpers shared by parse/ and languages/
-harnesses/                 # user harness plugin drop-ins (tracked)
+harnesses/                 # user harness plugin drop-ins (tracked; not in the wheel)
 tests/                     # pytest + retrieval_bench.py + bench_matrix.py
 tools/                     # dev scripts (see docs/TOOLS.md)
-pyproject.toml             # deps + ruff / pyright / pytest config
+.github/workflows/         # ci.yml (test + dist) and release.yml (tag-driven PyPI publish)
+pyproject.toml             # deps + metadata + ruff / pyright / pytest config
 ```
 
 ## Runtime / external services
@@ -99,8 +110,9 @@ Host-spawned MCP **reader** processes + one detached per-workspace **sidecar wri
 | Sweep | off by default (`sweep_seconds: 0`, watcher only); opt-in periodic reconcile with idle backoff (cap `SWEEP_BACKOFF_MAX_S` = 10 min) and temporary sweeps while chunks are pending; `get_status.sweep_seconds` reports it |
 | Logs | sidecar writer: `writer.log`; readers: `reader.log`; embedded: `embed.log` (all under `<workspace>/.simple-ci/log/`, same `log.max_bytes`/`log.backups` rotation; `log.level` / `LOG_LEVEL` controls them). `reader.log` is shared by readers, so its rotation is best-effort. INFO stays on stderr; stdout stays pure MCP |
 | Lifecycle | a reader exits with its stdio session and when the harness process dies (`parent_watch.py` skips `uv`/`uvx`, the venv trampoline, and a spawn shell below the harness; `SIMPLE_CI_PARENT_WATCH=0` disables). A reused `opencode-cli serve --service` *is* the harness, so the reader lives as long as it does; stop it with `opencode service stop`. The daemon never watches the harness |
-| Install | `%APPDATA%\simple-code-indexer` (Windows), `~/Library/Application Support/...` (macOS), `$XDG_DATA_HOME/...` (Linux); harness entries run `uv run --project <install> --no-sync python run_server.py` on POSIX and the venv's windowless `<install>/.venv/Scripts/pythonw.exe run_server.py` on Windows (no console window) |
-| Install record | `setup.install_root` + `setup.harnesses` in `~/.simple-ci/config.yaml`; used by re-runs to remove deselected entries and by `--uninstall` |
+| Install | `uv tool install <spec>` into one environment, in one of two flavours: **editable** (default from a checkout: `--editable <checkout>`) or **wheel** (`--wheel`, or any run with no checkout: `[--refresh] <checkout>` / `simple-code-indexer==<version>`). `<spec>` is the checkout path when running from a source tree (so local installs work before publishing) and the pinned published version otherwise. Environment root: `%APPDATA%\uv\tools\simple-code-indexer`, `~/Library/Application Support/uv/tools/...`, `$XDG_DATA_HOME/uv/tools/...`; harness entries run its `Scripts/pythonw.exe -m simple_code_indexer serve` on Windows (no console window) and `bin/python -m simple_code_indexer serve` on POSIX — identical for both flavours, so switching never rewrites an entry |
+| Install record | `setup.install_kind` (`editable`/`wheel`) + `setup.tool_env` + `setup.harnesses` in `~/.simple-ci/config.yaml`; `uv-receipt.toml` in the tool env is the ground truth for which flavour is live |
+| Release | tag-driven: `tools/release.py --bump` → `.github/workflows/release.yml` → PyPI Trusted Publishing (OIDC). `pyproject.toml` holds the version; the tag must match (`--verify-tag`) |
 
 Config comes from the YAML file first, then env (e.g. `VECTOR_STORE`, `FAISS_PATH`,
 `SQLITE_VEC_CHUNK_SIZE`, `SQLITE_VEC_MMAP_SIZE`, `SQLITE_VEC_CACHE_SIZE`, `QDRANT_URL`,
@@ -120,9 +132,9 @@ Probe the services with `uv run python tests/service_probe.py` before a live-mod
 - **Writer lifecycle**: `runtime.WriterRuntime.start()` acquires `index.db.lock`; `stop()` stops the watcher + writer/sweep/heartbeat threads, flushes vectors and clears dirty flags **while the lease is held**, then releases it last. The daemon clears `.simple-ci/run/daemon.json`/`daemon.token` before releasing the lease so a new daemon cannot publish into a file the old one deletes.
 - **Daemon spawn**: `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` (plus `CREATE_BREAKAWAY_FROM_JOB` with fallback; POSIX `start_new_session=True`), stdio redirected, own `writer.log`, and no `ParentWatchdog` (it must outlive the spawner). Never use `DETACHED_PROCESS` here: the venv `python.exe` redirector spawns the real interpreter without creation flags, and that child then allocates a visible console window. The control channel is `multiprocessing.connection` with a token `authkey` and JSON string bodies, never pickle.
 - File-watcher / MCP surface should stay small: `search_code`, `symbol_lookup`, `get_status` (optional `reindex`). The watcher is the primary index path; the periodic reconciliation sweep is opt-in (`sweep_seconds: 0` = off) and must stay a backstop, with idle backoff.
-- MCP config for the harness lives in `.mimocode/mimocode.json` (gitignored); changes need a session restart to reload. It points at the installed `run_server.py`, which pulls the repo and runs the server in the harness cwd. `python setup.py` writes the same entry for other harnesses (global scope, no per-location prompt).
+- MCP config for the harness lives in `.mimocode/mimocode.json` (gitignored); changes need a session restart to reload. It points at the installed tool environment, which runs the server in the harness cwd. `simple-code-indexer setup` writes the same entry for other harnesses (global scope, no per-location prompt).
 - Harness support is a plugin folder (`src/simple_code_indexer/harnesses/`); bad plugins are skipped, never fatal, and user drop-ins override builtins by `NAME`. A plugin may declare `resolve_workspace(cwd)` (runtime hook) and seal its entry with `SIMPLE_CI_HARNESS=<NAME>` (`harnesses.RUNTIME_ENV`); `harnesses.discover_workspace` then asks only that plugin. An entry without the marker (installed before it existed) still resolves: when the cwd is implausible (home or an ancestor's executable dir, `config._implausible_reason`) every resolver is asked, while a plausible cwd is never overridden. Keep client-specific discovery inside the plugin.
-- **Harness entries are global-only and workspace-free** ([ADR-015](docs/DECISIONS.md#adr-015-harness-entries-are-global-only-no-per-project-data)): never write a project path into an entry — no `WORKSPACE_ROOT`, no `cwd`, no `INDEX_DB`/`FAISS_PATH`. The only allowed env marker is the stable `SIMPLE_CI_HARNESS=<NAME>`. Workspace resolution happens after the MCP handshake (roots first; ADR-018); `get_status.workspace`/`workspace_source` confirm it. Pin only while debugging, and remove the pin before finishing (re-running `python setup.py --harnesses <name>` rewrites a clean entry).
+- **Harness entries are global-only and workspace-free** ([ADR-015](docs/DECISIONS.md#adr-015-harness-entries-are-global-only-no-per-project-data)): never write a project path into an entry — no `WORKSPACE_ROOT`, no `cwd`, no `INDEX_DB`/`FAISS_PATH`. The only allowed env marker is the stable `SIMPLE_CI_HARNESS=<NAME>`. Workspace resolution happens after the MCP handshake (roots first; ADR-018); `get_status.workspace`/`workspace_source` confirm it. Pin only while debugging, and remove the pin before finishing (re-running `simple-code-indexer setup --harnesses <name>` rewrites a clean entry).
 - Tests must set `SIMPLE_CI_CONFIG=none` (the autouse fixture in `tests/conftest.py` does this) so a developer's global config cannot change defaults. The same fixture sets `SIMPLE_CI_MODE=embedded`; sidecar tests override it explicitly and must kill spawned daemons by the pid in `.simple-ci/run/daemon.json` in `finally`.
 - The watchdog watches **only the harness process** (`parent_watch.harness_process` skips `uv`/`uvx`, the venv trampoline, and a spawn shell that sits below the harness) and finalizes by hand with `os._exit(0)`: `stdio_server`'s stdin reader blocks in a non-cancellable worker thread, so returning from the serve loop would hang on the open pipe. A reader unregisters its sidecar lease in the cleanup; a writer flushes and releases the lease. Keep the cleanup before the exit.
 - **Language support is a table, not a plugin folder**: `languages/catalog.py` is generated by `tools/gen_language_catalog.py` — never hand-edit it, edit the generator and re-run it (`--check` detects drift). `registry.py` only indexes the table.
