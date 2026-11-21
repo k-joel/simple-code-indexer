@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Release plumbing: bump the version, tag it, and verify the tag matches.
 
 `pyproject.toml` is the single source of truth for the version (`uv_build`
