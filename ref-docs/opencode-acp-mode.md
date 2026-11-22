@@ -269,24 +269,32 @@ Two independent sources load into a session:
   "mcpServers": [
     {
       "name": "simple-code-indexer",
-      "command": "C:\\Users\\you\\AppData\\Roaming\\simple-code-indexer\\.venv\\Scripts\\pythonw.exe",
-      "args": ["C:\\Users\\you\\AppData\\Roaming\\simple-code-indexer\\run_server.py"],
-      "env": [{ "name": "SIMPLE_CI_GIT_PULL", "value": "0" }]
+      "command": "C:\\Users\\you\\AppData\\Roaming\\uv\\tools\\simple-code-indexer\\Scripts\\pythonw.exe",
+      "args": ["-m", "simple_code_indexer", "serve"],
+      "env": []
     }
   ]
 }
 ```
 
+(`<tool-env>` is `uv tool dir` + `simple-code-indexer`; POSIX uses `<tool-env>/bin/python`. The
+launcher is always the tool environment — `run_server.py`, the `%APPDATA%\simple-code-indexer`
+copy and `SIMPLE_CI_GIT_PULL` were deleted by ADR-019.)
+
 Behaviour that matters in practice (verified against 2.2.5 and this repo's server):
 
-- **A client-supplied server replaces a configured server of the same name** for that directory.
-  This is how you get a hermetic test: inject `simple-code-indexer` yourself and the copy in
-  `opencode.json` never spawns.
-- **Different name = an extra server.** Two readers then attach to the same workspace and
-  `get_status.sessions` reports `2`. Harmless but confusing; rename the injected server or drop
-  the configured one.
-- The injection persists for the life of the `opencode acp` process, so later sessions in the
-  same directory see it too.
+- **On 2.2.5 the session-supplied `mcpServers` did not load (measured 2026-11-21).** With the
+  configured `simple-code-indexer` entry present the harness logged
+  `mcp connected server=simple-code-indexer tools=3`; with that entry removed, or renamed to a
+  different server name, **no** `mcp connected` line appeared for the injected server and the model
+  fell back to shell commands. Treat the configured entry as the one that launches, and check
+  `debug config --standalone` plus the `mcp connected` line before trusting a run. `tests/acp_probe.py`
+  now enforces this: for OpenCode it reads the configured entry through the harness plugin registry
+  and exits before spawning the agent when the entry is missing or does not launch the tool
+  environment.
+- **A differently named server is an extra server, not a replacement.** Two readers then attach to
+  the same workspace and `get_status.sessions` reports `2`. Harmless but confusing; keep the
+  canonical name.
 - HTTP MCP servers are supported; SSE is not advertised, and MCP-over-ACP is not supported.
 - `codemode` is an OpenCode-side per-server option. With `codemode: false` the three tools appear
   in the model's **direct** tool list under names like

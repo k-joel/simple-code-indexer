@@ -16,10 +16,17 @@ Options:
     --json              Emit a machine-readable result object on stdout
 
 The probe is fully automated: it spawns the agent, creates a session with the MCP
-server injected per session (no harness config is touched), drives prompts that
-make the model call each tool, and asserts on the **tool payloads** the agent
-returns - never on the model's prose. Every prompt is retried once, because free
-models skip tool calls intermittently.
+server injected per session, drives prompts that make the model call each tool,
+and asserts on the **tool payloads** the agent returns - never on the model's
+prose. Every prompt is retried once, because free models skip tool calls
+intermittently.
+
+OpenCode 2.2.5 **ignores** `session/new.mcpServers` (measured 2026-11-21): only
+the `simple-code-indexer` entry already configured for that harness launches, so
+the probe reads that entry first, requires it to launch this tool environment,
+and fails fast with the remedy when it does not. Without that preflight a run
+just exercises whatever the ambient harness config happens to contain - or
+falls back to shell scripts and reports a misleading 10/23 (ISS-017).
 
 The agent's stderr is drained on a thread. An unread stderr pipe blocks the agent
 (and, through it, the MCP server) inside a log write; that single omission was
@@ -39,13 +46,20 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from pathlib import Path
 from typing import Any
 
+from simple_code_indexer.harnesses import HarnessSpec, _json, _yaml, load_harnesses
+
 SERVER_NAME = "simple-code-indexer"
+ENTRY_MODULE = "simple_code_indexer"
 _STDERR_TAIL: list[str] = []
 _DEFAULT_TIMEOUT_S = 180.0
 _UPDATES: list[str] = []
+
+_IGNORES_INJECTION = {"opencode"}
+"""Harnesses that never start `session/new.mcpServers` (measured 2026-11-21)."""
 
 
 def _install_root(explicit: str | None) -> Path:
@@ -120,8 +134,130 @@ def _mcp_server(install: Path) -> dict[str, Any]:
     return {
         "name": SERVER_NAME,
         "command": str(exe),
-        "args": ["-m", "simple_code_indexer", "serve"],
+        "args": ["-m", ENTRY_MODULE, "serve"],
     }
+
+
+def _harness_plugin(agent: str) -> HarnessSpec | None:
+    """The harness plugin whose config the ACP agent reads, or None."""
+    base = Path(agent).name.lower()
+    if "opencode" in base:
+        wanted = "opencode"
+    elif "cmd" in base or "command" in base:
+        wanted = "commandcode"
+    else:
+        return None
+    return next((spec for spec in load_harnesses() if spec.name == wanted), None)
+
+
+def _entry_from_file(spec: HarnessSpec, path: Path) -> dict[str, Any] | None:
+    """This server's entry in `path`, or None when the file has no usable one."""
+    if spec.root_key is None:
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+        if spec.format == "toml":
+            document: Any = tomllib.loads(text)
+        elif spec.format == "yaml":
+            document = _yaml.parse(text)
+        else:
+            document = _json.parse(text)
+    except (OSError, ValueError):
+        return None
+    node: Any = document
+    for part in spec.root_key.split("."):
+        node = node.get(part) if isinstance(node, dict) else None
+    entry = node.get(SERVER_NAME) if isinstance(node, dict) else None
+    return entry if isinstance(entry, dict) else None
+
+
+def _configured_entry(
+    spec: HarnessSpec, workspace: Path, home: Path | None = None
+) -> tuple[Path | None, dict[str, Any] | None]:
+    """First config file that already declares this server, global scope first."""
+    candidates = [
+        *spec.candidates("global", workspace, home),
+        *spec.candidates("local", workspace, home),
+    ]
+    for path in candidates:
+        if path.is_file():
+            entry = _entry_from_file(spec, path)
+            if entry is not None:
+                return path, entry
+    return None, None
+
+
+def _entry_argv(entry: dict[str, Any]) -> list[str]:
+    """The entry's launch command as one argv list (shape varies by harness)."""
+    command = entry.get("command", entry.get("cmd"))
+    if isinstance(command, list):
+        return [str(part) for part in command]
+    if isinstance(command, str):
+        args = entry.get("args")
+        extra = [str(part) for part in args] if isinstance(args, list) else []
+        return [command, *extra]
+    return []
+
+
+def _inside(path: str, root: Path) -> bool:
+    """Path containment without following symlinks.
+
+    A POSIX venv's `bin/python` is a symlink to the base interpreter, so
+    resolving it would report the entry as outside its own tool environment.
+    """
+    candidate = os.path.normcase(os.path.abspath(path))
+    base = os.path.normcase(os.path.abspath(str(root)))
+    return candidate == base or candidate.startswith(base + os.sep)
+
+
+def _launches_install(entry: dict[str, Any], install: Path) -> bool:
+    """True when the entry serves this module from an `install` interpreter.
+
+    The interpreter must live in the tool environment (`python.exe` and
+    `pythonw.exe` are both valid) and the argv must be the documented
+    `-m simple_code_indexer serve` launch, so a stale entry naming another
+    install or the deleted checkout copy is rejected.
+    """
+    argv = _entry_argv(entry)
+    if not argv or not _inside(argv[0], install):
+        return False
+    return argv[1:] == ["-m", ENTRY_MODULE, "serve"]
+
+
+def _preflight_entry(
+    spec: HarnessSpec,
+    workspace: Path,
+    install: Path,
+    check: Any,
+    *,
+    home: Path | None = None,
+) -> bool:
+    """Prove the entry that will actually serve launches `install`.
+
+    A harness in `_IGNORES_INJECTION` never starts the `session/new` server, so
+    a missing or stale configured entry must stop the run here instead of
+    surfacing later as a model that shells out. Harnesses that do honour the
+    injection only report their entry.
+    """
+    required = spec.name in _IGNORES_INJECTION
+    path, entry = _configured_entry(spec, workspace, home)
+    label = f"{spec.label} configured entry launches this tool environment"
+    if entry is None:
+        if not required:
+            print(
+                "configured entry: none (this agent honours session injection)",
+                flush=True,
+            )
+            return True
+        check(label, False, f"no {SERVER_NAME!r} entry under {spec.root_key}")
+        return False
+    argv = _entry_argv(entry)
+    if not required:
+        print(f"configured entry: {path} -> {' '.join(argv)}", flush=True)
+        return True
+    launches = _launches_install(entry, install)
+    check(label, launches, f"{path}: {' '.join(argv)}")
+    return launches
 
 
 def _drain(stream: Any) -> None:
@@ -316,6 +452,19 @@ def main() -> int:
         f"tools: {tool('get_status')}, {tool('search_code')}, {tool('symbol_lookup')}",
         flush=True,
     )
+
+    spec = _harness_plugin(agent)
+    if spec is not None and not _preflight_entry(spec, workspace, install, check):
+        print(
+            f"\nRESULT: FAIL (0/{len(checks)})\n"
+            f"the {spec.label} session will not start {SERVER_NAME!r}. "
+            f"Rewrite the entry with `uv run simple-code-indexer setup "
+            f"--harnesses {spec.name}`, restart the harness, and re-run.",
+            flush=True,
+        )
+        if args.json:
+            print(json.dumps({"pass": False, "checks": checks}, indent=2), flush=True)
+        return 1
 
     client = AcpClient([agent, *json.loads(args.agent_args)], workspace)
     exit_code = -1

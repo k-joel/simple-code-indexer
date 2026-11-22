@@ -151,6 +151,10 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ### Added
 
+- **`ref-docs/acp-test-process.md` and `ref-docs/mcp-test-process.md` now document the uv install
+  model**: tool environment via `uv tool dir`, the `<tool-env>/Scripts/pythonw.exe -m
+  simple_code_indexer serve` entry, editable vs wheel flavours from `uv-receipt.toml`, and
+  `simple-code-indexer install` instead of the deleted `setup.py --install-only` copy flow.
 - `.github/workflows/ci.yml`: lint/format/typecheck/test on Ubuntu and Windows, plus a `dist`
   job that builds the wheel and asserts the packaged templates and console script work.
 - **Local installs work before the first publish**: a source checkout is installed by path
@@ -256,6 +260,18 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ### Fixed
 
+- `tests/acp_probe.py` no longer passes on ambient harness config. OpenCode 2.2.5 ignores the
+  server the probe injects on `session/new`, so a passing run only ever proved that the
+  *configured* `simple-code-indexer` entry launched; with that entry missing it reported a
+  misleading 10/23 and the now-removed masking step broke the run outright. The probe reads the
+  configured entry through the harness plugin registry (global scope first, then the workspace)
+  and exits 1 before spawning the agent unless it launches the target tool environment with
+  `-m simple_code_indexer serve`, so a stale or absent entry fails fast with the
+  `setup --harnesses` remedy. `HarnessSpec` now exposes `root_key`, and `tests/test_acp_probe.py`
+  covers the preflight (ISS-017).
+- `simple-code-indexer install` no longer fails with `error: Executable already exists:
+  simple-code-indexer.exe` when a tool environment was removed but its entrypoint shim survived.
+  The shim counts as an existing install, so `uv tool install` is given `--force` (ISS-016).
 - The parent watchdog now recognizes an exited-but-unreaped harness on Linux. A killed
   harness that its parent has not yet reaped is a zombie, and `kill(pid, 0)` still succeeds
   for it, so the server could outlive its harness indefinitely; liveness now also reads the

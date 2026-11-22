@@ -1,8 +1,8 @@
 # MCP Integration Test Process
 
-A repeatable, end-to-end procedure for verifying that `simple-code-indexer` installs cleanly,
-is picked up by a real MCP harness, indexes a workspace, answers all three MCP tools, and
-shuts down with the session.
+A repeatable, end-to-end procedure for verifying that `simple-code-indexer` installs cleanly
+into a uv tool environment, is picked up by a real MCP harness, indexes a workspace, answers all
+three MCP tools, and shuts down with the session.
 
 **Log files:** `mode: embedded` writes `<workspace>/.simple-ci/log/embed.log`; the default
 sidecar mode writes `writer.log` (daemon) and `reader.log` (MCP servers). The commands below
@@ -12,7 +12,7 @@ It uses a **double handoff**:
 
 ```
 Primary agent (Command Code / any coding agent)
-  └─ Stage 1: install + verify from outside
+  └─ Stage 1: install the uv tool environment + verify from outside
   └─ Stage 2: write a handoff doc
         └─ Human restarts the harness, opens the workspace, gives the handoff to the
            Secondary agent (the LLM inside the harness)
@@ -27,6 +27,27 @@ To start a run, the human prompts the primary agent with:
 
 The primary agent owns §1–§5 and §7. The secondary agent only ever sees the handoff document
 (§9.1), which the primary agent fills in with run-specific facts.
+
+---
+
+## Install model (what the commands below assume)
+
+Everything here descends from [ADR-019](../docs/DECISIONS.md#adr-019-pypi-distribution-uv-tool-install-replaces-the-git-copy-install):
+
+| Piece | Value |
+|---|---|
+| Distribution unit | the wheel; `uv tool install` is the install mechanism |
+| Environment root | `uv tool dir` + `simple-code-indexer` (`%APPDATA%\uv\tools\...`, `~/Library/Application Support/uv/tools/...`, `$XDG_DATA_HOME/uv/tools/...`) |
+| Interpreter | `<tool-env>\Scripts\pythonw.exe` (Windows, windowless) / `<tool-env>/bin/python` (POSIX) |
+| Entry argv | `<interpreter> -m simple_code_indexer serve` |
+| Editable (default from a checkout) | `uv tool install --editable <checkout>` — a `.pth` links the working tree |
+| Wheel | `simple-code-indexer install --wheel` — a built snapshot in the same environment |
+| Ground truth for the flavour | `<tool-env>/uv-receipt.toml` (`editable = …` vs `directory = …`) |
+| Deleted by ADR-019 | `setup.py`, `run_server.py`, the `%APPDATA%\simple-code-indexer` copy, `SIMPLE_CI_GIT_PULL`, `setup.install_root` |
+
+Both flavours share one environment, so the harness entry path never changes; only the receipt
+records which is live. `simple-code-indexer status` reports `install_kind` after a full `setup`
+has recorded it.
 
 ---
 
@@ -54,7 +75,7 @@ The primary agent owns §1–§5 and §7. The secondary agent only ever sees the
 | Area | Verified by |
 |---|---|
 | One-command install, model download, Docker service | Stage 1 |
-| Installed copy/venv actually serves MCP | Stage 1 (SDK probe in a scratch workspace) |
+| The uv tool environment actually serves MCP | Stage 1 (SDK probe in a scratch workspace) |
 | Harness reads the entry **after a restart** and spawns the server | Stage 3 preflight |
 | Server indexes the harness's workspace (not home, not `C:\`) | Stage 3 `get_status.workspace` + counts |
 | All three tools over the MCP **stdio channel** | Stage 3 query suite |
@@ -63,7 +84,7 @@ The primary agent owns §1–§5 and §7. The secondary agent only ever sees the
 | Defects are captured for follow-up | Stage 4 (`docs/ISSUES.md`) |
 
 **Not covered:** protocol conformance against the spec, multi-client concurrency, Qdrant parity
-(use the FAISS default unless Qdrant is the target), and Windows service behaviour.
+(use the sqlite-vec default unless another backend is the target), and Windows service behaviour.
 
 The four *product* areas that most often fail are: harness entry path/schema, spawn working
 directory, vector readiness (rows vs embeddings), and shutdown when a harness keeps a
@@ -91,7 +112,7 @@ Rules:
 2. **The secondary agent must exercise the MCP tools exposed by the harness**, not import the
    handlers. Direct handler invocation is a diagnostic fallback only and must be labelled as
    such in the results.
-3. **The secondary agent never runs `setup.py`, `--uninstall`, or edits `~/.simple-ci/`.** It
+3. **The secondary agent never runs `setup`/`install`/`uninstall` or edits `~/.simple-ci/`.** It
    writes only under `artifacts/`.
 4. **One writer per workspace.** A stale server holds the lock and the new one exits with
    `another simple-code-indexer already owns`. Check the process list and log before blaming
@@ -100,6 +121,8 @@ Rules:
    proven later against those values.
 6. **A failed stage is a valid result.** Capture evidence and continue; do not rewrite the test
    to make it pass.
+7. **Know which flavour is installed.** Editable serves the working tree; wheel serves a built
+   snapshot. The entry path is identical, so only `uv-receipt.toml` distinguishes them.
 
 ---
 
@@ -113,13 +136,14 @@ Rules:
   `pi`).
   **Cline is not supported** — its builtin plugin was removed on 2026-11-08 after its settings
   file did not survive a restart.
-- **Clean slate?** Reinstalling or uninstalling is destructive. Confirm before:
-  - `python setup.py --uninstall --yes` (removes the install copy, config, services, models and
-    recorded MCP entries; add `--keep-models` to keep the GGUFs),
+- **Clean slate?** Reinstalling or uninstalling is destructive and machine-wide. Confirm before:
+  - `simple-code-indexer uninstall --yes` (removes the uv tool environment, config, services,
+    models and recorded MCP entries; add `--keep-models` to keep the GGUFs),
   - deleting `<workspace>/.simple-ci/` (the previous index).
 - **Embedding model**: default `--model embeddinggemma2` (768-dim, ~0.6 GB). Other catalog keys
   are in `src/simple_code_indexer/setup_wizard/catalog.py`.
-- **Vector store**: default `--vector-store faiss` (local file, no extra container).
+- **Vector store**: default sqlite-vec (vectors inside `index.db`, no extra container). `faiss`
+  writes a separate local file; `qdrant` needs a service.
 - **Target workspace**: normally the repository under test (the harness must open this folder).
 
 ### 3.2 Snapshot the baseline
@@ -128,17 +152,22 @@ Record, in the eventual report:
 
 - `git status --short`, `git log --oneline -3`, and whether `HEAD` matches `origin` (see §4.5);
 - the harness entry file content (or "absent");
-- `~/.simple-ci/config.yaml` (or "absent") and `%APPDATA%/simple-code-indexer` (or "absent");
-- `docker ps -a --filter name=simple-code-indexer`/`simple-ci-embed`;
+- `~/.simple-ci/config.yaml` (or "absent") and `(uv tool dir)\simple-code-indexer` (or "absent");
+- the installed flavour from `uv-receipt.toml` (or "absent");
+- `docker ps -a --filter name=simple-ci`/`llamacpp`;
 - whether `<workspace>/.simple-ci/` exists;
-- any `run_server.py` processes already running.
+- any `simple_code_indexer` processes already running.
 
 ```powershell
+$repo = (Get-Location).Path
+$envDir = Join-Path (uv tool dir) 'simple-code-indexer'
 git status --short
 Get-Content "$env:USERPROFILE\.simple-ci\config.yaml" -ErrorAction SilentlyContinue
-Test-Path "<workspace>\.simple-ci"
+Test-Path $envDir
+Get-Content (Join-Path $envDir 'uv-receipt.toml') -ErrorAction SilentlyContinue
+Test-Path "$repo\.simple-ci"
 Get-CimInstance Win32_Process |
-  Where-Object { $_.Name -in @('python.exe','pythonw.exe','uv.exe') -and $_.CommandLine -like '*run_server.py*' } |
+  Where-Object { $_.CommandLine -like '*simple_code_indexer*' } |
   Select-Object ProcessId, CreationDate, CommandLine
 ```
 
@@ -146,68 +175,78 @@ Get-CimInstance Win32_Process |
 
 ## 4. Stage 1 — install and verify from outside
 
-> This stage is not "run setup.py and hope". Every item in §4.3 must be observed before the
+> This stage is not "run the wizard and hope". Every item in §4.3 must be observed before the
 > handoff is written.
 
 ### 4.1 Dry run first
 
 ```powershell
-python setup.py --dry-run --yes --model embeddinggemma2 --vector-store faiss --harnesses <name>
+uv run simple-code-indexer setup --dry-run --yes --model embeddinggemma2 --vector-store sqlite-vec --harnesses <name>
 ```
 
-Confirm the four choices in the output: model, vector store, install target, harness entry path.
-`--yes` only answers prompts; explicit flags win.
+Confirm the four choices in the output: model, vector store, install flavour/target, harness entry
+path. `--yes` only answers prompts; explicit flags win. A dry run needs an already-installed tool
+environment (it cannot invent one), so run it after §4.2 on a re-run.
 
 ### 4.2 Real install
 
 ```powershell
-python setup.py --yes --model embeddinggemma2 --vector-store faiss --harnesses <name>
+uv run simple-code-indexer setup --yes --model embeddinggemma2 --vector-store sqlite-vec --harnesses <name>
 ```
+
+This is the whole install: it installs `uv` when missing, installs the checkout into the uv tool
+environment, provisions the embedding model/container when asked, probes the real embedding
+dimension, writes `~/.simple-ci/config.yaml`, and registers the harness entry. From a source
+checkout the install is **editable**, so later edits are live without reinstalling.
 
 If the model must download, run it in the background (see `NOTES.md` for the long-command cap)
 and capture the output to a file; the wizard prints its progress, it does not write a log file.
 
-**Then refresh the installed copy from the working tree — mandatory:**
+**Install step alone:** when you only need to (re)create the environment — for example after a
+`git pull`, or to repoint entries at it — run:
 
 ```powershell
-python setup.py --install-only
+uv run simple-code-indexer install
 ```
 
-The primary agent **must** run this after the last edit. `--install-only` copies the checkout
-(including uncommitted changes) to the install directory and exits; it preserves the installed
-`.git` and `.venv`, and it cannot be combined with `--model`, `--harnesses`, `--uninstall`, or the
-other wizard flags. Without it the harness may launch a stale copy and the run tests the wrong
-code. The full install above also copies the working tree, so re-running `--install-only` after
-every later edit is what keeps the test honest.
+`install` force-reinstalls the tool environment and rewrites every entry recorded in
+`~/.simple-ci/config.yaml`; it writes no config and touches no index. `install --wheel` builds and
+installs a real wheel into the **same** environment instead (the prod-validation switch) — the
+entry stays byte-identical.
 
-`--install-only` deliberately **does not sync the copy's `.venv`**. If `pyproject.toml` or
-`uv.lock` changed since the last full install, sync it before probing (this was a real failure:
-a stale copy raised `ModuleNotFoundError: pathspec` on the next launch):
+Verify the environment and its flavour:
 
 ```powershell
-uv sync --project "$env:APPDATA\simple-code-indexer"
+Select-String -Path (Join-Path $envDir 'uv-receipt.toml') -Pattern 'editable|directory'
+& (Join-Path $envDir 'Scripts\python.exe') -c "import simple_code_indexer, pathlib; print(pathlib.Path(simple_code_indexer.__file__).resolve())"
 ```
 
-The §4.3 import check below is what catches this; do not skip it.
+Expected for an editable checkout install: `editable = "<repo>"` and an import path under
+`<repo>\src\simple_code_indexer\`. A `directory = "<repo>"` line with a `site-packages` import
+path means a wheel is live — say so in the report, because the run then tests a snapshot.
 
 ### 4.3 External verification checklist
 
 | Check | Evidence |
 |---|---|
-| Global config | `~/.simple-ci/config.yaml` has `embedding.model`, `embedding.dim`, `vector_store`, a `service` block, and `setup.install_root`/`setup.harnesses` |
+| Global config | `~/.simple-ci/config.yaml` has `embedding.model`, `embedding.dim`, `vector_store`, a `service` block when one was provisioned, and `setup.install_kind`/`setup.tool_env`/`setup.harnesses` |
+| Tool environment | `Join-Path (uv tool dir) 'simple-code-indexer'` exists with `Scripts\pythonw.exe` (Windows) or `bin/python` (POSIX) |
+| Flavour | `uv-receipt.toml` says `editable = "<repo>"`; the interpreter imports the tree rather than a copy |
 | Container | `docker ps` shows the embed container `Up` with the published port; `docker logs <container>` contains `listening on http://0.0.0.0:8080` (the tail is request logs once it has served) |
 | Endpoint | `uv run python tests/service_probe.py` → `embeddings OK dim=... model=...` and `PROBE OK` |
-| Install copy | `%APPDATA%\simple-code-indexer` exists with `.venv`; `--install-only` ran after the last edit and a spot-checked changed file matches the checkout |
-| Tools | the installed venv reports exactly `search_code`, `symbol_lookup`, `get_status` |
-| Harness entry | matches the harness schema: `command` + `args` for most JSON clients, or one `command` array for OpenCode; the launcher is `uv run --project <install> --no-sync python <install>/run_server.py` on POSIX and `<install>/.venv/Scripts/pythonw.exe <install>/run_server.py` on Windows (no console window); **no workspace data** — no `WORKSPACE_ROOT`, `cwd`, `INDEX_DB`, or `FAISS_PATH` (ADR-015) |
+| Tools | the tool environment reports exactly `search_code`, `symbol_lookup`, `get_status` |
+| Harness entry | matches the harness schema: `command` + `args` for most JSON clients, or one `command` array for OpenCode; the launcher is `<tool-env>\Scripts\pythonw.exe -m simple_code_indexer serve` on Windows (no console window) and `<tool-env>/bin/python -m simple_code_indexer serve` on POSIX; **no workspace data** — no `WORKSPACE_ROOT`, `cwd`, `INDEX_DB`, or `FAISS_PATH` (ADR-015) |
 | Workspace untouched | `<workspace>/.simple-ci` does **not** exist yet |
 
 ```powershell
-# installed environment imports the server and FAISS, and exposes the three tools
+# the installed environment imports the server and the default vector store, and exposes three tools
 cd $env:TEMP
-uv run --project "$env:APPDATA\simple-code-indexer" --no-sync python -c `
-  "import simple_code_indexer.server as s, faiss; print([t.name for t in s._TOOLS]); print(faiss.__version__)"
+& (Join-Path $envDir 'Scripts\python.exe') -c `
+  "import simple_code_indexer.server as s, sqlite_vec; print([t.name for t in s._TOOLS]); print(sqlite_vec.__version__ if hasattr(sqlite_vec,'__version__') else 'sqlite_vec loaded')"
 ```
+
+For `vector_store: faiss`, swap the import for `faiss`; for `qdrant`, the client is the
+`qdrant-client` dependency.
 
 ### 4.4 Confirm the workspace is inferred, never pinned
 
@@ -222,33 +261,24 @@ the harness spawns stdio servers from somewhere else; fix that in the harness (o
 
 **Debugging exception:** a temporary pin is allowed while diagnosing, and **must be removed
 before the session ends.** Remove the `env`/`environment`/`envs` key (and any `cwd`) you added,
-or simply re-run `python setup.py --harnesses <name>`, which always writes the clean entry.
+or simply re-run `simple-code-indexer setup --harnesses <name>`, which always writes the clean
+entry.
 
-`SIMPLE_CI_GIT_PULL=0` is a machine-scoped debugging toggle rather than project data, but it is
-also temporary: drop it when the session's testing is finished. Do not hand-edit it into the
-entries — run `python setup.py --install-only --no-git-pull`, which refreshes the installed copy
-and writes the pin into every recorded entry in one step (re-running `python setup.py --harnesses
-<name>` without it writes the clean entry back).
+### 4.5 Make sure you test the working tree, not the published wheel
 
-### 4.5 Make sure you test the working tree, not upstream
-
-`run_server.py` runs `git pull --ff-only --autostash --quiet` inside the **installed copy** before
-importing the server (fail-soft, 20 s). If upstream has moved, the secondary session tests
-upstream, not the checkout; `--autostash` can also park uncommitted edits in a stash if the pull
-conflicts. Since §4.2 refreshed the copy from the working tree, pin that snapshot.
+There is no launcher-time `git pull` any more: the environment serves whatever the install linked.
+An editable install follows the working tree (uncommitted edits included), so what you edited is
+what runs — but only after `uv run simple-code-indexer install` has linked the checkout and the
+harness has restarted.
 
 ```powershell
 git rev-parse HEAD
 git ls-remote origin refs/heads/master
 ```
 
-If they differ, or the checkout has uncommitted changes, pick one:
-
-- accept it and say so in the report ("tested upstream `<sha>`"), or
-- run `python setup.py --install-only --no-git-pull`, which refreshes the install from the
-  working tree and writes `SIMPLE_CI_GIT_PULL=0` into every recorded harness entry (no
-  hand-editing: `env` for most JSON clients, `environment` for OpenCode, `envs` for Goose), and
-  test the installed snapshot.
+If the checkout has uncommitted changes, say so in the report ("tested the working tree at
+`<sha>` + local edits"). If you deliberately installed a wheel, the report must say "tested the
+built wheel at `<sha>`" instead, because the environment no longer follows your edits.
 
 ### 4.6 Prove the server works before blaming the harness
 
@@ -285,7 +315,7 @@ that is a logging gap: add the missing log line before writing the handoff.
 ### 4.7 Record the installed entry
 
 Paste the entry JSON verbatim into the handoff and the final report. Note the exact path, the
-command, and any env additions.
+command, the `SIMPLE_CI_HARNESS` marker, and whether the environment is editable or wheel.
 
 ---
 
@@ -293,8 +323,8 @@ command, and any env additions.
 
 Create `artifacts/mcp-handoff.md` from the template in §9.1. It must contain:
 
-1. **Facts table** — workspace, config path, install copy, model/endpoint/dim, vector store,
-   entry path, expected indexable file count, index/vector/log paths.
+1. **Facts table** — workspace, config path, tool environment + flavour, model/endpoint/dim,
+   vector store, entry path, expected indexable file count, index/log paths.
 2. **Pre-verified baseline** — the result of §4.6, so a harness failure is not mistaken for a
    server failure.
 3. **Preflight** — confirm the server is listed/connected in the harness UI; confirm the three
@@ -348,12 +378,12 @@ observed immediately before writing results. For OpenCode, quit the UI **and** r
 The secondary agent follows the handoff. Order matters:
 
 1. **Preflight:** server listed and connected; exactly three tools; record PID + start time.
-   - One launch can appear as several processes: on Windows the venv `pythonw.exe` → the base
-     `pythonw.exe`; on POSIX `uv.exe` → the venv `python.exe` trampoline → the base interpreter.
-     The sidecar daemon is the exception: it is spawned as `sys._base_executable` with the
-     reader's `sys.path` (ISS-016), so it has no launcher parent. Count *server instances* by the
-     `index.db` lock / parent chain, not by a raw `python.exe` count, and include `pythonw.exe` in
-     the filter.
+   - One launch can appear as several processes: on Windows the tool environment's `pythonw.exe`
+     is a redirector that re-executes the base `pythonw.exe`; on POSIX `uv`-style trampolines can
+     add a layer. The sidecar daemon is the exception: it is spawned as the base interpreter with
+     the reader's `sys.path` (`sidecar.client._daemon_command`), so it has no launcher parent.
+     Count *server instances* by the `index.db` lock / parent chain, not by a raw interpreter
+     count, and include `pythonw.exe` in the filter.
 2. **`get_status`:** paste the full JSON; stop if `workspace` is wrong.
 3. **Index the workspace:** poll until counts are stable; record the timeline and
    `pending_embeddings`/`vectors_indexed`. Do not rely on `vector_store_ok` alone for vector
@@ -379,11 +409,12 @@ The secondary agent follows the handoff. Order matters:
 Compare the recorded PID/start time with the live process list, then read the log tail:
 
 ```powershell
+$repo = (Get-Location).Path
 Get-CimInstance Win32_Process |
-  Where-Object { $_.Name -in @('python.exe','pythonw.exe','uv.exe') -and $_.CommandLine -like '*run_server.py*' } |
+  Where-Object { $_.CommandLine -like '*simple_code_indexer*' } |
   Select-Object ProcessId, ParentProcessId, CreationDate, CommandLine
-Get-Content "<workspace>\.simple-ci\log\reader.log" -Tail 40   # sidecar (default)
-Get-Content "<workspace>\.simple-ci\log\embed.log" -Tail 40    # mode: embedded
+Get-Content "$repo\.simple-ci\log\reader.log" -Tail 40   # sidecar (default)
+Get-Content "$repo\.simple-ci\log\embed.log" -Tail 40    # mode: embedded
 ```
 
 - **Pass:** the recorded PID is gone and the **current session slice** of the log (from its
@@ -432,13 +463,15 @@ servers; direct invocation is not an MCP-channel test).
 
 ### 7.5 Cleanup (ask first)
 
-- Leave installed for daily use, **or** `python setup.py --uninstall --yes` (`--keep-models` to
-  keep GGUFs). Uninstall never touches workspace `.simple-ci/` indexes.
+- Leave the tool environment installed for daily use, **or** `simple-code-indexer uninstall --yes`
+  (`--keep-models` to keep the GGUFs). Uninstall is record-driven: it removes the uv tool
+  environment, the config, generated compose files, downloaded models and the recorded MCP
+  entries, and never touches workspace `.simple-ci/` indexes.
 - Stop the embedding container if the test should not leave it running.
-- Remove any debugging `WORKSPACE_ROOT`/`cwd`/`SIMPLE_CI_GIT_PULL` additions so the entries go
-  back to the stock, workspace-free form (ADR-015). Re-running `python setup.py --harnesses <name>`
-  does it in one step (without `--no-git-pull`); verify with `get_status.workspace` in a fresh
-  session.
+- Remove any debugging `WORKSPACE_ROOT`/`cwd` additions so the entries go back to the stock,
+  workspace-free form (ADR-015). Re-running `simple-code-indexer setup --harnesses <name>`
+  does it in one step; verify with `get_status.workspace` in a fresh session.
+- If you installed a wheel, restore the editable link with `uv run simple-code-indexer install`.
 - If code changed: `uv run ruff check .` → `uv run pyright` → `uv run pytest` (see `NOTES.md`
   for the writable `--basetemp` on this host).
 
@@ -449,14 +482,16 @@ servers; direct invocation is not an MCP-channel test).
 | Symptom | Likely cause | Action |
 |---|---|---|
 | Server absent from the harness after restart | entry path/schema wrong; harness overwrote or deleted the file; restart not done | read the entry file, validate JSON, check the harness MCP log, restart once, add an issue |
+| Entry launches nothing | `<tool-env>\Scripts\pythonw.exe` missing — the tool environment was never installed, or `uv tool uninstall` ran | `uv run simple-code-indexer install`, then re-check `uv tool dir` |
+| Edits are not live in a harness session | a wheel flavour is installed, or the session predates the reinstall | read `uv-receipt.toml`; run `simple-code-indexer install`; restart the harness |
 | Server starts then exits immediately | home workspace rejected, bad config YAML, lock held | read the active log (`reader.log`/`writer.log` in sidecar, `embed.log` in embedded); look for `another simple-code-indexer already owns` or a config error |
 | `get_status.workspace` is not the target | harness spawns with another cwd | fix the harness spawn cwd (or its config scope); a temporary `WORKSPACE_ROOT` is for debugging only and must be removed (ADR-015) |
 | `files_indexed`/`chunks_indexed` stay 0 | workspace wrong, walk pruned everything, or a database error | compare `get_status.workspace` with the target; check the `sweep:` line and `failed to index`/tracebacks in the session log |
 | `chunks_indexed` climbs but `pending_embeddings` never falls | embedding endpoint down or wrong model/dim | `tests/service_probe.py`, container logs, `embed_ok`/`embedding failed` lines |
-| Semantic query returns 0 hits | vectors still being written, or empty index | check `pending_embeddings` and the `faiss search: ntotal=` line; wait 10–15 s and retry once |
+| Semantic query returns 0 hits | vectors still being written, or empty index | check `pending_embeddings` and the vector-store line; for sqlite-vec verify `vectors_indexed` matches `vec_chunks`; wait 10–15 s and retry once |
 | A tool call hangs and the log's last line is an INFO record | harness is not draining the server's stderr pipe | record it; the server blocks in a log write on the serve thread. Keep the stderr-drain rule in `NOTES.md` |
 | Server survives closing the harness | check the server's `parent watchdog: watching` line: if the UI is absent, the service was started detached **or reused from an earlier UI** (the new UI is a sibling) | record the parent, stop the service/tree with consent; file a lifecycle issue only when the UI **was** in the watched list |
-| Several processes per session | Windows: venv `pythonw.exe` → base `pythonw.exe`; POSIX: `uv.exe` → venv `python.exe` trampoline → base interpreter | count server instances by the `index.db` lock, not processes; include `pythonw.exe` in the filter |
+| Several processes per session | Windows: tool-env `pythonw.exe` → base `pythonw.exe`; POSIX: trampoline → base interpreter | count server instances by the `index.db` lock, not processes; include `pythonw.exe` in the filter |
 | One expected file missing from top-3 | retrieval quality | record FAIL with hits/scores; file an issue; do not retry the same query endlessly |
 
 ---
@@ -469,7 +504,7 @@ servers; direct invocation is not an MCP-channel test).
 # Stage 2 handoff — MCP integration test (<harness>, <date>)
 
 Audience: the LLM running in <harness> with <workspace> open.
-Do not run setup.py/uninstall, edit ~/.simple-ci, delete .simple-ci, or kill the server.
+Do not run setup/install/uninstall, edit ~/.simple-ci, delete .simple-ci, or kill the server.
 Write only under artifacts/.
 
 ## Facts
@@ -477,12 +512,14 @@ Write only under artifacts/.
 |---|---|
 | Workspace | <abs path> |
 | Config | <~/.simple-ci/config.yaml> |
-| Install copy | <%APPDATA%/simple-code-indexer> |
+| Tool environment | <(uv tool dir)\simple-code-indexer> |
+| Install flavour | editable (`editable = "<repo>"`) / wheel (`directory = "<repo>"`) |
+| Launcher | <tool-env>\Scripts\pythonw.exe -m simple_code_indexer serve |
 | Embedding | <url> / <model> / <dim> |
-| Vector store | <faiss|qdrant> |
+| Vector store | <sqlite-vec|faiss|qdrant> |
 | Entry | <path>, key/dotted path <name> |
 | Indexable files (expected) | <N> |
-| Index / vectors / log | <.simple-ci/...> |
+| Index / log | <.simple-ci/...> |
 
 ## Pre-verified baseline (outside the harness)
 <result of the SDK probe; note the clean shutdown evidence>
@@ -491,7 +528,8 @@ Write only under artifacts/.
 1. Server listed/connected; screen text: ___
 2. Tools: search_code, symbol_lookup, get_status
 3. Powershell: Get-CimInstance ... -> record ProcessId + CreationDate
-   (Windows: venv pythonw.exe -> base pythonw.exe; POSIX: uv.exe -> venv trampoline -> base interpreter)
+   (Windows: tool-env pythonw.exe -> base pythonw.exe; the sidecar daemon is the base
+    interpreter with a sys.path bootstrap)
 
 ## Baseline get_status
 <paste full JSON; assertions: workspace, vector_store, vector_index, config_files, log_file>
@@ -540,8 +578,8 @@ further MCP calls.
 - Shutdown evidence recorded: YES/NO (PID + start time)
 
 ## Environment
-(server status, tool list, PID/CreationDate, baseline+final get_status JSON; mark fields that
- came from direct handler invocation)
+(tool environment + flavour, server status, tool list, PID/CreationDate, baseline+final
+ get_status JSON; mark fields that came from direct handler invocation)
 
 ## Indexing timeline
 | t | files | symbols | chunks | notes |
@@ -550,7 +588,7 @@ further MCP calls.
 | id | tool | query | #hits | top-3 file:line + score | PASS/FAIL | notes |
 
 ## Log evidence
-(session slice: startup lines, lock, serving, sweep summary, tool= lines, semantic/FAISS lines,
+(session slice: startup lines, lock, serving, sweep summary, tool= lines, semantic/vector lines,
 watchdog line, errors)
 
 ## Artifacts
@@ -565,7 +603,7 @@ watchdog line, errors)
 ```markdown
 # End-to-end MCP test — final report (<date>)
 ## Verdict per stage (install / pickup / indexing / retrieval / shutdown)
-## Install evidence
+## Install evidence (uv tool dir, uv-receipt.toml flavour, service probe)
 ## Indexing evidence (counts, elapsed, sizes, log)
 ## Retrieval results (table; expectations vs hits)
 ## Shutdown evidence (PIDs, log lines, cleanup)
@@ -579,10 +617,11 @@ watchdog line, errors)
 ## 10. Definition of done
 
 - [ ] Dry run and real install completed with explicit model/store/harness flags.
-- [ ] `python setup.py --install-only` ran after the last edit; the installed copy matches the
-      working tree (uncommitted changes included).
-- [ ] §4.3 checklist observed and recorded (config, container, probe, install copy, entry).
-- [ ] §4.5 upstream check done; `SIMPLE_CI_GIT_PULL=0` used if testing the working tree.
+- [ ] The uv tool environment exists; `uv-receipt.toml` shows `editable = "<repo>"` (or the
+      report states that a wheel was tested).
+- [ ] `simple-code-indexer install` ran after the last edit when a wheel flavour was in use.
+- [ ] §4.3 checklist observed and recorded (config, tool environment, container, probe, entry).
+- [ ] §4.5 provenance check done: the report names the commit (and local edits) or the built wheel.
 - [ ] §4.6 comprehensive SDK probe passed in a scratch workspace: indexing, ignored/disallowed
       paths, query edge cases, watch create/modify/delete, lock refusal, and clean shutdown.
 - [ ] Log contract asserted from the session slice; any missing evidence added as logging.
@@ -610,7 +649,7 @@ with an equivalent suite for another target repo.
 | S1 | semantic | how does the indexer avoid walking into virtualenv and cache directories | `src/simple_code_indexer/indexer.py` (regression probe for the 30-line chunker; must PASS now) |
 | S2 | semantic | prevent two indexer servers from writing to the same workspace at once | `workspace_lock.py` or `server.py` |
 | S3 | semantic | merge Codex TOML config using marker comments so user comments survive | `harnesses/_toml.py` |
-| S4 | semantic | allocate monotonic FAISS label ids so ids are never reused | `db.py` or `faiss_store.py` |
+| S4 | semantic | allocate monotonic vector labels so ids are never reused | `db.py` or `sqlite_vec_store.py` / `faiss_store.py` |
 | S5 | semantic | stop the server when the launching harness process dies while stdin stays open | `parent_watch.py` or `server.py` |
 | Y1 | symbol | `iter_workspace_files` | `indexer.py` |
 | Y2 | symbol | `WorkspaceLock` | `workspace_lock.py` (~line 30) |
@@ -626,7 +665,7 @@ Edge suite (same workspace, run through the harness where possible):
 | E2 | lexical | punctuation/operators only (`AND OR " (*)`) | no error; zero or sane hits (tokens are stripped) |
 | E3 | lexical | `iter_workspace_files` with `limit: 0` | at most 1 hit (clamped to 1) |
 | E4 | lexical | `iter_workspace_files` with `limit: 1000` | at most 50 hits (clamped to 50) |
-| E5 | symbol | empty string | **ISS-8:** `found: true` with every symbol; record the count, not a failure |
+| E5 | symbol | empty string | `found: false`, `matches: []` (empty names are rejected) |
 | E6 | symbol | `iter_workspace` | prefix `LIKE` fallback returns `iter_workspace_files` |
 | E7 | symbol | `main` | `found: true` `matches` envelope with several files |
 | E8 | semantic | empty string | `hits: []`, no embed call |
@@ -659,15 +698,18 @@ uv run python -c "from simple_code_indexer.config import load_settings; from sim
 
 ```powershell
 Get-CimInstance Win32_Process -Filter "name='python.exe' or name='pythonw.exe'" |
-  Where-Object { $_.CommandLine -like '*run_server.py*' } |
+  Where-Object { $_.CommandLine -like '*simple_code_indexer*' } |
   Select-Object ProcessId, ParentProcessId, CreationDate, CommandLine | Format-List
+
+$envDir = Join-Path (uv tool dir) 'simple-code-indexer'
+Get-Content (Join-Path $envDir 'uv-receipt.toml')
 
 Get-ChildItem "<workspace>\.simple-ci" -Recurse | Select-Object FullName, Length
 Get-Content "<workspace>\.simple-ci\log\reader.log" -Tail 120   # sidecar (default)
 Get-Content "<workspace>\.simple-ci\log\embed.log" -Tail 120    # mode: embedded
 ```
 
-POSIX equivalent: `ps -eo pid,ppid,lstart,args | grep run_server.py`, `ls -la .simple-ci`,
+POSIX equivalent: `ps -eo pid,ppid,lstart,args | grep simple_code_indexer`, `ls -la .simple-ci`,
 `tail -n 120 .simple-ci/log/reader.log` (or `embed.log` in embedded mode).
 
 ### B.2 External SDK probe (primary agent, scratch workspace)
@@ -677,16 +719,14 @@ import anyio
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-INSTALL = r"C:\Users\<you>\AppData\Roaming\simple-code-indexer"
+# `uv tool dir` + simple-code-indexer; scripts/ on Windows, bin/ elsewhere.
+TOOL_ENV = r"C:\Users\<you>\AppData\Roaming\uv\tools\simple-code-indexer"
 params = StdioServerParameters(
-    # Windows entry: the venv's GUI-subsystem interpreter, so no console window opens.
-    command=INSTALL + r"\.venv\Scripts\pythonw.exe",
-    args=[INSTALL + r"\run_server.py"],
-    env={
-        # cwd alone selects the workspace; WORKSPACE_ROOT is only a debugging override
-        # and must never be written into a harness entry (ADR-015).
-        "SIMPLE_CI_GIT_PULL": "0",  # test the installed working-tree snapshot
-    },
+    # Windows entry: the environment's GUI-subsystem interpreter, so no console window opens.
+    command=TOOL_ENV + r"\Scripts\pythonw.exe",
+    args=["-m", "simple_code_indexer", "serve"],
+    # cwd alone selects the workspace; WORKSPACE_ROOT is only a debugging override
+    # and must never be written into a harness entry (ADR-015).
     cwd=r"<scratch workspace>",
 )
 
@@ -712,8 +752,8 @@ it (`tests/mcp_probe.py` does the latter on a thread).
 Check `docs/ISSUES.md` before starting. As of 2026-11-11 the earlier ISS entries (including
 ISS-10) are fixed and removed. Keep these fixed cases in the check suite as regressions:
 
-- **ISS-8 (fixed)** — `symbol_lookup` with an empty symbol must return no matches; record the
-  count in the edge suite (E5).
+- **ISS-8 (fixed)** — `symbol_lookup` with an empty symbol must return no matches; record it in
+  the edge suite (E5).
 - **ISS-9 (fixed)** — the watcher must not log its own active-log-file writes; an idle server must
   not grow its log continuously. Check for it in the watch/logging step.
 

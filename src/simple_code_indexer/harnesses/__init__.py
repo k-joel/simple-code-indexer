@@ -75,6 +75,7 @@ class HarnessSpec:
     global_configs: tuple[str, ...]
     local_configs: tuple[str, ...]
     format: str
+    root_key: str | None
     entry: EntryFn
     render: RenderFn
     remove: RemoveFn
@@ -329,6 +330,11 @@ def _spec_from_module(module: ModuleType, path: Path) -> HarnessSpec | None:
         global_configs=global_configs,
         local_configs=local_configs,
         format=fmt,
+        root_key=(
+            module.ROOT_KEY
+            if isinstance(getattr(module, "ROOT_KEY", None), str)
+            else None
+        ),
         entry=resolved_entry,
         render=resolved_render,
         remove=resolved_remove,

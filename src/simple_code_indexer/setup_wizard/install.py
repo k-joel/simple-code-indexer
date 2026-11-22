@@ -53,6 +53,32 @@ def tool_env_root(runner: Runner) -> Path | None:
     return root if root.is_dir() else None
 
 
+def tool_bin_dir(runner: Runner) -> Path | None:
+    """``uv tool dir --bin``; None when uv cannot report it."""
+    uv = runner.which("uv") or "uv"
+    result: CommandResult = runner.run([uv, "tool", "dir", "--bin"])
+    if result.returncode != 0:
+        return None
+    reported = result.stdout.strip().splitlines()
+    if not reported:
+        return None
+    return Path(reported[0].strip()).expanduser()
+
+
+def entrypoint_present(runner: Runner) -> bool:
+    """Whether the tool's launch shim is still in ``uv tool dir --bin``.
+
+    An environment can be deleted by hand (or by a failed uninstall) while its
+    entrypoint survives. ``uv tool list`` and ``tool_env_root`` both report
+    "not installed" in that state, yet uv refuses to write over the shim
+    without ``--force``, so installs must treat it as an existing tool.
+    """
+    bin_dir = tool_bin_dir(runner)
+    if bin_dir is None or not bin_dir.is_dir():
+        return False
+    return any(entry.stem == TOOL_NAME for entry in bin_dir.iterdir())
+
+
 def ensure_uv(runner: Runner, *, output) -> str | None:
     """Find `uv`, installing it from astral.sh when missing.
 
@@ -112,7 +138,9 @@ def ensure_tool(
 
     An existing environment is always force-reinstalled: that is what lets the
     *same* environment flip between an editable link and a built wheel without
-    touching the entry path the harnesses recorded.
+    touching the entry path the harnesses recorded. A surviving entrypoint shim
+    counts as existing too, because uv refuses to overwrite it without
+    ``--force`` even when the environment itself is gone.
 
     ``--refresh`` applies to wheel installs only. It busts uv's local-build
     cache, which is keyed on ``pyproject.toml``/``setup.py``/``setup.cfg`` and
@@ -122,12 +150,12 @@ def ensure_tool(
     """
     uv = runner.which("uv") or "uv"
     argv = [uv, "tool", "install"]
-    existing = tool_env_root(runner) is not None
+    env_present = tool_env_root(runner) is not None
     if editable:
         argv.append("--editable")
-    if existing:
+    if env_present or entrypoint_present(runner):
         argv.append("--force")
-    if existing and not editable:
+    if env_present and not editable:
         argv.append("--refresh")
     argv.append(spec)
     output(f"Installing {spec} with uv tool ...")

@@ -732,7 +732,10 @@ install — where no checkout exists — pins `simple-code-indexer==<version>`. 
 path is handed to `uv tool install` with or without `--editable`: editable (the
 default) links the working tree, a wheel build (`--wheel`) installs a copy. Both
 land in the same environment root, so the harness entry is identical and only
-`uv-receipt.toml` records which flavour is live.
+`uv-receipt.toml` records which flavour is live. A reinstall always passes
+`--force`: `install.tool_env_root()` covers a live environment, and
+`install.entrypoint_present()` covers a shim in `uv tool dir --bin` that
+outlived a deleted environment, which uv refuses to overwrite otherwise.
 
 Per workspace (gitignore `.simple-ci/`):
 
@@ -1172,7 +1175,10 @@ A harness plugin is a plain module loaded from `src/simple_code_indexer/harnesse
 `<repo>/harnesses/`, or `<workspace>/harnesses/`; a user plugin overrides a builtin by `NAME`. It
 declares `NAME`, `LABEL`, detection dirs/binaries, global config paths, format
 (`json`, `toml`, or `yaml`), the config root key, and optional
-`entry`/`render`/`remove` callables. A plugin may also implement
+`entry`/`render`/`remove` callables. `HarnessSpec` exposes those as data
+(`candidates`, `root_key`, `format`), so config readers outside the wizard — the ACP
+probe's configured-entry preflight — resolve paths and entries from the same table
+instead of hardcoding a harness's layout. A plugin may also implement
 `resolve_workspace(cwd) -> Path | None`; it must then put
 `SIMPLE_CI_HARNESS=<NAME>` into its entry env (the reserved `RUNTIME_ENV` key),
 which is how the server knows which single plugin to ask at runtime. That key is
@@ -1473,6 +1479,7 @@ writes harness entries, config, compose files, and model downloads.
 | Integration | `test_indexer` (tmp workspace, stubbed embeddings), `test_watcher` (real events), `test_runtime`, multi-workspace isolation (FAISS + embedding endpoint) |
 | Sidecar | protocol validation, lease registry, reader client, daemon lifecycle, MCP over a real daemon; tests kill spawned daemons by the pid in `daemon.json` in `finally` |
 | Stdio contract | `tests/mcp_client.py` is a reusable client with drained stderr and step deadlines; `mcp_probe.py` checks initialize/tools/list/tool shapes |
+| ACP contract | `tests/acp_probe.py` drives a real ACP harness over stdio; it first requires the harness's configured entry to launch the target tool environment (OpenCode ignores per-session injection), then asserts tool payloads and shutdown |
 | Live probes | `service_probe.py` (embedding dimension + optional Qdrant), `live_watch_probe.py` (create a file, find it via MCP) |
 | Retrieval benchmarks | `retrieval_bench.py` scores a golden query set; `bench_matrix.py` runs model/backend combinations in isolated scratch directories |
 

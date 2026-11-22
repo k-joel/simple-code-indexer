@@ -14,6 +14,7 @@ class FakeRunner(Runner):
         self.uv = uv
         self.calls: list[list[str]] = []
         self.tool_dir = "/tools"
+        self.tool_bin = "/tools/bin"
         self.result = CommandResult(0)
         self.responses: dict[tuple[str, ...], CommandResult] = {}
         self.creates_tool_env = False
@@ -32,6 +33,8 @@ class FakeRunner(Runner):
         for key, result in self.responses.items():
             if tuple(argv[: len(key)]) == key:
                 return result
+        if argv[1:4] == ["tool", "dir", "--bin"]:
+            return CommandResult(0, self.tool_bin + "\n")
         if argv[1:3] == ["tool", "dir"]:
             return CommandResult(0, self.tool_dir + "\n")
         if argv[1:3] == ["tool", "install"] and self.creates_tool_env:
@@ -201,6 +204,95 @@ def test_ensure_tool_refreshes_a_wheel_reinstall_when_present(
         "--refresh",
         "simple-code-indexer==1.2.3",
     ] in runner.calls
+
+
+def test_ensure_tool_forces_an_install_past_an_orphan_entrypoint(
+    tmp_path: Path,
+) -> None:
+    """ISS-016: a shim can outlive its environment, so the env alone is not proof."""
+    runner = FakeRunner()
+    runner.tool_dir = str(tmp_path / "tools")
+    runner.tool_bin = str(tmp_path / "bin")
+    runner.creates_tool_env = True
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir(parents=True)
+    (shim_dir / f"{install.TOOL_NAME}.exe").write_bytes(b"stale")
+
+    install.ensure_tool(
+        runner,
+        spec=str(tmp_path),
+        editable=True,
+        output=lambda _: None,
+    )
+
+    assert [
+        "/uv",
+        "tool",
+        "install",
+        "--editable",
+        "--force",
+        str(tmp_path),
+    ] in runner.calls
+
+
+def test_ensure_tool_skips_refresh_when_only_the_orphan_entrypoint_exists(
+    tmp_path: Path,
+) -> None:
+    """The shim path forces; it must not invent a cache to refresh."""
+    runner = FakeRunner()
+    runner.tool_dir = str(tmp_path / "tools")
+    runner.tool_bin = str(tmp_path / "bin")
+    runner.creates_tool_env = True
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir(parents=True)
+    (shim_dir / f"{install.TOOL_NAME}.exe").write_bytes(b"stale")
+
+    install.ensure_tool(
+        runner,
+        spec="simple-code-indexer==1.2.3",
+        editable=False,
+        output=lambda _: None,
+    )
+
+    assert [
+        "/uv",
+        "tool",
+        "install",
+        "--force",
+        "simple-code-indexer==1.2.3",
+    ] in runner.calls
+
+
+def test_ensure_tool_omits_force_for_a_first_install(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    runner.tool_dir = str(tmp_path / "tools")
+    runner.tool_bin = str(tmp_path / "bin")
+    runner.creates_tool_env = True
+
+    install.ensure_tool(
+        runner,
+        spec=str(tmp_path),
+        editable=True,
+        output=lambda _: None,
+    )
+
+    assert ["/uv", "tool", "install", "--editable", str(tmp_path)] in runner.calls
+
+
+def test_entrypoint_present_ignores_a_missing_bin_dir(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    runner.tool_bin = str(tmp_path / "no-such-bin")
+
+    assert install.entrypoint_present(runner) is False
+
+
+def test_entrypoint_present_ignores_other_executables(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    runner.tool_bin = str(tmp_path / "bin")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / f"{install.TOOL_NAME}-other.exe").write_bytes(b"x")
+
+    assert install.entrypoint_present(runner) is False
 
 
 def test_ensure_tool_raises_when_uv_fails() -> None:

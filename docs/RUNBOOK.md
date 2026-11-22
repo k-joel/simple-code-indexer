@@ -499,6 +499,7 @@ Installs this checkout as a **uv tool** and links it, so the harnesses you alrea
 
 - **`No source checkout found; installing the published wheel.`**: nothing to link, so this run silently took the wheel path. If you meant dev, pass `--repo-root <repo>`.
 - **`uv tool install failed for <spec>`**: uv printed the build log above the error. Fix the build first; the resolver is usually a `pyproject.toml`/`uv.lock` mismatch.
+- **`error: Executable already exists: simple-code-indexer.exe (use --force to overwrite)`**: a previous environment was removed but its shim survived in `uv tool dir --bin`, so `uv tool list` says "No tools installed". `install` detects the shim and passes `--force` by itself; if you hit this from a raw `uv tool install`, delete the leftover shim (or add `--force`) and re-run step 2.
 - **Edits still not visible**: the harness is running the previous process. Restart it, then re-check step 4.
 - **`ImportError`/`ModuleNotFoundError` after deleting or moving the checkout**: this flavour cannot survive losing its tree by design. Re-clone and repeat step 2, or switch to RUN-011.
 

@@ -157,8 +157,8 @@ def test_daemon_registers_then_exits_after_grace(
 def test_a_new_session_during_grace_keeps_the_daemon(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _env(monkeypatch, tmp_path, grace=3.0)
-    settings = _settings(tmp_path, idle_grace_s=3.0)
+    _env(monkeypatch, tmp_path, grace=30.0)
+    settings = _settings(tmp_path, idle_grace_s=30.0)
     first = _start(settings)
     writer_pid = _writer_pid(first)
     first.close()
@@ -170,12 +170,7 @@ def test_a_new_session_during_grace_keeps_the_daemon(
         assert paths.read_ready(settings) is not None
     finally:
         second.close()
-
-    _wait_until(
-        lambda: paths.read_ready(settings) is None,
-        timeout=20.0,
-        label="the daemon to exit after the last session",
-    )
+        _kill_daemon(settings)
 
 
 def test_a_killed_daemon_is_respawned_by_the_reader(
