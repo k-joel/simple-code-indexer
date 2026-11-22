@@ -180,12 +180,14 @@ def _prompt(
     return value
 
 
-def resolve_workspace_root(mcp_workspace: Path | None = None) -> tuple[Path, str]:
-    """WORKSPACE_ROOT > MCP roots > harness-published workspace > process cwd.
+def resolve_workspace_root(
+    mcp_workspace: Path | None = None, cli_workspace: Path | None = None
+) -> tuple[Path, str]:
+    """WORKSPACE_ROOT > --workspace > MCP roots > harness workspace > cwd.
 
-    Returns the workspace and its source — ``env``, ``roots``,
+    Returns the workspace and its source — ``env``, ``arg``, ``roots``,
     ``harness:<name>`` or ``cwd`` — so the choice is observable through
-    ``get_status.workspace_source`` (ADR-018).
+    ``get_status.workspace_source`` (ADR-018, ADR-022).
 
     Discovery is normally sealed by the entry's `SIMPLE_CI_HARNESS` marker. An
     entry installed before that marker existed gets no marker at all, so when
@@ -196,6 +198,8 @@ def resolve_workspace_root(mcp_workspace: Path | None = None) -> tuple[Path, str
     env_root = os.environ.get("WORKSPACE_ROOT")
     if env_root:
         return Path(env_root).resolve(), "env"
+    if cli_workspace is not None:
+        return cli_workspace.resolve(), "arg"
     if mcp_workspace is not None:
         return mcp_workspace.resolve(), "roots"
     cwd = Path.cwd().resolve()
@@ -240,12 +244,13 @@ def _implausible_reason(workspace_root: Path) -> str | None:
 def _reject_implausible_workspace(workspace_root: Path, source: str) -> None:
     """Refuse an *inferred* workspace that cannot be a project root.
 
-    An explicit `WORKSPACE_ROOT` and a client-published MCP root are opt-ins:
-    in both cases the user chose the directory. Everything else must look like a
-    project, so a harness that spawns the server outside one fails loudly
-    instead of silently building an empty index it cannot even log to.
+    An explicit `WORKSPACE_ROOT`, a `--workspace` argument, and a
+    client-published MCP root are opt-ins: in all three cases the user chose the
+    directory. Everything else must look like a project, so a harness that
+    spawns the server outside one fails loudly instead of silently building an
+    empty index it cannot even log to.
     """
-    if source in {"env", "roots"}:
+    if source in {"env", "arg", "roots"}:
         return
     reason = _implausible_reason(workspace_root)
     if reason is None:
@@ -397,11 +402,15 @@ def _log_level(file_value: str | None, env_value: str | None) -> str:
     return "debug"
 
 
-def load_settings(*, mcp_workspace: Path | None = None) -> Settings:
+def load_settings(
+    *, mcp_workspace: Path | None = None, cli_workspace: Path | None = None
+) -> Settings:
     from simple_code_indexer.registry import get_registry
 
     registry = get_registry()
-    workspace_root, workspace_source = resolve_workspace_root(mcp_workspace)
+    workspace_root, workspace_source = resolve_workspace_root(
+        mcp_workspace, cli_workspace
+    )
     _reject_implausible_workspace(workspace_root, workspace_source)
     config_paths = configfile.config_paths(workspace_root)
     raw = configfile.load_layered_config(config_paths) if config_paths else {}

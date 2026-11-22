@@ -13,8 +13,15 @@ _END = "# <<< simple-code-indexer <<<"
 STARTUP_TIMEOUT_SEC = 120
 
 
-def upsert(existing: str, *, name: str, command: list[str], env: dict[str, str]) -> str:
-    block = _render(name, command, env)
+def upsert(
+    existing: str,
+    *,
+    name: str,
+    command: list[str],
+    env: dict[str, str],
+    enabled: bool = False,
+) -> str:
+    block = _render(name, command, env, enabled=enabled)
     if _BEGIN in existing and _END in existing:
         before, _, rest = existing.partition(_BEGIN)
         _, _, after = rest.partition(_END)
@@ -44,13 +51,17 @@ def remove(existing: str, *, name: str) -> str | None:
     return tail
 
 
-def _render(name: str, command: list[str], env: dict[str, str]) -> str:
+def _render(
+    name: str, command: list[str], env: dict[str, str], *, enabled: bool = False
+) -> str:
     lines = [
         _BEGIN,
         f"[mcp_servers.{json.dumps(name)}]",
         f"command = {json.dumps(command[0])}",
         f"startup_timeout_sec = {STARTUP_TIMEOUT_SEC}",
     ]
+    if enabled:
+        lines.append("enabled = true")
     if len(command) > 1:
         lines.append(f"args = {json.dumps(command[1:])}")
     if env:

@@ -621,3 +621,69 @@ Checks whether `symbol_lookup` can resolve symbols in the languages a workspace 
 - **A Vue/Svelte/Astro/Heex/Blade/Templ declaration does not resolve**: confirm the host entry carries `injections=True` in `catalog.ENTRIES`, then check that the region's injected language is one of `elixir`/`javascript`/`php_only`/`typescript` — the other targets are deliberately not indexed. Heex `<script>`/`<style>` tags stay unindexed because their query relies on `#offset!`, which the binding does not expose (see NOTES.md).
 - **A language has a map but still resolves nothing**: its tags query may describe node types the grammar uses differently from the sample the map was verified against. Re-run `tools/gen_language_catalog.py --report` and check that language's entry.
 - **Symbols did not change after a catalog update**: the map version was not bumped, so no backfill was enqueued. Bump `SYMBOL_MAP_VERSION` in the generator (not `CATALOG_VERSION`) and restart the writer.
+
+---
+
+## RUN-013 (OPERATOR): Install a project-scope harness entry and verify pickup
+
+Writes the MCP server into one workspace's own client config and pins it, then proves the client
+loads it. Global entries are never touched, and no settings file changes. Run this in a throwaway
+profile first: a non-dry-run setup writes the global config, the uv tool environment, and client
+configs (NOTES.md).
+
+1. Pick the project and (for a rehearsal) a redirected profile:
+
+   ```powershell
+   $root = "$env:TEMP\sci-scope"; New-Item -ItemType Directory -Force "$root\home","$root\proj" | Out-Null
+   $env:USERPROFILE = "$root\home"; $env:HOME = "$root\home"
+   $env:APPDATA = "$root\home\AppData\Roaming"; $env:LOCALAPPDATA = "$root\home\AppData\Local"
+   Set-Location "$root\proj"
+   ```
+
+2. Install the project entry, skipping the interactive questions:
+
+   ```
+   uvx simple-code-indexer setup --harness-scope project --harnesses opencode --gitignore \
+     --config-mode use --yes
+   ```
+
+   Expected: `opencode (project): …` naming the workspace file, then
+   `Added to .gitignore: opencode.json, .simple-ci/`. A client with no project config (Goose,
+   Claude Desktop) prints its **global** fallback instead, with the reason.
+
+3. Confirm the pin and the absence of a global entry:
+
+   ```
+   Get-Content opencode.json
+   Test-Path "$env:USERPROFILE\.config\opencode\opencode.json"
+   ```
+
+   Expected: `args` ends with `--workspace <abs workspace>`; the second command is `False`. A global
+   entry would instead have no `--workspace` and would live in the home profile.
+
+4. Prove the server resolves the pin (`workspace_source` must be `arg`, not `cwd`):
+
+   ```
+   uv run python tests/mcp_probe.py
+   ```
+
+   Under a project entry the probe prints `workspace_source: arg` and the workspace it was pinned to.
+
+5. Prove the client itself picks the entry up (OpenCode; see
+   `ref-docs/opencode-acp-mode.md` §8 for the log evidence):
+
+   ```
+   uv run python tests/acp_probe.py <workspace> --agent opencode
+   ```
+
+   Expected: `configured entry (project): …` in the preflight, `[PASS] OpenCode entry is pinned to
+   this workspace`, then `mcp connected server=simple-code-indexer tools=3` in
+   `~/.local/share/opencode/log/opencode.log`.
+
+**Troubleshooting**
+
+- **`configured entry (global)` when a project entry was expected**: the client's project file is not where the plugin says it is. Check `LOCAL_CONFIGS` in `harnesses/<client>.py` against that client's docs; the file must resolve under the workspace.
+- **`[FAIL] … entry is pinned to this workspace`**: the entry pins a different directory (usually an older checkout). Re-run step 2 from the right folder — `--install-only` also rewrites it, using the recorded `workspace`.
+- **The client connects but the index is empty**: the pin worked but the client is refusing project config — Claude Code needs interactive approval for `.mcp.json` servers; Codex and Pi read `.codex/config.toml` / `.pi/mcp.json` only in a trusted project.
+- **`get_status.workspace_source` is `env`**: `WORKSPACE_ROOT` is set and outranks `--workspace`. Unset it before concluding anything about the pin.
+- **The entry must not be committed**: a project entry contains an absolute path. Keep the `.gitignore` entry, or re-run with the file untracked.

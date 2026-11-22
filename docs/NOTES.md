@@ -159,22 +159,64 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 - **A VS Code window costs three pythonw processes, not four (ISS-016, fixed 2026-11-19)**: a reader is two OS processes because `<install>/.venv/Scripts/pythonw.exe` (263 KB) is a redirector that re-executes `c:\python312\pythonw.exe` and waits for it; the per-workspace daemon used to add a second pair the same way. `sidecar.client._daemon_command` now starts the daemon as `sys._base_executable` with the reader's resolved `sys.path` (the installed package comes from a `.pth`), so the daemon is one process. The Command Code extension still builds one stdio client per consumer (`createStdioMcpClient` in `dist/extension.js`) — the window's connection client and each chat session — so an open chat adds a second reader; `get_status.harnesses` then lists `Code.exe(<pid>)` twice (verified `sessions=2`, both `Code.exe(1612)`). That duplicate is upstream-only and adds a registration, not a writer, because readers share the daemon. Count servers by `get_status.sessions`/`daemon.json`, never by a raw `pythonw.exe` count.
 - **Reader spawn storm (2026-11-12)**: `_spawn_if_needed` used only a 2→30 s cooldown, so a daemon that took >2 s to publish `daemon.json` (Docker/vector startup) made the reader spawn 2-4 extra daemons; each lost the writer lease and exited, so the user saw several console windows flash and close, leaving one. The reader now refuses to spawn while the Popen child it started is still alive (`_children` pruned by `poll()`), so a slow-starting daemon is waited for instead of raced. Cross-process races remain possible because `_children` is per reader; the spawn lock holder therefore also writes `run/daemon.spawn.json` (child pid + wall-clock timestamp) before releasing the lock, and peers skip spawning while that pid is alive and the claim is under 10 minutes old. Dead or expired claims are cleared by the next reader holding the lock. Without the claim, a duplicate spawned just before the winner was force-killed could later win the freed lease and outlive the test that stopped the published daemon.
 - **The Cline builtin harness was removed (2026-11-08)**: the end-to-end run found `~/.cline/data/settings/cline_mcp_settings.json` gone after the Cline desktop app restarted — the wizard's entry did not survive there, and Cline never listed the server. `harnesses/cline.py` is deleted rather than patched; re-add it only with a verified path and lifecycle for the current Cline build.
-- **Harness entries must stay workspace-free (ADR-015)**: the entry is global, so a pinned
-  `WORKSPACE_ROOT`/`cwd` makes one fixed tree the workspace for *every* project opened afterwards.
-  Workspace resolution is runtime-only (ADR-007, extended by ADR-018); `get_status.workspace` and
-  `get_status.workspace_source` are how you confirm it. The
-  OpenCode/Goose/Pi plugins no longer turn `WORKSPACE_ROOT` into a `cwd`, and the wizard passes
-  `env=self.harness_env`, which is empty unless `--no-git-pull` is given. A pin is a debugging aid
-  only and must be removed before the session ends — the cheap
+- **Global harness entries must stay workspace-free (ADR-015)**: the entry serves every project, so
+  a pinned `WORKSPACE_ROOT`/`cwd`/`--workspace` makes one fixed tree the workspace for *every*
+  project opened afterwards. Workspace resolution is runtime-only (ADR-007, extended by ADR-018);
+  `get_status.workspace` and `get_status.workspace_source` are how you confirm it. The
+  OpenCode/Goose/Pi plugins no longer turn `WORKSPACE_ROOT` into a `cwd`. A pin in a global entry is
+  a debugging aid only and must be removed before the session ends — the cheap
   way is `simple-code-indexer setup --harnesses <name>`, which rewrites a clean entry. The repeated
   re-pollution came from `ref-docs/mcp-test-process.md` §4.4 telling sessions to pin it, so that
   section now documents the ban instead. `cwd` in the *probe* script is fine: it is the process
   spawn directory, not an entry key. The one exception is the stable `SIMPLE_CI_HARNESS=<NAME>`
-  marker: it selects the plugin that may publish a workspace and carries no project data.
+  marker: it selects the plugin that may publish a workspace and carries no project data. A
+  **project** entry (ADR-022) is the opposite case: it lives in the workspace and always carries
+  `serve --workspace <abs workspace>`. Do not "fix" one by copying the other.
+- **The entry ladder is CLI-first, and the wizard has no per-client branches (ADR-022)**: each
+  `harnesses/<client>.py` may declare `CLI_BINARIES` + `cli_add`/`cli_remove`; `setup_wizard/entries.py`
+  tries that CLI, then `write.install`, then (for a client with no project config) that client's
+  global entry with a warning. Verified shapes: `cmdc mcp add-json --scope {user,project}` (needed
+  because only `add-json` can express `transport`, `enabled` and the `SIMPLE_CI_HARNESS` marker),
+  `claude mcp add -s {user,project} <name> -- …`, `gemini mcp add --scope {user,project} <name> …`,
+  `opencode mcp add [--global] <name> -- …`, `pi mcp add [-l] <name> -- …`, `codex mcp add <name> --
+  …` (global only; no scope flag), and `cursor --add-mcp '<json>'` (global only — see below).
+  Zed, Windsurf, MiMo and Claude Desktop have no scriptable CLI (`mimo mcp add` is interactive-only),
+  and VS Code's `--add-mcp` writes the user profile only, so those go through the config merge.
+  `cmdc` is safe as a CLI binary; `cmd` is the Windows shell and must never be one. OpenCode has no
+  `enabled` key — it uses `disabled`, and a test asserts the entry carries none. Claude Code needs
+  interactive approval for project servers; Codex and Pi read project config only in a trusted
+  project. None of that can be shortcut by a config writer.
+- **Cursor's CLI writes its profile settings, not `~/.cursor/mcp.json`** (verified on 3.31.15):
+  `cursor --add-mcp '{"name":…,"command":…,"args":[…] }'` edits
+  `%APPDATA%\Cursor\User\settings.json` under **`mcp.servers`**, keeps unrelated keys, and has no
+  `mcp remove`; `--mcp-workspace` is rejected as an unknown option, so there is no project scope
+  through the CLI. Two consequences: the plugin lists that settings file only in `cli_target`
+  (`CLI_ROOT_KEY = "mcp.servers"`) and **never** in `GLOBAL_CONFIGS`, because the wizard's JSON merge
+  would add an `mcpServers` key to Cursor's whole editor settings; and `install_entry` disables the
+  CLI when an explicit recorded `target` names a different file, so a repin can never be redirected
+  into the profile.
+- **`zed` on PATH is usually not the editor.** A chocolatey/managed install of authzed's SpiceDB CLI
+  claims `zed.exe` and wins on the machine PATH, while the real editor lives in
+  `%LOCALAPPDATA%\Programs\Zed\bin\zed.exe` and has **no** MCP command at all (`zed --help` accepts
+  only paths and `--diff`; `zed mcp` belongs to the SpiceDB CLI). The plugin therefore declares
+  neither `BINARIES` nor `CLI_BINARIES` and relies on `HOME_DIRS` detection, and Zed's config is
+  written by the merge at `%APPDATA%\Zed\settings.json` (Windows) or `~/.config/zed/settings.json`.
+- **Windows `.cmd` shims need `cmd /c`** (verified with Cursor): `shutil.which("cursor")` resolves to
+  `cursor.cmd`, and `subprocess` cannot execute a batch file directly (`WinError 2`). `entries._run_cli`
+  and the remove path route `.cmd`/`.bat` through `%COMSPEC% /c`, and run the path `which` resolved
+  rather than the bare name. Without that, every shim-based client silently fell back to the config
+  merge.
+- **A project config is machine-specific by design**: the pin is an absolute path, so the wizard
+  offers `.gitignore` (via `ignore.IgnoreRules`, so its verdict matches the indexer's) for the config
+  file and `.simple-ci/`. Never commit one. `setup.harnesses` records `scope`/`workspace`, which is
+  what lets `--install-only` repoint the same file with the same pin; records written before ADR-022
+  have no `scope` and are treated as `global`.
 - **Workspace resolution waits for the MCP handshake (ADR-018)**: `server.ServerState` calls
   `load_settings()` from the `notifications/initialized` handler (first `tools/*` call as a
   fallback), because `roots/list` is a server-initiated request and the SDK parks the read loop
-  during `initialize`. Early startup lines (`parent watchdog: watching …`) only reach **stderr**;
+  during `initialize`. A `--workspace` pin answers the question up front, so the roots probe is
+  skipped entirely for a project-scope session. Early startup lines (`parent watchdog: watching …`)
+  only reach **stderr**;
   the file handler exists only after the workspace is known. A server that never receives a
   handshake never starts a writer/reader. `SIMPLE_CI_ROOTS_TIMEOUT_S` (default `1`, `0` disables)
   bounds the roots probe. The Command Code VS Code extension advertises `roots` but never answers,

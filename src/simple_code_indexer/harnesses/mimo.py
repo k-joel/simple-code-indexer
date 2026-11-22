@@ -1,4 +1,9 @@
-"""Builtin MiMoCode harness plugin (`mcp` key, local command array)."""
+"""Builtin MiMoCode harness plugin (`mcp` key, local command array).
+
+`mimo mcp add` prompts for every field and offers no non-interactive flags, so
+the wizard writes the JSON itself: `~/.config/mimocode/mimocode.json` globally
+and `.mimocode/mimocode.json` for one project.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +25,8 @@ GLOBAL_CONFIGS = [
     "%APPDATA%/mimocode/mimocode.json",
     "%LOCALAPPDATA%/mimocode/mimocode.json",
 ]
-LOCAL_CONFIGS = [".mimocode/mimocode.json"]
+# `.jsonc` first: an existing commented config is the one MiMoCode loads.
+LOCAL_CONFIGS = [".mimocode/mimocode.jsonc", ".mimocode/mimocode.json"]
 ROOT_KEY = "mcp"
 
 

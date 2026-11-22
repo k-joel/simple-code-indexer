@@ -23,9 +23,16 @@ from simple_code_indexer import (
     sqlite_vec_store,
 )
 from simple_code_indexer.errors import ConfigError
-from simple_code_indexer.harnesses import HarnessSpec, load_harnesses
+from simple_code_indexer.harnesses import (
+    HarnessSpec,
+    Scope,
+    load_harnesses,
+    pinned_command,
+)
 from simple_code_indexer.setup_wizard import (
     catalog,
+    entries,
+    gitignore,
     gpu,
     install,
     probe,
@@ -87,6 +94,34 @@ def _stored_prompt(
     return default
 
 
+def _pinned(command: list[str], scope: str, workspace: Path) -> list[str]:
+    """The argv an entry at `scope` carries; only a project entry is pinned."""
+    if scope == Scope.PROJECT:
+        return pinned_command(command, workspace)
+    return list(command)
+
+
+def _record(
+    spec: HarnessSpec, target: Path, scope: str, workspace: Path
+) -> dict[str, str]:
+    """One `setup.harnesses` row; `scope`/`workspace` drive later cleanup."""
+    record = {"name": spec.name, "config": str(target), "scope": scope}
+    if scope == Scope.PROJECT:
+        record["workspace"] = str(workspace)
+    return record
+
+
+def _entry_message(spec: HarnessSpec, outcome: entries.EntryOutcome) -> str:
+    """One user-facing line per harness, naming the scope and the writer."""
+    where = "global" if outcome.scope == Scope.GLOBAL else "project"
+    if not outcome.wrote:
+        return f"{spec.label} ({where}): {outcome.detail}"
+    line = f"{spec.label} ({where}): {outcome.detail}"
+    if outcome.fell_back_to_global and not spec.supports(Scope.PROJECT):
+        line += " — this client has no project-level MCP config"
+    return line
+
+
 class Wizard:
     def __init__(
         self,
@@ -112,6 +147,8 @@ class Wizard:
         harnesses: str | None = None,
         editable: bool = True,
         sweep_seconds: float | None = None,
+        harness_scope: str | None = None,
+        gitignore: bool | None = None,
     ) -> None:
         self.cwd = (cwd or Path.cwd()).resolve()
         self.home = (home or Path.home()).resolve()
@@ -134,6 +171,8 @@ class Wizard:
         self.harnesses = harnesses
         self.editable = editable
         self.sweep_seconds = sweep_seconds
+        self.harness_scope = harness_scope
+        self.gitignore = gitignore
         self._docker_checked: bool | None = None
         self._written_harnesses: list[tuple[HarnessSpec, Path]] = []
         self._record_tool_env: Path | None = None
@@ -1154,8 +1193,18 @@ class Wizard:
                 continue
             name = item.get("name")
             config = item.get("config")
-            if isinstance(name, str) and isinstance(config, str) and name and config:
-                records.append({"name": name, "config": config})
+            if not (isinstance(name, str) and isinstance(config, str)):
+                continue
+            if not name or not config:
+                continue
+            record = {"name": name, "config": config}
+            scope = item.get("scope")
+            if isinstance(scope, str) and scope in {Scope.GLOBAL, Scope.PROJECT}:
+                record["scope"] = scope
+            workspace = item.get("workspace")
+            if isinstance(workspace, str) and workspace:
+                record["workspace"] = workspace
+            records.append(record)
         self._record_harnesses = records
 
     def _write_global_config(
@@ -1268,86 +1317,150 @@ class Wizard:
                 default=detected,
             )
         by_name = {spec.name: spec for spec in specs}
-        recorded = {
-            item["name"]: Path(item["config"]) for item in self._record_harnesses
-        }
+        records = {item["name"]: item for item in self._record_harnesses}
         selected_names = {specs[index].name for index in selected}
-        unresolved: dict[str, str] = {}
-        for name, path in recorded.items():
+        unresolved: dict[str, dict[str, str]] = {}
+        for name, record in records.items():
             if name in selected_names:
                 continue
             spec = by_name.get(name)
             if spec is None:
                 self.prompts.say(
-                    f"{name}: the harness plugin is gone; leaving {path} alone."
+                    f"{name}: the harness plugin is gone; leaving {record['config']} alone."
                 )
-                unresolved[name] = str(path)
+                unresolved[name] = record
                 continue
-            self._remove_harness_entry(spec, path)
+            self._remove_recorded_entry(spec, record)
 
+        scope = self._step_harness_scope([specs[index] for index in selected])
         command = install_result.server_command
         written: dict[Path, HarnessSpec] = {}
-        kept: dict[str, str] = {}
+        kept: dict[str, dict[str, str]] = {}
         for index in selected:
             spec = specs[index]
-            target = write.choose_target(spec, "global", self.cwd, self.home)
+            effective = entries.scope_for(spec, scope)
+            target = write.choose_target(spec, effective, self.cwd, self.home)
             if target is None:
-                self.prompts.say(f"{spec.label} has no global config path.")
+                self.prompts.say(f"{spec.label} has no {effective} config path.")
                 continue
             resolved = target.resolve()
-            previous = recorded.get(spec.name)
-            if previous is not None and previous.resolve() != resolved:
-                self._remove_harness_entry(spec, previous)
+            previous = records.get(spec.name)
+            if previous is not None and Path(previous["config"]).resolve() != resolved:
+                self._remove_recorded_entry(spec, previous)
             if resolved in written:
                 self.prompts.say(
                     f"{target} was already updated for {written[resolved].label}; "
                     f"skipping {spec.label}."
                 )
-                kept[spec.name] = str(target)
+                kept[spec.name] = _record(spec, target, effective, self.cwd)
                 continue
-            if self.dry_run:
-                snippet = write.render(spec, SERVER_NAME, command, {})
-                self.prompts.say(f"Would update {target}:\n{snippet}")
-            else:
-                try:
-                    write.install(spec, target, SERVER_NAME, command, {})
-                except (TypeError, ValueError, OSError) as exc:
-                    self.prompts.say(f"Could not update {target}: {exc}")
-                    self.prompts.say(
-                        "Add this entry manually:\n"
-                        + write.render(spec, SERVER_NAME, command, {})
+            outcome = entries.install_entry(
+                spec,
+                scope=scope,
+                workspace=self.cwd,
+                home=self.home,
+                server_name=SERVER_NAME,
+                command=command,
+                env={},
+                runner=self.runner,
+                dry_run=self.dry_run,
+                say=self.prompts.say,
+                target=target,
+            )
+            self.prompts.say(_entry_message(spec, outcome))
+            if not outcome.wrote and outcome.path is not None:
+                self.prompts.say(
+                    "Add this entry manually:\n"
+                    + write.render(
+                        spec,
+                        SERVER_NAME,
+                        _pinned(command, outcome.scope, self.cwd),
+                        {},
                     )
-                    if previous is not None and previous.resolve() == resolved:
-                        kept[spec.name] = str(previous)
-                    continue
-                self.prompts.say(f"Updated {target}")
+                )
             written[resolved] = spec
             self._written_harnesses.append((spec, target))
-            kept[spec.name] = str(target)
+            recorded_path = outcome.path or target
+            kept[spec.name] = _record(spec, recorded_path, outcome.scope, self.cwd)
         kept.update(unresolved)
-        self._record_harnesses = [
-            {"name": name, "config": kept[name]} for name in sorted(kept)
-        ]
+        self._record_harnesses = [kept[name] for name in sorted(kept)]
+        self._step_gitignore(scope, specs, selected)
 
-    def _remove_harness_entry(self, spec: HarnessSpec, target: Path) -> None:
-        """Drop the server entry a previous run installed (and its backup)."""
+    def _step_harness_scope(self, selected: list[HarnessSpec]) -> str:
+        """Global entries serve every project; project entries live here.
+
+        A project entry is written into the workspace and pins it, so it only
+        makes sense outside the home directory — running setup in `~` (which is
+        what a bare `uvx simple-code-indexer setup` in a terminal often means)
+        is treated as a request for the global scope.
+        """
+        if not selected:
+            return Scope.GLOBAL
+        if self.cwd == self.home:
+            self.prompts.say(
+                "Running in the home directory; harness entries will be global."
+            )
+            return Scope.GLOBAL
+        if self.harness_scope is not None:
+            return self.harness_scope
+        choice = self._ask_choice(
+            "Install the MCP server entries where?",
+            [
+                "Global — every project on this machine (no workspace pin)",
+                f"Project — this workspace only ({self.cwd}, pinned)",
+            ],
+            default=0,
+        )
+        return Scope.PROJECT if choice == 1 else Scope.GLOBAL
+
+    def _step_gitignore(
+        self, scope: str, specs: list[HarnessSpec], selected: list[int]
+    ) -> None:
+        """Offer to keep the project entry and the index out of version control."""
+        if scope != Scope.PROJECT or not selected or self.dry_run:
+            return
+        configs = [path for _spec, path in self._written_harnesses]
+        if not configs:
+            return
+        if not gitignore.is_git_workspace(self.cwd):
+            self.prompts.say("Not a git repository; leaving .gitignore alone.")
+            return
+        patterns = gitignore.relative_targets(configs, self.cwd)
+        add = gitignore.missing(self.cwd, patterns)
+        if not add:
+            return
+        if self.gitignore is False:
+            return
+        if self.gitignore is None and not self._ask_yes_no(
+            f"Add {', '.join(add)} to .gitignore?", default=True
+        ):
+            return
+        added = gitignore.ensure(self.cwd, add)
+        if added:
+            self.prompts.say("Added to .gitignore: " + ", ".join(added))
+
+    def _remove_recorded_entry(self, spec: HarnessSpec, record: dict[str, str]) -> None:
+        """Drop an entry a previous run recorded, at the scope it was written in."""
+        target = Path(record["config"]).expanduser()
+        scope = record.get("scope", Scope.GLOBAL)
+        workspace = Path(record.get("workspace") or self.cwd).expanduser()
         if not target.is_file():
             self.prompts.say(f"{spec.label}: no entry to remove at {target}")
             return
-        if self.dry_run:
-            self.prompts.say(f"Would remove the server entry from {target}")
-            return
-        try:
-            removed = write.remove(spec, target, SERVER_NAME)
-        except (TypeError, ValueError, OSError) as exc:
-            self.prompts.say(f"Could not update {target}: {exc}")
-            return
-        write.remove_backups(target)
-        if not removed:
-            self.prompts.say(f"No server entry in {target}")
-            return
-        install.prune_empty_dirs(target.parent, stop=self.home)
-        self.prompts.say(f"Removed the server entry from {target}")
+        outcome = entries.remove_entry(
+            spec,
+            scope=scope,
+            workspace=workspace,
+            home=self.home,
+            server_name=SERVER_NAME,
+            runner=self.runner,
+            dry_run=self.dry_run,
+            say=self.prompts.say,
+            target=target,
+        )
+        if not self.dry_run and outcome.wrote:
+            install.prune_empty_dirs(target.parent, stop=self.home)
+        self.prompts.say(f"{spec.label}: {outcome.detail}")
 
     def _parse_harness_selection(
         self, value: str, specs: list[HarnessSpec]
@@ -1479,20 +1592,25 @@ def _repin_recorded_harnesses(prompts: Prompter, *, dry_run: bool) -> int:
             )
             failures += 1
             continue
-        command = result.server_command
-        if dry_run:
-            prompts.say(
-                f"Would update {item.config}:\n"
-                + write.render(spec, SERVER_NAME, command, {})
-            )
-            continue
-        try:
-            write.install(spec, item.config, SERVER_NAME, command, {})
-        except (TypeError, ValueError, OSError) as exc:
-            prompts.say(f"Could not update {item.config}: {exc}")
+        workspace = item.workspace or Path.cwd()
+        # `home` must come from the real profile: a recorded global entry points
+        # at a real config path, and a repin has to reach the same file.
+        outcome = entries.install_entry(
+            spec,
+            scope=item.scope,
+            workspace=workspace,
+            home=Path.home(),
+            server_name=SERVER_NAME,
+            command=result.server_command,
+            env={},
+            runner=runner,
+            dry_run=dry_run,
+            say=prompts.say,
+            target=item.config,
+        )
+        prompts.say(f"{spec.label} ({item.scope}): {outcome.detail}")
+        if not outcome.wrote:
             failures += 1
-            continue
-        prompts.say(f"Updated {item.config}")
     return 1 if failures else 0
 
 
@@ -1566,6 +1684,22 @@ def run(argv: list[str] | None = None) -> int:
         help="'all', 'none', or a comma-separated list of harness names",
     )
     parser.add_argument(
+        "--harness-scope",
+        choices=[Scope.GLOBAL, Scope.PROJECT],
+        default=None,
+        help=(
+            "global (default) serves every project with no pin; project writes "
+            "into the current workspace and pins it (a project config only one "
+            "workspace can use)"
+        ),
+    )
+    parser.add_argument(
+        "--gitignore",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="add project-scope config files and .simple-ci/ to .gitignore",
+    )
+    parser.add_argument(
         "--wheel",
         action="store_true",
         help=(
@@ -1605,6 +1739,8 @@ def run(argv: list[str] | None = None) -> int:
         "--vector-store": args.vector_store,
         "--gpu": args.gpu,
         "--harnesses": args.harnesses,
+        "--harness-scope": args.harness_scope,
+        "--gitignore": args.gitignore,
         "--config-mode": args.config_mode,
         "--sweep-seconds": args.sweep_seconds,
     }
@@ -1655,6 +1791,8 @@ def run(argv: list[str] | None = None) -> int:
         harnesses=args.harnesses,
         editable=not args.wheel,
         sweep_seconds=args.sweep_seconds,
+        harness_scope=args.harness_scope,
+        gitignore=args.gitignore,
     )
     return wizard.run()
 

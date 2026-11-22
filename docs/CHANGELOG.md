@@ -121,6 +121,45 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ### Added
 
+- **Harness entries can now be installed per project, not just globally** (ADR-022). `setup` asks
+  for a scope after the harness selection: `global` (the default, and mandatory when run from the
+  home directory) or `project`, which writes the client's own project config — `.mcp.json`,
+  `.cursor/mcp.json`, `opencode.json`, `.vscode/mcp.json`, `.codex/config.toml`, and so on — and pins
+  it with `serve --workspace <dir>`. Global entries stay workspace-free, as before.
+- `serve --workspace <dir>` sets the workspace explicitly, beating MCP roots and the
+  harness-published workspace and losing only to `WORKSPACE_ROOT`; `get_status.workspace_source`
+  reports `arg`. It is also treated as an opt-in for the implausible-directory refusal, like
+  `WORKSPACE_ROOT`.
+- `setup --harness-scope {global,project}` and `--gitignore` / `--no-gitignore` skip the two new
+  prompts, so a project install can be scripted.
+- A project install offers to add its config file and `.simple-ci/` to `.gitignore` (only inside a
+  git repository, and never duplicating an entry that already covers them).
+- **Entries are written by each client's own `mcp add` when it has one** — `cmdc mcp add-json`,
+  `claude mcp add`, `gemini mcp add`, `opencode mcp add`, `pi mcp add`, `codex mcp add`, and
+  `cursor --add-mcp` — falling back to the wizard's config merge when the CLI is absent, does not
+  support the scope, or fails. All per-client flag knowledge lives in that client's `harnesses/*.py`
+  plugin. On Windows the ladder runs the path `shutil.which` resolved and routes `.cmd`/`.bat` shims
+  through `cmd /c`, so shim-based clients (Cursor, VS Code, npm CLIs) actually run instead of
+  silently falling back.
+- Cursor: its CLI is used for the global scope and the wizard records the file it really writes,
+  `%APPDATA%\Cursor\User\settings.json` under `mcp.servers` (verified on 3.31.15, which has no
+  `mcp remove` and rejects `--mcp-workspace`). That settings file is deliberately kept out of the
+  merge targets, because merging `mcpServers` into it would corrupt Cursor's editor settings.
+- Zed: `BINARIES`/`CLI_BINARIES` are now empty because `zed` on `PATH` is commonly authzed's SpiceDB
+  CLI, not the editor; detection relies on the config directory. Its Windows settings location
+  (`%APPDATA%\Zed\settings.json`) now wins over the XDG path when no file exists yet.
+- `enabled: true` is now written for Pi and Codex (Codex through a new `ENABLED` plugin flag, since
+  its marker-block TOML writer bypasses `entry()`), matching Goose/MiMo/Command Code. Clients that
+  do not document the key — OpenCode, VS Code, Cursor, Zed, Gemini CLI, Claude Code, Claude Desktop,
+  Windsurf — still get none.
+- MiMoCode's project config now prefers an existing `.mimocode/mimocode.jsonc`, and OpenCode's
+  project config also considers `.opencode/opencode.json(c)`; Windsurf/Devin gets its gitignored
+  `.devin/mcp_config.local.json` as a fallback.
+- `setup.harnesses` records `scope` and `workspace` per entry, so `--install-only` repoints the same
+  file with the same pin and a deselected harness is removed from the scope it was written in.
+
+### Changed
+
 - **`symbol_lookup` now works for 167 of the 322 indexable languages, up from 29** (ADR-020).
   Symbol maps are derived at catalog-generation time from each grammar's own tags query
   (`get_tags_query`), which names the real declaration node types; grammars that ship no tags query

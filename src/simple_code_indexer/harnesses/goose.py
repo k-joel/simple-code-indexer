@@ -1,4 +1,9 @@
-"""Builtin Goose harness plugin (YAML, `extensions.<name>` stdio entry)."""
+"""Builtin Goose harness plugin (YAML, `extensions.<name>` stdio entry).
+
+Goose has one config file (`~/.config/goose/config.yaml`, or
+`%APPDATA%/Block/goose/config/config.yaml` on Windows) and no project scope and
+no `mcp add` CLI, so a project-scope request falls back to a global entry.
+"""
 
 from __future__ import annotations
 

@@ -283,7 +283,7 @@ Architectural boundaries:
 
 | In scope | Out of scope |
 |---|---|
-| One workspace per process: `WORKSPACE_ROOT`, then the client's MCP roots, then the harness-published workspace, then cwd (ADR-018) | Multi-repo registry, path sandbox, worktree identity |
+| One workspace per process: `WORKSPACE_ROOT`, then `--workspace`, then the client's MCP roots, then the harness-published workspace, then cwd (ADR-018, ADR-022) | Multi-repo registry, path sandbox, worktree identity |
 | Index-on-save from working-tree bytes | Git readiness, commit gating, provenance |
 | SQLite + FTS5 lexical index | Staged generations, quarantine trees |
 | Direct chunk embeddings; sqlite-vec default, FAISS and Qdrant opt-in | LLM chunk summaries before embedding |
@@ -865,30 +865,34 @@ stored vectors change, so query-prompt edits do not force a re-embed.
 An inferred workspace that cannot be a project root is refused with a
 `ConfigError`: the user's home directory, or the installation directory of a
 live ancestor process (`config._implausible_reason`, using
-`parent_watch.ancestor_install_dirs`). An explicit `WORKSPACE_ROOT` or a
-client-published MCP root still opts in.
+`parent_watch.ancestor_install_dirs`). An explicit `WORKSPACE_ROOT`, a
+`--workspace` argument, or a client-published MCP root still opts in.
 
-Workspace resolution order (`config.resolve_workspace_root`, ADR-018):
+Workspace resolution order (`config.resolve_workspace_root`, ADR-018, ADR-022):
 
 1. `WORKSPACE_ROOT` — explicit escape hatch.
-2. **MCP `roots/list`** — the connected client's own folder list, first
+2. **`serve --workspace <dir>`** — the pin a project-scope harness entry carries
+   (ADR-022). `cli._serve` splits it out before argparse validation, so it never
+   appears in another subcommand's flags, and `ServerState` skips the roots
+   probe when it is present.
+3. **MCP `roots/list`** — the connected client's own folder list, first
    existing `file:` root. A server-initiated request, so it is asked only after
    the handshake (`notifications/initialized`, with the first `tools/*` call as
    a fallback), bounded by `SIMPLE_CI_ROOTS_TIMEOUT_S` (default 1 s, `0`
    disables), gated on the client declaring `roots` and on the connection having
    a back-channel (the 2026-era protocol forbids server-initiated requests).
-3. **Harness-published workspace** — `harnesses.discover_workspace` asks the
+4. **Harness-published workspace** — `harnesses.discover_workspace` asks the
    plugin named by the entry's `SIMPLE_CI_HARNESS` env value. Today only
    `commandcode` implements it (its `~/.commandcode/ide/*.json` window files,
    matched by live ancestry). When the cwd is implausible (home or an ancestor's
    install directory) an entry without the marker — installed before the marker
    existed — asks **every** plugin that declares a resolver instead, so shipping
    a new version of the package is enough and no setup re-run is needed.
-4. Process cwd — only when it is plausible; otherwise the `ConfigError` above
+5. Process cwd — only when it is plausible; otherwise the `ConfigError` above
    names the directory and the sources that were tried.
 
-`Settings.workspace_source` records `env` / `roots` / `harness:<name>` / `cwd`
-and is surfaced as `get_status.workspace_source` and in the startup banner.
+`Settings.workspace_source` records `env` / `arg` / `roots` / `harness:<name>` /
+`cwd` and is surfaced as `get_status.workspace_source` and in the startup banner.
 Because roots needs a session, `server.ServerState` defers `load_settings()`,
 the file log, and the writer/reader start until the MCP session exists; tool
 handlers await `ensure_started`.
@@ -1208,12 +1212,12 @@ search continue. `get_status.services` reports
 
 A harness plugin is a plain module loaded from `src/simple_code_indexer/harnesses/`,
 `<repo>/harnesses/`, or `<workspace>/harnesses/`; a user plugin overrides a builtin by `NAME`. It
-declares `NAME`, `LABEL`, detection dirs/binaries, global config paths, format
-(`json`, `toml`, or `yaml`), the config root key, and optional
-`entry`/`render`/`remove` callables. `HarnessSpec` exposes those as data
-(`candidates`, `root_key`, `format`), so config readers outside the wizard — the ACP
-probe's configured-entry preflight — resolve paths and entries from the same table
-instead of hardcoding a harness's layout. A plugin may also implement
+declares `NAME`, `LABEL`, detection dirs/binaries, global **and project** config paths
+(`GLOBAL_CONFIGS` / `LOCAL_CONFIGS`), format (`json`, `toml`, or `yaml`), the config root key, and
+optional `entry`/`render`/`remove` callables. `HarnessSpec` exposes those as data
+(`candidates`, `supports`, `root_key`, `format`), so config readers outside the wizard — the ACP
+probe's configured-entry preflight — resolve paths and entries from the same table instead of
+hardcoding a harness's layout. A plugin may also implement
 `resolve_workspace(cwd) -> Path | None`; it must then put
 `SIMPLE_CI_HARNESS=<NAME>` into its entry env (the reserved `RUNTIME_ENV` key),
 which is how the server knows which single plugin to ask at runtime. That key is
@@ -1222,6 +1226,20 @@ parse/merge without destroying unrelated keys; JSONC comments are lost on
 rewrite, so the writer backs up the file and refuses to rewrite an unparsable
 document. TOML harness configs are merged with marker comments rather than a
 round-trip, because the parser cannot write. Bad plugins are skipped.
+
+A plugin whose client ships a non-interactive `mcp add` also declares `CLI_BINARIES` plus
+`cli_add(scope, workspace, name, command, entry)` / `cli_remove(scope, workspace, name)`, each
+returning an argv or `None` when the client cannot express that scope. A client whose CLI writes
+somewhere else adds `cli_target(scope)` and `cli_root_key` — Cursor's `--add-mcp` edits
+`%APPDATA%/Cursor/User/settings.json` under `mcp.servers`, so that file is a CLI target and never a
+merge target. All per-client knowledge lives there; `setup_wizard/entries.py` owns the ladder and
+never inspects a harness name: client CLI first (at the path `shutil.which` resolved, with
+`.cmd`/`.bat` shims routed through `cmd /c` on Windows), the wizard's config merge second, and — for
+a client with no project config (Goose, Claude Desktop) — its global entry plus a warning. `ENABLED`
+is for TOML clients only, because the marker-block writer bypasses `entry()`; a JSON plugin puts
+`enabled: true` in its own entry, and only where the client documents the key. Zed declares no
+`BINARIES`/`CLI_BINARIES` at all: `zed` on `PATH` is commonly authzed's SpiceDB CLI, so detection
+uses the config directory.
 
 The setup wizard:
 
@@ -1236,25 +1254,31 @@ The setup wizard:
   and deleting it;
 - installs the tool with `uv tool install`, editable when a checkout is detectable
   (the default) or as a built wheel with `--wheel`;
-- writes the server entry into selected harness configs at global scope and
-  records `setup.install_kind` (`editable`/`wheel`) / `setup.tool_env` plus
-  `setup.harnesses`;
-- supports `--install-only` (install + repoint the recorded entries) and
-  record-driven `--uninstall` (harness entries, uv tool environment, config,
-  docker assets, model cache; never workspace indexes).
+- asks for a harness **scope** after the harness selection: `global` (default; the
+  home directory always means global) or `project`, which writes the client's
+  project config file and pins it (ADR-022). It then records
+  `setup.install_kind` (`editable`/`wheel`) / `setup.tool_env` plus
+  `setup.harnesses` with `name` / `config` / `scope` / `workspace`;
+- offers to add a project config file and `.simple-ci/` to `.gitignore`
+  (`--gitignore` / `--no-gitignore`), only inside a git repository;
+- supports `--install-only` (install + repoint the recorded entries, same files and
+  same pins) and record-driven `--uninstall` (harness entries, uv tool
+  environment, config, docker assets, model cache; never workspace indexes).
 
 Harness launch commands preserve the harness cwd and are the same for both install
 flavours: the uv tool environment's `bin/python -m simple_code_indexer serve` on
 POSIX and its windowless `Scripts/pythonw.exe -m simple_code_indexer serve` on
-Windows. Entries are
-**workspace-free**
-([ADR-015](DECISIONS.md#adr-015-harness-entries-are-global-only-no-per-project-data)):
-they carry the install-scoped interpreter only — never `WORKSPACE_ROOT`, `cwd`,
-`INDEX_DB`, or `FAISS_PATH` — because the workspace is resolved at runtime
-(ADR-018). The only entry env the wizard may write for a resolver harness is the
+Windows. Global entries are **workspace-free**
+([ADR-015](DECISIONS.md#adr-015-global-harness-entries-carry-no-per-project-data)):
+they carry the install-scoped interpreter only — never `WORKSPACE_ROOT`,
+`--workspace`, `cwd`, `INDEX_DB`, or `FAISS_PATH` — because the workspace is
+resolved at runtime (ADR-018). A project entry appends
+`--workspace <abs workspace>` and nothing else; that is the whole pin
+([ADR-022](DECISIONS.md#adr-022-harness-entries-can-be-project-scoped-pinned-by-serve---workspace)).
+The only entry env the wizard may write for a resolver harness is the
 stable `SIMPLE_CI_HARNESS=<NAME>` marker. Because the server resolves the
 workspace after the MCP handshake (roots first), the harness cwd is one source
-among four, not the definition.
+among five, not the definition.
 
 ---
 
@@ -1470,7 +1494,7 @@ won (`env`, `roots`, `harness:<name>`, or `cwd`).
 | Extension | Mechanism | Rules |
 |---|---|---|
 | Language support | Generated table in `languages/catalog.py` | one `LanguageSpec` per language (`name` == `grammar`); `DATA_FORMATS` are never registered; hand-maintained overrides live in `tools/gen_language_catalog.py`; re-run the tool rather than editing the table |
-| Harness support | Drop-in module in `harnesses/` or workspace `harnesses/` | config paths, format, root key, optional entry/render/remove; global scope only in the wizard; user overrides builtin by `NAME` |
+| Harness support | Drop-in module in `harnesses/` or workspace `harnesses/` | config paths (global + project), format, root key, optional entry/render/remove, optional `cli_add`/`cli_remove`; global or project scope in the wizard; user overrides builtin by `NAME` |
 | Vector backend | New module in `src/simple_code_indexer/` plus one `_STORES` entry in `vector_store.py` | must implement the whole `STORE_CONTRACT` (writer and read-only query paths, identity/describe, flush/reconcile/age); `tests/test_vector_store.py` enforces it |
 | Embedding model | Catalog entry plus `model_prompts.defaults_for_model` | dimension is probed, never trusted; document-prompt or chunker changes alter the vector identity |
 | Managed service | `service` block under `embedding` or `qdrant` | fail-soft; readiness waits bounded by `startup_timeout_s` |

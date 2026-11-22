@@ -150,7 +150,11 @@ class Runner:
         return shutil.which(name)
 
     def run(
-        self, argv: list[str], *, timeout: float = _DOCKER_TIMEOUT_S
+        self,
+        argv: list[str],
+        *,
+        timeout: float = _DOCKER_TIMEOUT_S,
+        cwd: Path | None = None,
     ) -> CommandResult:
         try:
             completed = subprocess.run(
@@ -159,6 +163,7 @@ class Runner:
                 text=True,
                 timeout=timeout,
                 check=False,
+                cwd=str(cwd) if cwd is not None else None,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             return CommandResult(127, "", str(exc))

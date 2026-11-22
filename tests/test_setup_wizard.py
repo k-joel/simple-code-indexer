@@ -109,7 +109,7 @@ class FakeRunner(Runner):
     def which(self, name: str) -> str | None:
         return self.which_map.get(name)
 
-    def run(self, argv: list[str], *, timeout: float = 15.0) -> CommandResult:
+    def run(self, argv: list[str], *, timeout: float = 15.0, cwd=None) -> CommandResult:
         self.calls.append(list(argv))
         if self.creates_tool_env is not None and argv[1:3] == ["tool", "install"]:
             self.creates_tool_env.mkdir(parents=True, exist_ok=True)
@@ -1112,7 +1112,9 @@ def test_install_only_installs_the_tool_and_writes_no_config(
         def which(self, name: str) -> str | None:
             return "/usr/bin/uv" if name == "uv" else None
 
-        def run(self, argv: list[str], *, timeout: float = 15.0) -> CommandResult:
+        def run(
+            self, argv: list[str], *, timeout: float = 15.0, cwd=None
+        ) -> CommandResult:
             calls.append(list(argv))
             if argv[1:3] == ["tool", "dir"]:
                 return CommandResult(0, str(tmp_path / "tools"))
@@ -1137,7 +1139,9 @@ def test_install_only_dry_run_runs_nothing(
         def which(self, name: str) -> str | None:
             return "/usr/bin/uv" if name == "uv" else None
 
-        def run(self, argv: list[str], *, timeout: float = 15.0) -> CommandResult:
+        def run(
+            self, argv: list[str], *, timeout: float = 15.0, cwd=None
+        ) -> CommandResult:
             calls.append(list(argv))
             return CommandResult(0)
 
@@ -1215,7 +1219,9 @@ def test_install_only_refreshes_the_recorded_entries(
         def which(self, name: str) -> str | None:
             return "/usr/bin/uv" if name == "uv" else None
 
-        def run(self, argv: list[str], *, timeout: float = 15.0) -> CommandResult:
+        def run(
+            self, argv: list[str], *, timeout: float = 15.0, cwd=None
+        ) -> CommandResult:
             if argv[1:3] == ["tool", "dir"]:
                 return CommandResult(0, str(tmp_path / "tools"))
             return CommandResult(0)
@@ -1289,7 +1295,9 @@ def test_harness_install_is_recorded_in_the_config(tmp_path: Path) -> None:
 
     target = home / ".cursor" / "mcp.json"
     setup = _global(home)["setup"]
-    assert setup["harnesses"] == [{"name": "cursor", "config": str(target)}]
+    assert setup["harnesses"] == [
+        {"name": "cursor", "config": str(target), "scope": "global"}
+    ]
 
 
 def test_the_tool_environment_is_recorded(tmp_path: Path, real_install) -> None:
@@ -1424,7 +1432,9 @@ def test_a_recorded_harness_path_that_moved_is_cleaned_up(
     assert document["mcpServers"]["simple-code-indexer"]["command"] == str(
         repo / "bin" / "python"
     )
-    assert wizard._record_harnesses == [{"name": "cursor", "config": str(target)}]
+    assert wizard._record_harnesses == [
+        {"name": "cursor", "config": str(target), "scope": "global"}
+    ]
 
 
 def test_harness_selection_parser(tmp_path: Path) -> None:
@@ -1645,3 +1655,231 @@ def test_compose_template_renders_each_backend() -> None:
     assert "deploy" not in intel
     assert "deploy" not in cpu
     assert not any("N_GPU_LAYERS" in item for item in cpu["environment"])
+
+
+# -- project scope (ADR-022) ---------------------------------------------
+
+
+def _scope_wizard(
+    tmp_path: Path, *, harnesses: str, scope: str, runner: FakeRunner | None = None
+) -> tuple[Wizard, Path, Path, Path]:
+    project, home, repo = _workspace(tmp_path)
+    wizard = Wizard(
+        cwd=project,
+        home=home,
+        repo_root=repo,
+        prompts=ScriptedPrompter(),
+        runner=runner or FakeRunner(),
+        harnesses=harnesses,
+        harness_scope=scope,
+    )
+    return wizard, project, home, repo
+
+
+def test_a_project_entry_pins_the_workspace(tmp_path: Path) -> None:
+    monkeypatch_specs = load_harnesses(user_dirs=[])
+    assert any(spec.name == "cursor" for spec in monkeypatch_specs)
+    wizard, project, home, _repo = _scope_wizard(
+        tmp_path, harnesses="cursor", scope="project"
+    )
+    result = install_mod.InstallResult(root=tmp_path / "tool-env", platform="linux")
+
+    wizard._step_harnesses(result)
+
+    target = project / ".cursor" / "mcp.json"
+    entry = json.loads(target.read_text(encoding="utf-8"))["mcpServers"][
+        "simple-code-indexer"
+    ]
+    assert entry["args"] == [
+        "-m",
+        "simple_code_indexer",
+        "serve",
+        "--workspace",
+        str(project),
+    ]
+    assert "env" not in entry
+    assert not (home / ".cursor" / "mcp.json").exists()
+    assert wizard._record_harnesses == [
+        {
+            "name": "cursor",
+            "config": str(target),
+            "scope": "project",
+            "workspace": str(project),
+        }
+    ]
+
+
+def test_a_global_entry_is_never_pinned(tmp_path: Path) -> None:
+    wizard, _project, home, _repo = _scope_wizard(
+        tmp_path, harnesses="cursor", scope="global"
+    )
+    result = install_mod.InstallResult(root=tmp_path / "tool-env", platform="linux")
+
+    wizard._step_harnesses(result)
+
+    entry = json.loads((home / ".cursor" / "mcp.json").read_text(encoding="utf-8"))[
+        "mcpServers"
+    ]["simple-code-indexer"]
+    assert entry["args"] == ["-m", "simple_code_indexer", "serve"]
+    assert "--workspace" not in entry["args"]
+
+
+def test_switching_scope_removes_the_old_entry(tmp_path: Path) -> None:
+    wizard, project, home, repo = _scope_wizard(
+        tmp_path, harnesses="cursor", scope="global"
+    )
+    result = install_mod.InstallResult(root=tmp_path / "tool-env", platform="linux")
+    wizard._step_harnesses(result)
+    assert (home / ".cursor" / "mcp.json").is_file()
+
+    second = Wizard(
+        cwd=project,
+        home=home,
+        repo_root=repo,
+        prompts=ScriptedPrompter(),
+        runner=FakeRunner(),
+        harnesses="cursor",
+        harness_scope="project",
+    )
+    second._record_harnesses = list(wizard._record_harnesses)
+
+    second._step_harnesses(result)
+
+    assert not (home / ".cursor" / "mcp.json").exists()
+    assert (project / ".cursor" / "mcp.json").is_file()
+
+
+def test_running_in_the_home_directory_forces_global(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    prompts = ScriptedPrompter()
+    wizard = Wizard(
+        cwd=home,
+        home=home,
+        prompts=prompts,
+        runner=FakeRunner(),
+        harnesses="cursor",
+        harness_scope="project",
+    )
+
+    assert wizard._step_harness_scope(load_harnesses(user_dirs=[])) == "global"
+    assert any("home directory" in message for message in prompts.messages)
+
+
+def test_a_client_without_a_project_config_falls_back_to_global(
+    tmp_path: Path, capsys
+) -> None:
+    wizard, project, _home, _repo = _scope_wizard(
+        tmp_path, harnesses="goose", scope="project"
+    )
+    result = install_mod.InstallResult(root=tmp_path / "tool-env", platform="linux")
+
+    wizard._step_harnesses(result)
+
+    assert not (project / "goose").exists()
+    recorded = wizard._record_harnesses
+    assert recorded and recorded[0]["scope"] == "global"
+    assert Path(recorded[0]["config"]).is_file()
+    assert "workspace" not in recorded[0]
+
+
+def test_the_client_cli_is_preferred_when_it_is_on_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(harnesses_pkg, "_which", lambda _name: None)
+    runner = FakeRunner(
+        which_map={"claude": "/usr/bin/claude"}, default=CommandResult(0)
+    )
+
+    def fake_run(argv: list[str], *, timeout: float = 15.0, cwd=None) -> CommandResult:
+        runner.calls.append(list(argv))
+        return CommandResult(0)
+
+    monkeypatch.setattr(runner, "run", fake_run)
+    wizard, project, _home, _repo = _scope_wizard(
+        tmp_path, harnesses="claude_code", scope="project", runner=runner
+    )
+    result = install_mod.InstallResult(root=tmp_path / "tool-env", platform="linux")
+
+    wizard._step_harnesses(result)
+
+    # The CLI is run at the path `which` resolved, not the bare name.
+    add = [
+        call for call in runner.calls if call[:3] == ["/usr/bin/claude", "mcp", "add"]
+    ]
+    assert add and add[0][3:5] == ["-s", "project"]
+    assert "--workspace" in add[0] and str(project) in add[0]
+
+
+def test_a_failing_cli_falls_back_to_the_config_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(harnesses_pkg, "_which", lambda _name: None)
+
+    def fake_run(argv: list[str], *, timeout: float = 15.0, cwd=None) -> CommandResult:
+        return CommandResult(1, "", "boom")
+
+    runner = FakeRunner(which_map={"claude": "/usr/bin/claude"})
+    monkeypatch.setattr(runner, "run", fake_run)
+    wizard, project, _home, _repo = _scope_wizard(
+        tmp_path, harnesses="claude_code", scope="project", runner=runner
+    )
+    result = install_mod.InstallResult(root=tmp_path / "tool-env", platform="linux")
+
+    wizard._step_harnesses(result)
+
+    entry = json.loads((project / ".mcp.json").read_text(encoding="utf-8"))[
+        "mcpServers"
+    ]["simple-code-indexer"]
+    assert entry["args"][-2:] == ["--workspace", str(project)]
+
+
+def test_project_scope_offers_gitignore_once(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(harnesses_pkg, "_which", lambda _name: None)
+    wizard, project, _home, _repo = _scope_wizard(
+        tmp_path, harnesses="cursor", scope="project"
+    )
+    (project / ".git").mkdir()
+    wizard.gitignore = True
+    result = install_mod.InstallResult(root=tmp_path / "tool-env", platform="linux")
+
+    wizard._step_harnesses(result)
+    wizard._step_harnesses(result)
+
+    text = (project / ".gitignore").read_text(encoding="utf-8")
+    assert text.count(".cursor/mcp.json") == 1
+    assert text.count(".simple-ci/") == 1
+
+
+def test_gitignore_is_left_alone_outside_a_repository(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(harnesses_pkg, "_which", lambda _name: None)
+    wizard, project, _home, _repo = _scope_wizard(
+        tmp_path, harnesses="cursor", scope="project"
+    )
+    wizard.gitignore = True
+    result = install_mod.InstallResult(root=tmp_path / "tool-env", platform="linux")
+
+    wizard._step_harnesses(result)
+
+    assert not (project / ".gitignore").exists()
+
+
+def test_gitignore_already_covering_the_entry_is_not_rewritten(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from simple_code_indexer.setup_wizard import gitignore
+
+    monkeypatch.setattr(harnesses_pkg, "_which", lambda _name: None)
+    wizard, project, _home, _repo = _scope_wizard(
+        tmp_path, harnesses="cursor", scope="project"
+    )
+    (project / ".git").mkdir()
+    (project / ".gitignore").write_text(".cursor/\n.simple-ci/\n", encoding="utf-8")
+    wizard.gitignore = True
+    result = install_mod.InstallResult(root=tmp_path / "tool-env", platform="linux")
+
+    wizard._step_harnesses(result)
+
+    assert gitignore.missing(project, [".cursor/mcp.json", ".simple-ci/"]) == []

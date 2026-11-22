@@ -521,15 +521,21 @@ def _call_tool(
 class ServerState:
     """Workspace-bound settings and the role runtime, resolved once the session exists.
 
-    Workspace sources are, in order, `WORKSPACE_ROOT`, the client's MCP roots,
-    the harness-published workspace, and the process cwd
-    (`config.resolve_workspace_root`). MCP roots can only be requested after
-    the handshake, so this object defers `load_settings()`, the log file, and
-    the runtime start until then (ADR-018).
+    Workspace sources are, in order, `WORKSPACE_ROOT`, the `--workspace`
+    argument, the client's MCP roots, the harness-published workspace, and the
+    process cwd (`config.resolve_workspace_root`). MCP roots can only be
+    requested after the handshake, so this object defers `load_settings()`, the
+    log file, and the runtime start until then (ADR-018). A `--workspace` pin
+    answers the question up front, so the roots probe is skipped entirely.
     """
 
-    def __init__(self, exit: Callable[[int], NoReturn] = os._exit) -> None:
+    def __init__(
+        self,
+        exit: Callable[[int], NoReturn] = os._exit,
+        workspace: Path | None = None,
+    ) -> None:
         self._exit = exit
+        self._pinned = workspace
         self._lock = asyncio.Lock()
         self._cleanup: Callable[[], None] | None = None
         self._finalized = False
@@ -545,9 +551,15 @@ class ServerState:
         async with self._lock:
             if self.settings is not None:
                 return
-            roots = await mcp_roots.first_workspace(session)
+            roots = (
+                None
+                if self._pinned is not None
+                else await mcp_roots.first_workspace(session)
+            )
             try:
-                settings = load_settings(mcp_workspace=roots)
+                settings = load_settings(
+                    mcp_workspace=roots, cli_workspace=self._pinned
+                )
             except ConfigError as exc:
                 logger.error("%s", exc)
                 self._exit(1)
@@ -687,9 +699,9 @@ async def _serve(
             watchdog.close()
 
 
-async def _run() -> None:
+async def _run(workspace: Path | None = None) -> None:
     logging_setup.install_excepthooks()
-    state = ServerState()
+    state = ServerState(workspace=workspace)
     watchdog = parent_watch.ParentWatchdog() if parent_watch.enabled() else None
 
     try:
@@ -717,10 +729,10 @@ async def _run() -> None:
         state.cleanup_once()
 
 
-def main() -> None:
+def main(workspace: Path | None = None) -> None:
     logging_setup.configure_console()
     try:
-        asyncio.run(_run())
+        asyncio.run(_run(workspace))
     except ConfigError as exc:
         logger.error("%s", exc)
         raise SystemExit(1) from None

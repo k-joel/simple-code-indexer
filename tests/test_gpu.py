@@ -25,7 +25,7 @@ class FakeRunner(Runner):
     def which(self, name: str) -> str | None:
         return self.which_map.get(name)
 
-    def run(self, argv: list[str], *, timeout: float = 15.0) -> CommandResult:
+    def run(self, argv: list[str], *, timeout: float = 15.0, cwd=None) -> CommandResult:
         self.calls.append(list(argv))
         for prefix, result in self.results.items():
             if tuple(argv[: len(prefix)]) == prefix:

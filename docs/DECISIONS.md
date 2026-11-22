@@ -141,9 +141,14 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 | [012](#adr-012-role-specific-per-workspace-log-files) | Role-specific per-workspace log files |
 | [013](#adr-013-honor-gitignore-and-watch-the-workspace-root-recursively) | Honor `.gitignore` and watch the root recursively |
 | [014](#adr-014-per-workspace-sidecar-writer--read-only-mcp-sessions) | Per-workspace sidecar writer + read-only MCP sessions |
-| [015](#adr-015-harness-entries-are-global-only-no-per-project-data) | Harness entries are global-only, no per-project data |
+| [015](#adr-015-global-harness-entries-carry-no-per-project-data) | Global harness entries carry no per-project data |
 | [016](#adr-016-a-generated-language-catalog-replaces-the-plugin-folder) | A generated language catalog replaces the plugin folder |
 | [017](#adr-017-sqlite-vec-is-the-default-vector-store-faiss-and-qdrant-opt-in) | sqlite-vec is the default vector store; FAISS and Qdrant opt-in |
+| [018](#adr-018-mcp-roots-first-harness-published-workspace-third) | MCP roots first, harness-published workspace third |
+| [019](#adr-019-pypi-distribution-uv-tool-install-replaces-the-git-copy-install) | PyPI distribution; `uv tool install` replaces the git-copy install |
+| [020](#adr-020-symbol-maps-are-derived-from-the-packs-tags-queries-at-catalog-generation-time) | Symbol maps from the pack's tags queries |
+| [021](#adr-021-embedded-regions-are-indexed-through-the-grammars-injections-query-opt-in-per-host) | Embedded regions via the grammar's injections query |
+| [022](#adr-022-harness-entries-can-be-project-scoped-pinned-by-serve---workspace) | Harness entries can be project-scoped, pinned by `serve --workspace` |
 
 
 ## ADR-001: Index on save, not git-committed state
@@ -422,34 +427,34 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   (`role`, `index_ready`, `writer_pid`, `writer_ok`, `writer_heartbeat_age_s`, `writer_log_file`,
   `daemon_endpoint`, `sessions`, `harnesses`, `vector_index_age_s`).
 
-## ADR-015: Harness entries are global-only, no per-project data
+## ADR-015: Global harness entries carry no per-project data
 
-- **Context:** Every harness entry is written at **global** scope (ADR-011: one config file, one
-  install, one entry set), and the workspace is inferred from the process cwd (ADR-007). Despite
-  that, repeated debugging sessions hand-edited `WORKSPACE_ROOT` and `cwd` into the OpenCode, Goose
-  and Pi entries, pinning this checkout's absolute path in files that belong to every project on
-  the machine. The result was a global entry that silently indexed one fixed tree for every project
-  opened afterwards, and a git-tracked repo path leaking into user-home config. The behaviour was
-  even documented as a step (`ref-docs/mcp-test-process.md` §4.4) and as a harness capability (the
-  three plugins emit `cwd` from `WORKSPACE_ROOT`), so each new session re-created it.
-- **Decision:** A harness entry contains **only** install-scoped data: the interpreter, the
-  installed `run_server.py` launcher, and the user's global settings. It must never contain a
-  workspace path — no `WORKSPACE_ROOT`, no `cwd`, no `INDEX_DB`, no `FAISS_PATH`. Workspace
-  resolution stays entirely runtime-inferred (ADR-007; ADR-018 adds roots and harness-published
-  sources). Harness plugins therefore drop `WORKSPACE_ROOT`/`cwd` from the entry they build and pass `env`
-  through untouched; the wizard passes an empty `env` unless `--no-git-pull` (a debug switch) adds
-  `SIMPLE_CI_GIT_PULL=0`. One reserved key is allowed: `SIMPLE_CI_HARNESS=<NAME>`, a stable
-  install-scoped marker that tells the server which plugin may publish this session's workspace. It carries
-  no project data, so it does not reintroduce the pinning this ADR forbids. A temporary pin is allowed
-  **only** inside a debugging session, and must be removed before the session's work is called done.
-- **Consequences:** One static entry set serves every project; moving or cloning a repo cannot
-  leave a stale absolute path behind, and re-running `setup.py` is idempotent with respect to the
+- **Context:** Every harness entry used to be written at **global** scope (ADR-011: one config file,
+  one install, one entry set), and the workspace is inferred from the process cwd (ADR-007).
+  Despite that, repeated debugging sessions hand-edited `WORKSPACE_ROOT` and `cwd` into the OpenCode,
+  Goose and Pi entries, pinning this checkout's absolute path in files that belong to every project
+  on the machine. The result was a global entry that silently indexed one fixed tree for every
+  project opened afterwards, and a git-tracked repo path leaking into user-home config. The
+  behaviour was even documented as a step (`ref-docs/mcp-test-process.md` §4.4) and as a harness
+  capability (the three plugins emit `cwd` from `WORKSPACE_ROOT`), so each new session re-created
+  it. ADR-022 later added an explicit *project* scope, so this rule is now stated per scope.
+- **Decision:** A **global** harness entry contains **only** install-scoped data: the interpreter
+  and the user's global settings. It must never contain a workspace path — no `WORKSPACE_ROOT`, no
+  `--workspace`, no `cwd`, no `INDEX_DB`, no `FAISS_PATH`. Workspace resolution stays entirely
+  runtime-inferred (ADR-007; ADR-018 adds roots and harness-published sources). Harness plugins
+  therefore never turn `WORKSPACE_ROOT` into a `cwd`, and the wizard passes an empty `env`. One
+  reserved key is allowed: `SIMPLE_CI_HARNESS=<NAME>`, a stable install-scoped marker that tells
+  the server which plugin may publish this session's workspace. It carries no project data, so it
+  does not reintroduce the pinning this ADR forbids. A **project** entry (ADR-022) is written into
+  the workspace and *must* carry the pin, because that file belongs to one project by construction.
+  A temporary pin in a *global* entry is allowed **only** inside a debugging session, and must be
+  removed before the session's work is called done.
+- **Consequences:** One static global entry set serves every project; moving or cloning a repo
+  cannot leave a stale absolute path behind, and re-running setup is idempotent with respect to the
   workspace. `get_status.workspace` remains the way to detect a harness that spawns from elsewhere
-  — the fix is a harness that spawns in the project cwd, not an entry edit. `SIMPLE_CI_GIT_PULL=0`
-  is *not* covered by this ban: it is a machine/install-scoped toggle, not a project path, but it
-  too is debugging-only and should not survive the session. When a harness genuinely cannot spawn
-  in the project directory, that is a harness defect to record in `docs/ISSUES.md`, not something
-  to paper over per project.
+  — the fix is a harness that spawns in the project cwd, not an entry edit. When a harness
+  genuinely cannot spawn in the project directory, that is a harness defect to record in
+  `docs/ISSUES.md`, or a case for the project scope in ADR-022.
 
 ## ADR-016: A generated language catalog replaces the plugin folder
 
@@ -612,3 +617,47 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   Heex `<script>`/`<style>` tags stay unindexed because their query captures the whole tag and its
   `#offset!` directives are not exposed by the binding; the limitation is recorded rather than
   worked around with a host-specific offset table.
+
+## ADR-022: Harness entries can be project-scoped, pinned by `serve --workspace`
+
+- **Context:** Global-only entries (ADR-015) rely on the client spawning the server in the project
+  directory. That is true for most terminal clients, but not for an IDE extension whose stdio
+  children inherit the editor's install directory (ISS-014), and some clients read a
+  project-level config anyway — OpenCode, Claude Code, Cursor, VS Code, Codex, Pi, MiMo and
+  Windsurf all do. Users also asked for an index that belongs to one repository, listed in that
+  repository's own config, without touching every other project on the machine. The earlier answer,
+  a `--scope` flag, was deleted with ADR-011 because it selected a *settings* file; the settings
+  file stays global.
+- **Decision:** `setup` asks for a **harness scope** after the harness selection:
+  `global` (default) or `project` (the current workspace). Running from the home directory always
+  means global, because that is where a bare `uvx … setup` lands and a home-scope entry would
+  index all of `$HOME`. A project entry is written to the client's project config file
+  (`harnesses/<client>.py: LOCAL_CONFIGS`) and carries the pin `serve --workspace <abs workspace>`;
+  a global entry never does. `WORKSPACE_ROOT` still wins over the argument, which wins over MCP
+  roots, the harness-published workspace, and cwd, and `get_status.workspace_source` reports
+  `env` / `arg` / `roots` / `harness:<name>` / `cwd`. `--workspace` is a serve-only flag: it is
+  parsed in `cli._serve`, deliberately absent from the argparse help of the other subcommands, and
+  treated like `WORKSPACE_ROOT` as an explicit opt-in for the implausible-directory refusal.
+  Entries are written by the client's own `mcp add` CLI when the plugin declares one
+  (`CLI_BINARIES` / `cli_add` / `cli_remove`), falling back to the wizard's config merge, and
+  finally — for a client with no project config at all (Goose, Claude Desktop) — to its **global**
+  entry plus a warning. A CLI that writes somewhere other than the plugin's config paths declares
+  `cli_target` / `cli_root_key` (Cursor's `--add-mcp` edits the profile settings under
+  `mcp.servers`); such a file must **not** also appear in `GLOBAL_CONFIGS`, or the merge path would
+  write the wrong root key into it. On Windows the ladder runs the path `shutil.which` resolved and
+  routes `.cmd`/`.bat` shims through `cmd /c`, because `subprocess` cannot execute a batch file and
+  every shim-based client would otherwise fall back silently.
+  `enabled: true` is emitted only for clients that document the key (Codex,
+  Pi, Goose, MiMo, Command Code); OpenCode uses `disabled` and its entry must not carry `enabled`.
+  After a project write the wizard offers to add the config file and `.simple-ci/` to
+  `.gitignore`, because a pinned entry is machine-specific.
+- **Consequences:** A global entry stays workspace-free, so ADR-015 continues to hold where it
+  matters. A project entry is per-machine by design: it must be gitignored, and a teammate cloning
+  the repo runs `setup` themselves. `setup.harnesses` records `scope` and `workspace`, so
+  `--install-only` repoints the same file with the same pin and a deselect removes the entry where
+  it was written; records from before this ADR default to `global`. Adding a client means adding
+  its project path and — only if it ships a non-interactive `mcp add` — a `cli_add` in its own
+  plugin module; the wizard has no per-client branches. A client that requires interactive
+  approval for project servers (Claude Code) or project trust (Codex, Pi) still connects only after
+  the user grants it, which no config writer can shortcut.
+

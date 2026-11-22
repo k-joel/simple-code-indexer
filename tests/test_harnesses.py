@@ -250,8 +250,10 @@ def test_mimo_global_paths_cover_xdg_and_appdata(tmp_path: Path) -> None:
     assert mimo.candidates("global", tmp_path, home=home)[0] == (
         home / ".config" / "mimocode" / "mimocode.json"
     )
-    assert mimo.candidates("local", tmp_path) == [
-        tmp_path / ".mimocode" / "mimocode.json"
+    # `.jsonc` first: an existing commented config is the one the client loads.
+    assert mimo.candidates("project", tmp_path) == [
+        tmp_path / ".mimocode" / "mimocode.jsonc",
+        tmp_path / ".mimocode" / "mimocode.json",
     ]
 
 
@@ -262,8 +264,9 @@ def test_windsurf_uses_the_devin_local_config(tmp_path: Path) -> None:
     candidates = windsurf.candidates("global", tmp_path, home=home)
     assert candidates[0] == home / ".config" / "devin" / "mcp_config.json"
     assert candidates[-1] == home / ".codeium" / "windsurf" / "mcp_config.json"
-    assert windsurf.candidates("local", tmp_path) == [
-        tmp_path / ".devin" / "mcp_config.json"
+    assert windsurf.candidates("project", tmp_path) == [
+        tmp_path / ".devin" / "mcp_config.json",
+        tmp_path / ".devin" / "mcp_config.local.json",
     ]
 
 
@@ -375,6 +378,222 @@ def test_commandcode_marks_the_stdio_transport() -> None:
     assert entry["command"] == "uvx"
     assert entry["args"] == ["--from", "/repo", NAME]
     assert entry["env"] == {harnesses_pkg.RUNTIME_ENV: "commandcode"}
+
+
+LOCAL_CONFIGS = {
+    "claude_code": [".mcp.json"],
+    "commandcode": [".mcp.json"],
+    "cursor": [".cursor/mcp.json"],
+    "gemini_cli": [".gemini/settings.json"],
+    "opencode": [
+        "opencode.json",
+        "opencode.jsonc",
+        ".opencode/opencode.json",
+        ".opencode/opencode.jsonc",
+    ],
+    "pi": [".pi/mcp.json"],
+    "codex": [".codex/config.toml"],
+    "vscode": [".vscode/mcp.json"],
+    "zed": [".zed/settings.json"],
+    "mimo": [".mimocode/mimocode.jsonc", ".mimocode/mimocode.json"],
+    "windsurf": [".devin/mcp_config.json", ".devin/mcp_config.local.json"],
+    "goose": [],
+    "claude_desktop": [],
+}
+
+
+def test_local_config_paths_are_the_documented_ones() -> None:
+    """Each client's project-scope file, verified against its own docs (ADR-022)."""
+    for name, expected in LOCAL_CONFIGS.items():
+        assert list(_spec(name).local_configs) == expected, name
+
+
+def test_a_client_without_a_project_config_does_not_support_project_scope() -> None:
+    assert not _spec("goose").supports("project")
+    assert not _spec("claude_desktop").supports("project")
+    assert _spec("claude_code").supports("project")
+    assert _spec("goose").supports("global")
+
+
+def test_pinned_command_appends_the_workspace_flag(tmp_path: Path) -> None:
+    pinned = harnesses_pkg.pinned_command(COMMAND, tmp_path)
+
+    assert pinned == [*COMMAND, "--workspace", str(tmp_path)]
+    assert pinned[: len(COMMAND)] == COMMAND
+
+
+def test_entry_argv_handles_every_client_shape() -> None:
+    assert harnesses_pkg.entry_argv({"command": ["a", "b"]}) == ["a", "b"]
+    assert harnesses_pkg.entry_argv({"command": "a", "args": ["b"]}) == ["a", "b"]
+    assert harnesses_pkg.entry_argv({"cmd": "a", "args": ["b"]}) == ["a", "b"]
+    assert harnesses_pkg.entry_argv({"name": "a"}) == []
+
+
+def test_only_supported_clients_emit_enabled() -> None:
+    """`enabled` exists in Codex/Pi/Goose/MiMo/Command Code, and nowhere else."""
+    supported = {"codex", "pi", "goose", "mimo", "commandcode"}
+    for spec in load_harnesses(user_dirs=[]):
+        rendered = spec.render("", name=NAME, command=COMMAND, env={})
+        if spec.name in supported:
+            assert "enabled" in rendered, spec.name
+        else:
+            assert "enabled" not in rendered, spec.name
+
+
+def test_codex_enables_the_server_in_its_toml_block() -> None:
+    rendered = _spec("codex").render("", name=NAME, command=COMMAND, env={})
+
+    assert "enabled = true" in rendered
+    assert tomllib.loads(rendered)["mcp_servers"][NAME]["enabled"] is True
+
+
+def test_pi_enables_the_server() -> None:
+    entry = json.loads(_spec("pi").render("", name=NAME, command=COMMAND, env={}))
+
+    assert entry["mcpServers"][NAME]["enabled"] is True
+
+
+def test_cli_adapters_build_the_documented_argv(tmp_path: Path) -> None:
+    """The per-client `mcp add` shapes, isolated in each plugin (ADR-022)."""
+    command = [str(tmp_path / "python"), "-m", "simple_code_indexer", "serve"]
+    pinned = harnesses_pkg.pinned_command(command, tmp_path)
+    cases = {
+        "claude_code": (
+            ["claude", "mcp", "add", "-s", "user", NAME, "--", *command],
+            ["claude", "mcp", "add", "-s", "project", NAME, "--", *pinned],
+        ),
+        "gemini_cli": (
+            ["gemini", "mcp", "add", "--scope", "user", NAME, *command],
+            ["gemini", "mcp", "add", "--scope", "project", NAME, *pinned],
+        ),
+        "opencode": (
+            ["opencode", "mcp", "add", "--global", NAME, "--", *command],
+            ["opencode", "mcp", "add", NAME, "--", *pinned],
+        ),
+        "pi": (
+            ["pi", "mcp", "add", "--exposure", "direct", NAME, "--", *command],
+            ["pi", "mcp", "add", "-l", "--exposure", "direct", NAME, "--", *pinned],
+        ),
+        "codex": (
+            ["codex", "mcp", "add", NAME, "--", *command],
+            None,
+        ),
+        # Cursor's CLI has no project flag (`--mcp-workspace` is rejected by
+        # 3.31.15), so only the global scope has an argv.
+        "cursor": (
+            [
+                "cursor",
+                "--add-mcp",
+                json.dumps({"name": NAME, "command": command[0], "args": command[1:]}),
+            ],
+            None,
+        ),
+        "vscode": (None, None),
+        "zed": (None, None),
+        "windsurf": (None, None),
+        "mimo": (None, None),
+        "goose": (None, None),
+        "claude_desktop": (None, None),
+    }
+    for name, (global_argv, project_argv) in cases.items():
+        spec = _spec(name)
+        if global_argv is None and project_argv is None and spec.cli_add is None:
+            continue
+        assert spec.cli_add is not None, name
+        entry = spec.entry(command, {})
+        assert spec.cli_add("global", tmp_path, NAME, command, entry) == global_argv, (
+            name
+        )
+        entry = spec.entry(pinned, {})
+        assert spec.cli_add("project", tmp_path, NAME, pinned, entry) == project_argv, (
+            name
+        )
+
+
+def test_commandcode_hands_the_whole_entry_to_its_cli(tmp_path: Path) -> None:
+    """`add-json` keeps `transport`, `enabled` and the marker the flags cannot."""
+    spec = _spec("commandcode")
+    assert spec.cli_add is not None
+    command = [str(tmp_path / "python"), "-m", "simple_code_indexer", "serve"]
+    pinned = harnesses_pkg.pinned_command(command, tmp_path)
+    entry = spec.entry(pinned, {})
+
+    argv = spec.cli_add("project", tmp_path, NAME, pinned, entry)
+
+    assert argv is not None
+    assert argv[:5] == ["cmdc", "mcp", "add-json", "--scope", "project"]
+    assert argv[5] == NAME
+    assert json.loads(argv[6]) == entry
+    assert spec.cli_add("local", tmp_path, NAME, pinned, entry) is None
+
+
+def test_a_cli_remove_names_the_recorded_scope(tmp_path: Path) -> None:
+    claude = _spec("claude_code")
+    pi = _spec("pi")
+    codex = _spec("codex")
+    assert claude.cli_remove is not None
+    assert pi.cli_remove is not None
+    assert codex.cli_remove is not None
+
+    assert claude.cli_remove("project", tmp_path, NAME) == [
+        "claude",
+        "mcp",
+        "remove",
+        "-s",
+        "project",
+        NAME,
+    ]
+    assert pi.cli_remove("project", tmp_path, NAME) == [
+        "pi",
+        "mcp",
+        "remove",
+        "-l",
+        NAME,
+    ]
+    assert codex.cli_remove("project", tmp_path, NAME) is None
+    assert _spec("cursor").cli_remove is None
+
+
+def test_cursor_adds_through_its_profile_cli(tmp_path: Path) -> None:
+    """`cursor --add-mcp` writes the profile settings, not `.cursor/mcp.json`.
+
+    Cursor 3.31.15 has no `mcp remove` and rejects `--mcp-workspace`, so the
+    plugin exposes a CLI for the global scope only and names the file the CLI
+    really edits.
+    """
+    cursor = _spec("cursor")
+    assert cursor.cli_add is not None
+    command = [str(tmp_path / "python"), "-m", "simple_code_indexer", "serve"]
+    pinned = harnesses_pkg.pinned_command(command, tmp_path)
+
+    argv = cursor.cli_add("global", tmp_path, NAME, command, cursor.entry(command, {}))
+
+    assert argv is not None
+    assert argv[:2] == ["cursor", "--add-mcp"]
+    payload = json.loads(argv[2])
+    assert payload == {"name": NAME, "command": command[0], "args": command[1:]}
+    assert cursor.cli_add("project", tmp_path, NAME, pinned, {}) is None
+    assert cursor.cli_root_key == "mcp.servers"
+
+
+def test_zed_is_not_offered_as_a_cli_binary() -> None:
+    """`zed` on PATH is the SpiceDB CLI (authzed), not the editor."""
+    zed = _spec("zed")
+
+    assert zed.binaries == ()
+    assert zed.cli_binaries == ()
+    assert zed.cli_add is None
+
+
+def test_cursor_settings_file_is_never_a_merge_target() -> None:
+    """A JSON merge into it would add `mcpServers` to Cursor's own settings."""
+    cursor = _spec("cursor")
+
+    for scope in ("global", "project"):
+        for raw in cursor.global_configs + cursor.local_configs:
+            assert "settings.json" not in raw, (scope, raw)
+    assert cursor.cli_target is not None
+    assert cursor.cli_target("global") == "%APPDATA%/Cursor/User/settings.json"
 
 
 def _discovery(
@@ -588,6 +807,9 @@ def test_candidates_use_the_supplied_home(tmp_path: Path) -> None:
     home = tmp_path / "home"
     cursor = _spec("cursor")
 
+    # Cursor's profile settings file is where its CLI writes, but it is not a
+    # merge target: the wizard's JSON merge would put `mcpServers` into a file
+    # that expects `mcp.servers`. Only `~/.cursor/mcp.json` is a config path.
     assert cursor.candidates("global", tmp_path, home=home) == [
         home / ".cursor" / "mcp.json"
     ]

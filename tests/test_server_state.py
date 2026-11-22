@@ -70,7 +70,9 @@ def test_ensure_started_resolves_the_workspace_once(
         probes.append(session)
         return workspace
 
-    def fake_load(*, mcp_workspace: Path | None = None) -> Settings:
+    def fake_load(
+        *, mcp_workspace: Path | None = None, cli_workspace: Path | None = None
+    ) -> Settings:
         loads.append(mcp_workspace)
         return settings
 
@@ -94,6 +96,35 @@ def test_ensure_started_resolves_the_workspace_once(
     state.cleanup_once()
     state.cleanup_once()
     assert FakeReader.instances[0].closes == 1
+
+
+def test_a_workspace_pin_skips_the_roots_probe(tmp_path: Path, monkeypatch) -> None:
+    """`serve --workspace <dir>` answers the question before the handshake."""
+    workspace = tmp_path / "pinned"
+    workspace.mkdir()
+    settings = _settings(workspace)
+    probes: list[object] = []
+    loads: list[object] = []
+
+    async def fake_probe(session: object) -> Path:
+        probes.append(session)
+        return workspace
+
+    def fake_load(
+        *, mcp_workspace: Path | None = None, cli_workspace: Path | None = None
+    ) -> Settings:
+        loads.append((mcp_workspace, cli_workspace))
+        return settings
+
+    monkeypatch.setattr(mcp_roots, "first_workspace", fake_probe)
+    monkeypatch.setattr(server, "load_settings", fake_load)
+    monkeypatch.setattr(server, "ReaderSession", FakeReader)
+
+    state = server.ServerState(workspace=workspace)
+    asyncio.run(state.ensure_started(object()))
+
+    assert probes == []
+    assert loads == [(None, workspace)]
 
 
 def test_ensure_started_refuses_an_inferred_home_workspace(

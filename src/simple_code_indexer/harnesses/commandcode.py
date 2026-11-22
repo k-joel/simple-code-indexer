@@ -12,14 +12,22 @@ from simple_code_indexer.harnesses import RUNTIME_ENV
 NAME = "commandcode"
 LABEL = "Command Code"
 HOME_DIRS = [".commandcode"]
+# `cmd` is the Windows shell, so it must never be a detection binary; `cmdc` is
+# the real CLI (NOTES.md).
 BINARIES: list[str] = []
+CLI_BINARIES = ["cmdc"]
 GLOBAL_CONFIGS = ["~/.commandcode/mcp.json"]
+# `project` scope is `.mcp.json` at the project root. Command Code's own
+# `local` scope (`~/.commandcode/projects/<slug>/mcp.json`) is deliberately not
+# used: the slug is derived by the client and the file is outside the workspace.
 LOCAL_CONFIGS = [".mcp.json"]
 ROOT_KEY = "mcpServers"
 
 _IDE_DIR = "ide"
 
 logger = logging.getLogger(__name__)
+
+_CLI_SCOPES = {"user", "project"}
 
 
 def entry(command: list[str], env: dict[str, str]) -> dict[str, Any]:
@@ -32,6 +40,35 @@ def entry(command: list[str], env: dict[str, str]) -> dict[str, Any]:
     if len(command) > 1:
         value["args"] = command[1:]
     return value
+
+
+def cli_add(
+    scope: str,
+    workspace: Path,
+    name: str,
+    command: list[str],
+    entry: dict[str, Any],
+) -> list[str] | None:
+    """`cmdc mcp add-json`, so the CLI writes our canonical entry verbatim.
+
+    `add-json` takes the whole entry, which keeps `transport`, `enabled` and
+    the `SIMPLE_CI_HARNESS` marker intact — the flag-style `add` cannot express
+    them. `--scope user` is the global file, `--scope project` is `.mcp.json`;
+    Command Code's `local` scope is a home-directory file and is not used.
+    """
+    del workspace, command
+    cli_scope = "user" if scope == "global" else scope
+    if cli_scope not in _CLI_SCOPES:
+        return None
+    return ["cmdc", "mcp", "add-json", "--scope", cli_scope, name, json.dumps(entry)]
+
+
+def cli_remove(scope: str, workspace: Path, name: str) -> list[str] | None:
+    del workspace
+    cli_scope = "user" if scope == "global" else scope
+    if cli_scope not in _CLI_SCOPES:
+        return None
+    return ["cmdc", "mcp", "remove", "--scope", cli_scope, name]
 
 
 def _discovery_files(home: Path) -> list[dict[str, Any]]:

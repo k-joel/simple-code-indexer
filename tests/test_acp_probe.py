@@ -93,6 +93,14 @@ def test_configured_entry_prefers_the_global_file(tmp_path: Path) -> None:
         (["pythonw.exe", "-m", "simple_code_indexer", "serve"], True),
         (["pythonw.exe", "-m", "simple_code_indexer"], False),
         (["python.exe", "run_server.py"], False),
+        (
+            ["pythonw.exe", "-m", "simple_code_indexer", "serve", "--workspace", "/w"],
+            True,
+        ),
+        (
+            ["pythonw.exe", "-m", "simple_code_indexer", "serve", "--workspace"],
+            False,
+        ),
     ],
 )
 def test_launches_install_requires_the_documented_argv(
@@ -183,4 +191,67 @@ def test_preflight_only_reports_a_stale_entry_when_injection_is_honoured(
 
     assert passed is True
     assert checks == []
-    assert f"configured entry: {config}" in capsys.readouterr().out
+    assert f"configured entry (global): {config}" in capsys.readouterr().out
+
+
+def _project_opencode_config(workspace: Path, entry: dict[str, object]) -> Path:
+    config = workspace / "opencode.json"
+    config.write_text(
+        json.dumps({"mcp": {"servers": {acp_probe.SERVER_NAME: entry}}}),
+        encoding="utf-8",
+    )
+    return config
+
+
+def test_a_project_entry_pins_the_workspace_and_is_accepted(tmp_path: Path) -> None:
+    env = _tool_env(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    pinned = [
+        str(env / "Scripts" / "pythonw.exe"),
+        "-m",
+        "simple_code_indexer",
+        "serve",
+        "--workspace",
+        str(workspace),
+    ]
+    _project_opencode_config(workspace, _entry(pinned))
+    checks: list[dict[str, object]] = []
+
+    def check(label: str, passed: bool, detail: str = "") -> None:
+        checks.append({"check": label, "pass": passed, "detail": detail})
+
+    passed = acp_probe._preflight_entry(
+        _spec("opencode"), workspace, env, check, home=tmp_path / "home"
+    )
+
+    assert passed is True
+    assert all(item["pass"] for item in checks)
+
+
+def test_a_pin_pointing_elsewhere_fails_the_preflight(tmp_path: Path) -> None:
+    env = _tool_env(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    pinned = [
+        str(env / "Scripts" / "pythonw.exe"),
+        "-m",
+        "simple_code_indexer",
+        "serve",
+        "--workspace",
+        str(other),
+    ]
+    _project_opencode_config(workspace, _entry(pinned))
+    checks: list[dict[str, object]] = []
+
+    def check(label: str, passed: bool, detail: str = "") -> None:
+        checks.append({"check": label, "pass": passed, "detail": detail})
+
+    passed = acp_probe._preflight_entry(
+        _spec("opencode"), workspace, env, check, home=tmp_path / "home"
+    )
+
+    assert passed is False
+    assert checks[0]["pass"] is False

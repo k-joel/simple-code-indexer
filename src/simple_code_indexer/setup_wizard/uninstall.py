@@ -18,7 +18,7 @@ from pathlib import Path
 
 from simple_code_indexer import configfile
 from simple_code_indexer.errors import ConfigError
-from simple_code_indexer.harnesses import load_harnesses
+from simple_code_indexer.harnesses import Scope, load_harnesses
 from simple_code_indexer.setup_wizard import install, provision, write
 from simple_code_indexer.setup_wizard.prompts import Prompter
 from simple_code_indexer.setup_wizard.provision import Runner
@@ -32,6 +32,13 @@ DEFAULT_SERVER_NAME = "simple-code-indexer"
 class HarnessRecord:
     name: str
     config: Path
+    scope: str = Scope.GLOBAL
+    workspace: Path | None = None
+    """The pinned workspace for a project-scope record (ADR-022).
+
+    ``None`` for records written before project scope existed, and for global
+    entries, which never carry a pin.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +64,21 @@ def read_record(config_path: Path) -> InstallRecord:
             name = item.get("name")
             config = item.get("config")
             if isinstance(name, str) and isinstance(config, str) and name and config:
-                harnesses.append(HarnessRecord(name, Path(config).expanduser()))
+                raw_scope = item.get("scope")
+                scope = (
+                    raw_scope
+                    if raw_scope in {Scope.GLOBAL, Scope.PROJECT}
+                    else Scope.GLOBAL
+                )
+                raw_workspace = item.get("workspace")
+                workspace = (
+                    Path(raw_workspace).expanduser()
+                    if isinstance(raw_workspace, str) and raw_workspace
+                    else None
+                )
+                harnesses.append(
+                    HarnessRecord(name, Path(config).expanduser(), scope, workspace)
+                )
     return InstallRecord(tuple(harnesses))
 
 

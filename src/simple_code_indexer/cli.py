@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from simple_code_indexer import logging_setup
 
@@ -48,13 +49,39 @@ def _parser() -> argparse.ArgumentParser:
 
 def _serve(argv: list[str]) -> int:
     # Unknown flags are ignored on purpose: a stray argument in a harness config
-    # must never leave the pipe without a server. `serve` currently takes none.
-    _parser().parse_known_args(argv)
+    # must never leave the pipe without a server. `--workspace` is the one
+    # exception — a project-scope entry pins its workspace with it (ADR-022).
+    workspace, rest = _workspace_arg(argv)
+    _parser().parse_known_args(rest)
     logging_setup.configure_console()
     from simple_code_indexer.server import main as server_main
 
-    server_main()
+    server_main(workspace=workspace)
     return 0
+
+
+def _workspace_arg(argv: list[str]) -> tuple[Path | None, list[str]]:
+    """Split the `--workspace` pin out of `argv`; last occurrence wins."""
+    found: str | None = None
+    rest: list[str] = []
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item == "--workspace":
+            if index + 1 < len(argv):
+                found = argv[index + 1]
+                index += 1
+        elif item.startswith("--workspace="):
+            found = item.partition("=")[2]
+        else:
+            rest.append(item)
+        index += 1
+    if not found:
+        return None, rest
+    path = Path(found).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path, rest
 
 
 def _setup(argv: list[str]) -> int:

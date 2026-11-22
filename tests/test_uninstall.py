@@ -43,7 +43,7 @@ class FakeRunner(Runner):
     def which(self, name: str) -> str | None:
         return "/usr/bin/docker" if self.docker and name == "docker" else None
 
-    def run(self, argv: list[str], *, timeout: float = 15.0) -> CommandResult:
+    def run(self, argv: list[str], *, timeout: float = 15.0, cwd=None) -> CommandResult:
         self.calls.append(list(argv))
         if argv[:2] == ["docker", "info"]:
             return CommandResult(0 if self.docker else 1)

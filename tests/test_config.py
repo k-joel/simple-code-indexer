@@ -205,6 +205,59 @@ def test_workspace_source_defaults_to_the_cwd(monkeypatch) -> None:
     assert settings.workspace_source == "cwd"
 
 
+def test_the_workspace_argument_beats_roots_and_the_harness(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`serve --workspace <dir>` is an explicit opt-in (ADR-022)."""
+    from simple_code_indexer import harnesses
+
+    pinned = tmp_path / "pinned"
+    pinned.mkdir()
+    roots = tmp_path / "roots"
+    roots.mkdir()
+    published = tmp_path / "published"
+    published.mkdir()
+    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.setattr(
+        harnesses, "discover_workspace", lambda cwd: (published, "commandcode")
+    )
+
+    settings = load_settings(mcp_workspace=roots, cli_workspace=pinned)
+
+    assert settings.workspace_root == pinned.resolve()
+    assert settings.workspace_source == "arg"
+
+
+def test_workspace_root_beats_the_workspace_argument(
+    tmp_path: Path, monkeypatch
+) -> None:
+    env_root = tmp_path / "env"
+    env_root.mkdir()
+    pinned = tmp_path / "pinned"
+    pinned.mkdir()
+    monkeypatch.setenv("WORKSPACE_ROOT", str(env_root))
+
+    settings = load_settings(cli_workspace=pinned)
+
+    assert settings.workspace_root == env_root.resolve()
+    assert settings.workspace_source == "env"
+
+
+def test_an_implausible_workspace_is_allowed_when_pinned(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An explicit pin opts in, exactly like `WORKSPACE_ROOT` and roots do."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+
+    settings = load_settings(cli_workspace=home)
+
+    assert settings.workspace_root == home.resolve()
+    assert settings.workspace_source == "arg"
+
+
 def test_harness_published_workspace_wins_over_the_cwd(
     tmp_path: Path, monkeypatch
 ) -> None:

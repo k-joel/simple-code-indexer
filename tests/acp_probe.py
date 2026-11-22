@@ -50,7 +50,14 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from simple_code_indexer.harnesses import HarnessSpec, _json, _yaml, load_harnesses
+from simple_code_indexer.harnesses import (
+    WORKSPACE_FLAG,
+    HarnessSpec,
+    _json,
+    _yaml,
+    entry_argv,
+    load_harnesses,
+)
 
 SERVER_NAME = "simple-code-indexer"
 ENTRY_MODULE = "simple_code_indexer"
@@ -189,14 +196,7 @@ def _configured_entry(
 
 def _entry_argv(entry: dict[str, Any]) -> list[str]:
     """The entry's launch command as one argv list (shape varies by harness)."""
-    command = entry.get("command", entry.get("cmd"))
-    if isinstance(command, list):
-        return [str(part) for part in command]
-    if isinstance(command, str):
-        args = entry.get("args")
-        extra = [str(part) for part in args] if isinstance(args, list) else []
-        return [command, *extra]
-    return []
+    return entry_argv(entry)
 
 
 def _inside(path: str, root: Path) -> bool:
@@ -215,13 +215,28 @@ def _launches_install(entry: dict[str, Any], install: Path) -> bool:
 
     The interpreter must live in the tool environment (`python.exe` and
     `pythonw.exe` are both valid) and the argv must be the documented
-    `-m simple_code_indexer serve` launch, so a stale entry naming another
-    install or the deleted checkout copy is rejected.
+    `-m simple_code_indexer serve` launch, optionally followed by the
+    project-scope pin `--workspace <dir>` (ADR-022), so a stale entry naming
+    another install or the deleted checkout copy is rejected.
     """
     argv = _entry_argv(entry)
     if not argv or not _inside(argv[0], install):
         return False
-    return argv[1:] == ["-m", ENTRY_MODULE, "serve"]
+    tail = argv[1:]
+    if len(tail) >= 2 and tail[-2] == WORKSPACE_FLAG:
+        tail = tail[:-2]
+    return tail == ["-m", ENTRY_MODULE, "serve"]
+
+
+def _pinned_workspace(entry: dict[str, Any]) -> Path | None:
+    """The workspace a project-scope entry pins, or None for a global entry."""
+    argv = _entry_argv(entry)
+    for index, item in enumerate(argv):
+        if item == WORKSPACE_FLAG and index + 1 < len(argv):
+            return Path(argv[index + 1])
+        if item.startswith(WORKSPACE_FLAG + "="):
+            return Path(item.partition("=")[2])
+    return None
 
 
 def _preflight_entry(
@@ -252,10 +267,28 @@ def _preflight_entry(
         check(label, False, f"no {SERVER_NAME!r} entry under {spec.root_key}")
         return False
     argv = _entry_argv(entry)
+    pinned = _pinned_workspace(entry)
+    scope = "project" if pinned is not None else "global"
+    print(
+        f"configured entry ({scope}): {path} -> {' '.join(argv)}",
+        flush=True,
+    )
     if not required:
-        print(f"configured entry: {path} -> {' '.join(argv)}", flush=True)
         return True
     launches = _launches_install(entry, install)
+    if launches and pinned is not None:
+        try:
+            same = pinned.resolve() == workspace.resolve()
+        except OSError:
+            same = False
+        if not same:
+            check(
+                f"{spec.label} entry is pinned to this workspace",
+                False,
+                f"entry pins {pinned}, probe indexes {workspace}",
+            )
+            return False
+        check(f"{spec.label} entry is pinned to this workspace", True, str(pinned))
     check(label, launches, f"{path}: {' '.join(argv)}")
     return launches
 

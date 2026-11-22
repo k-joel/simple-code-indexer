@@ -10,9 +10,17 @@ Contract (plain module globals):
     LOCAL_CONFIGS   project-scope config files, relative to the workspace
     FORMAT          "json" (default), "toml" or "yaml"
     ROOT_KEY        config root key ("mcpServers", "servers", "mcp", ...)
+    ENABLED         optional: emit ``enabled = true`` (TOML clients; JSON uses entry())
     entry(...)      optional: build the per-harness server entry
     render(...)     optional: full override for merging into existing text
     remove(...)     optional: strip the server entry (None = nothing to remove)
+    CLI_BINARIES    optional: names of this client's own CLI, tried in order
+    cli_add(...)    optional: argv for the client's "add a server" command
+    cli_remove(...) optional: argv for the client's "remove a server" command
+    cli_target(scope)  optional: where `cli_add` writes, when that is not a
+                    config path (Cursor's `--add-mcp` edits the profile
+                    settings file, not `~/.cursor/mcp.json`)
+    cli_root_key    optional: root key inside that file (default: ROOT_KEY)
     resolve_workspace(cwd)  optional: publish this session's workspace at runtime
 
 A plugin that implements ``resolve_workspace`` must also put the reserved
@@ -31,6 +39,10 @@ the entry it builds — no ``cwd`` derived from ``env``, no ``WORKSPACE_ROOT``,
 ``INDEX_DB`` or ``FAISS_PATH``. The wizard passes an empty ``env`` unless
 ``--no-git-pull`` (debug) adds ``SIMPLE_CI_GIT_PULL=0``, and the
 server infers the workspace from its process cwd at runtime (ADR-007).
+
+Project-scope entries are the exception (ADR-022): they are written into the
+workspace, so they carry the explicit pin ``serve --workspace <abs workspace>``
+(``pinned_command``). A global entry never carries it.
 """
 
 from __future__ import annotations
@@ -55,12 +67,73 @@ EntryFn = Callable[[list[str], dict[str, str]], dict[str, Any]]
 RenderFn = Callable[..., str]
 RemoveFn = Callable[..., str | None]
 ResolveWorkspaceFn = Callable[[Path], Path | None]
+CliAddFn = Callable[..., "list[str] | None"]
+"""`cli_add(scope, workspace, name, command, entry) -> argv | None`.
+
+`command` is the final argv (already pinned for project scope) and `entry` is
+the plugin's canonical entry, so a client CLI can be handed either shape.
+``None`` means "this client's CLI cannot express that scope" — the wizard then
+writes the config file itself.
+"""
+CliRemoveFn = Callable[..., "list[str] | None"]
+"""`cli_remove(scope, workspace, name) -> argv | None`."""
+CliTargetFn = Callable[[str], "str | None"]
+"""`cli_target(scope) -> config pattern | None`.
+
+Only for a client whose `cli_add` writes somewhere other than the plugin's own
+config paths — Cursor's `--add-mcp` edits the profile settings file. `None`
+means "the CLI cannot be used at this scope".
+"""
+
+
+class Scope:
+    """Where a harness entry is stored.
+
+    `PROJECT` config files live inside the workspace and carry the pin;
+    `GLOBAL` ones serve every project and never do (ADR-015, ADR-022).
+    """
+
+    GLOBAL = "global"
+    PROJECT = "project"
+    LOCAL_ALIAS = "local"
+    """The pre-ADR-022 name for `PROJECT`; still accepted by `candidates`."""
+
 
 RUNTIME_ENV = "SIMPLE_CI_HARNESS"
 """Reserved entry env key naming the plugin that launched this session.
 
 Install-scoped, not per-project: the server uses it to pick the one plugin
 allowed to publish a workspace at runtime (ADR-018)."""
+
+WORKSPACE_FLAG = "--workspace"
+"""Explicit workspace pin for project-scope entries (ADR-022).
+
+A project entry lives inside the workspace, so pinning the directory there is
+not the global-entry hazard ADR-015 banned; it also survives a client that
+spawns stdio children from somewhere else.
+"""
+
+
+def pinned_command(command: list[str], workspace: Path) -> list[str]:
+    """`command` plus the explicit workspace pin, for a project-scope entry."""
+    return [*command, WORKSPACE_FLAG, str(workspace)]
+
+
+def entry_argv(entry: dict[str, Any]) -> list[str]:
+    """An entry's launch command as one argv list (shape varies by client).
+
+    `command` is a list for OpenCode/MiMo, a string plus `args` for most other
+    JSON clients, and `cmd` for Goose. Unrelated keys are ignored.
+    """
+    command = entry.get("command", entry.get("cmd"))
+    if isinstance(command, list):
+        return [str(part) for part in command]
+    if isinstance(command, str):
+        args = entry.get("args")
+        extra = [str(part) for part in args] if isinstance(args, list) else []
+        return [command, *extra]
+    return []
+
 
 _which = shutil.which
 _UNRESOLVED_VAR = re.compile(r"%[^%]+%")
@@ -80,12 +153,18 @@ class HarnessSpec:
     render: RenderFn
     remove: RemoveFn
     workspace_resolver: ResolveWorkspaceFn | None = None
+    enabled: bool = False
+    cli_binaries: tuple[str, ...] = ()
+    cli_add: CliAddFn | None = None
+    cli_remove: CliRemoveFn | None = None
+    cli_target: CliTargetFn | None = None
+    cli_root_key: str | None = None
 
     def detected(self, home: Path | None = None) -> bool:
         """True when one of the harness's home folders or binaries exists."""
         root = home or Path.home()
         for raw in self.home_dirs:
-            path = _expand(raw, root, root)
+            path = expand_config_path(raw, root, root)
             if path is not None and path.is_dir():
                 return True
         return any(_which(binary) is not None for binary in self.binaries)
@@ -93,19 +172,34 @@ class HarnessSpec:
     def candidates(
         self, scope: str, workspace: Path, home: Path | None = None
     ) -> list[Path]:
-        """Config paths to try for "global" or "local" scope (may not exist)."""
-        raw = self.global_configs if scope == "global" else self.local_configs
+        """Config paths to try for "global" or "project" scope (may not exist).
+
+        `"local"` is the pre-ADR-022 spelling of `"project"` and is still
+        accepted, so existing calls and user plugins keep working.
+        """
+        global_scope = scope == Scope.GLOBAL
+        raw = self.global_configs if global_scope else self.local_configs
         paths: list[Path] = []
         for item in raw:
-            path = _expand(item, workspace, home)
+            path = expand_config_path(item, workspace, home)
             if path is not None:
                 paths.append(path)
         return paths
 
+    def supports(self, scope: str) -> bool:
+        """True when the client has a config file for `scope`."""
+        return scope == Scope.GLOBAL or bool(self.local_configs)
 
-def _expand(raw: str, base: Path, home: Path | None = None) -> Path | None:
-    """Expand ~ and environment variables; None when a variable stays unresolved."""
-    expanded = os.path.expandvars(raw)
+
+def expand_config_path(raw: str, base: Path, home: Path | None = None) -> Path | None:
+    """A `GLOBAL_CONFIGS`-style pattern as a path; None when a var stays unset.
+
+    An explicit `home` also redirects the app-data variables (`%APPDATA%`,
+    `%LOCALAPPDATA%`), so a caller that supplies a profile — the wizard's
+    rehearsal runs and its tests — never reads or writes the real one.
+    """
+    expanded = _apply_home_overrides(raw, home) if home is not None else raw
+    expanded = os.path.expandvars(expanded)
     if _UNRESOLVED_VAR.search(expanded):
         return None
     if expanded == "~" or expanded.startswith(("~/", "~\\")):
@@ -113,6 +207,20 @@ def _expand(raw: str, base: Path, home: Path | None = None) -> Path | None:
         expanded = str(root) + expanded[1:]
     path = Path(expanded)
     return path if path.is_absolute() else base / path
+
+
+def _apply_home_overrides(raw: str, home: Path) -> str:
+    """Point the app-data variables at `home`, so a supplied profile wins."""
+    overrides = {
+        "%APPDATA%": home / "AppData" / "Roaming",
+        "%LOCALAPPDATA%": home / "AppData" / "Local",
+        "$APPDATA": home / "AppData" / "Roaming",
+        "$LOCALAPPDATA": home / "AppData" / "Local",
+    }
+    expanded = raw
+    for marker, replacement in overrides.items():
+        expanded = expanded.replace(marker, str(replacement))
+    return expanded
 
 
 _HARNESSES: tuple[HarnessSpec, ...] | None = None
@@ -306,6 +414,22 @@ def _spec_from_module(module: ModuleType, path: Path) -> HarnessSpec | None:
     if resolve_workspace is not None and not callable(resolve_workspace):
         logger.warning("harness plugin %s resolve_workspace must be callable", path)
         return None
+    cli_add = getattr(module, "cli_add", None)
+    if cli_add is not None and not callable(cli_add):
+        logger.warning("harness plugin %s cli_add must be callable", path)
+        return None
+    cli_remove = getattr(module, "cli_remove", None)
+    if cli_remove is not None and not callable(cli_remove):
+        logger.warning("harness plugin %s cli_remove must be callable", path)
+        return None
+    cli_target = getattr(module, "cli_target", None)
+    if cli_target is not None and not callable(cli_target):
+        logger.warning("harness plugin %s cli_target must be callable", path)
+        return None
+    enabled = getattr(module, "ENABLED", False)
+    if not isinstance(enabled, bool):
+        logger.warning("harness plugin %s ENABLED must be a bool", path)
+        return None
     fmt = getattr(module, "FORMAT", "json")
     if fmt not in {"json", "toml", "yaml"}:
         logger.warning("harness plugin %s FORMAT must be json, toml or yaml", path)
@@ -346,6 +470,16 @@ def _spec_from_module(module: ModuleType, path: Path) -> HarnessSpec | None:
             if resolve_workspace is not None
             else None
         ),
+        enabled=enabled,
+        cli_binaries=_string_tuple(module, "CLI_BINARIES", path),
+        cli_add=cast(CliAddFn, cli_add) if cli_add is not None else None,
+        cli_remove=cast(CliRemoveFn, cli_remove) if cli_remove is not None else None,
+        cli_target=cast(CliTargetFn, cli_target) if cli_target is not None else None,
+        cli_root_key=(
+            getattr(module, "CLI_ROOT_KEY", None)
+            if isinstance(getattr(module, "CLI_ROOT_KEY", None), str)
+            else None
+        ),
     )
 
 
@@ -354,7 +488,11 @@ def _build_render(module: ModuleType, path: Path, fmt: str) -> RenderFn:
     entry_fn = cast(EntryFn, entry) if callable(entry) else _default_entry
     if fmt == "toml":
         return lambda existing, *, name, command, env: _toml.upsert(
-            existing, name=name, command=command, env=env
+            existing,
+            name=name,
+            command=command,
+            env=env,
+            enabled=bool(getattr(module, "ENABLED", False)),
         )
     root_key = getattr(module, "ROOT_KEY", None)
     if not isinstance(root_key, str) or not root_key:

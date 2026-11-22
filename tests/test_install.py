@@ -28,7 +28,7 @@ class FakeRunner(Runner):
         self.console_calls.append(list(argv))
         return self.console_rc
 
-    def run(self, argv: list[str], *, timeout: float = 15.0) -> CommandResult:
+    def run(self, argv: list[str], *, timeout: float = 15.0, cwd=None) -> CommandResult:
         self.calls.append(list(argv))
         for key, result in self.responses.items():
             if tuple(argv[: len(key)]) == key:
