@@ -7,6 +7,9 @@ silently corrupting the index.
 
 from __future__ import annotations
 
+import importlib.util
+import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,6 +19,19 @@ from simple_code_indexer.languages import catalog
 from simple_code_indexer.registry import load_registry
 
 DENIED = (".md", ".markdown", ".txt", ".json", ".yaml", ".yml", ".toml", ".csv", ".xml")
+
+#: The generator's own kind vocabulary, imported rather than restated so the two
+#: can never drift apart. (`sys.modules` must be populated before `exec_module`,
+#: or the module's own `@dataclass` decorators cannot resolve their module.)
+_spec = importlib.util.spec_from_file_location(
+    "gen_language_catalog_for_tests",
+    Path(__file__).resolve().parents[1] / "tools" / "gen_language_catalog.py",
+)
+assert _spec is not None and _spec.loader is not None
+_generator = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name or "gen_language_catalog_for_tests"] = _generator
+_spec.loader.exec_module(_generator)
+KINDS = _generator.SYMBOL_KINDS
 
 
 def test_catalog_version_is_set() -> None:
@@ -27,6 +43,57 @@ def test_entries_have_name_and_grammar() -> None:
         assert spec.name
         assert spec.grammar
         assert spec.name == spec.grammar
+
+
+def test_symbol_maps_use_real_node_types_and_known_kinds() -> None:
+    """Every mapped node type is a valid identifier and a known kind.
+
+    Offline on purpose: the generator validates node types against the installed
+    grammar, but that needs the grammar downloaded, which the unit suite must not
+    do. This catches a hand edit or a truncated regeneration.
+    """
+    registered = {spec.name for spec in catalog.ENTRIES} - catalog.DATA_FORMATS
+    allowed = [spec for spec in catalog.ENTRIES if spec.name in registered]
+    pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    for spec in allowed:
+        for node, entry in spec.symbol_nodes.items():
+            assert pattern.match(node), f"{spec.name}: {node!r} is not a node type"
+            kind = entry.partition("@")[0]
+            assert kind in KINDS, f"{spec.name}: {node} -> unknown kind {kind!r}"
+
+
+def test_symbol_gaps_do_not_overlap_mapped_languages() -> None:
+    mapped = {spec.name for spec in catalog.ENTRIES if spec.symbol_nodes}
+    assert not (set(catalog.SYMBOL_GAPS) & mapped)
+
+
+def test_symbol_gaps_do_not_overlap_injection_hosts() -> None:
+    """A host whose declarations come from an embedded region is not a gap."""
+    hosts = {spec.name for spec in catalog.ENTRIES if spec.injections}
+    assert hosts
+    assert not (set(catalog.SYMBOL_GAPS) & hosts)
+
+
+def test_injection_hosts_are_symbol_mapped() -> None:
+    for spec in catalog.ENTRIES:
+        if spec.injections:
+            assert spec.symbol_mapped, spec.name
+
+
+def test_symbol_gaps_are_registered_languages() -> None:
+    registered = {spec.name for spec in catalog.ENTRIES} - catalog.DATA_FORMATS
+    assert set(catalog.SYMBOL_GAPS) <= registered
+
+
+def test_prefetch_is_a_bounded_subset() -> None:
+    registered = {spec.name for spec in catalog.ENTRIES} - catalog.DATA_FORMATS
+    assert catalog.PREFETCH <= registered
+    assert 0 < len(catalog.PREFETCH) <= 60
+
+
+def test_symbol_map_version_is_set() -> None:
+    assert isinstance(catalog.SYMBOL_MAP_VERSION, str) and catalog.SYMBOL_MAP_VERSION
+    assert catalog.SYMBOL_MAP_VERSION != catalog.VERSION
 
 
 def test_every_grammar_exists_in_the_pack() -> None:

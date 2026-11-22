@@ -19,8 +19,9 @@ class LanguageSpec:
     filenames: frozenset[str]
     symbol_nodes: dict[str, str] = field(default_factory=dict)
     extract: ExtractFn | None = None
+    injections: bool = False
 
     @property
     def symbol_mapped(self) -> bool:
         """True when this language can resolve symbols on its own."""
-        return self.extract is not None or bool(self.symbol_nodes)
+        return self.extract is not None or bool(self.symbol_nodes) or self.injections

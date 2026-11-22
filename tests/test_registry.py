@@ -74,10 +74,20 @@ def test_data_formats_are_never_registered() -> None:
 
 
 def test_prefetch_targets_stay_small() -> None:
+    """Prefetch is a fixed, bounded set, not every symbol-mapped grammar.
+
+    A map now exists for most of the catalog; prefetching all of them would
+    download the whole pack on first run (ADR-016).
+    """
     registry = load_registry()
-    mapped = registry.mapped_grammars()
-    assert 0 < len(mapped) <= 60
-    assert set(mapped) < set(registry.grammars())
+    registered = {spec.name for spec in catalog.ENTRIES} - catalog.DATA_FORMATS
+    assert 0 < len(catalog.PREFETCH) <= 60
+    assert catalog.PREFETCH <= registered
+    # Every prefetched grammar must still be symbol-mapped, or prefetching it is
+    # a wasted download.
+    for name in catalog.PREFETCH:
+        spec = registry.spec(name)
+        assert spec is not None and spec.symbol_mapped, name
 
 
 def test_symbol_mapped_flags_cover_the_curated_languages() -> None:
@@ -87,5 +97,16 @@ def test_symbol_mapped_flags_cover_the_curated_languages() -> None:
     zig = registry.spec("zig")
     assert python is not None and python.symbol_mapped
     assert rust is not None and rust.symbol_mapped
-    assert zig is not None and not zig.symbol_mapped
+    # Zig ships no tags query, so its map is hand-verified in the generator.
+    assert zig is not None and zig.symbol_mapped
     assert len(get_registry()) == len(registry)
+
+
+def test_only_recorded_gaps_lack_a_symbol_map() -> None:
+    """`SYMBOL_GAPS` is the exhaustive list of languages that cannot resolve."""
+    actual = {
+        spec.name
+        for spec in catalog.ENTRIES
+        if spec.name not in catalog.DATA_FORMATS and not spec.symbol_mapped
+    }
+    assert actual == set(catalog.SYMBOL_GAPS)

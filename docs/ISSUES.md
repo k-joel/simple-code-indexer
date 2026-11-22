@@ -84,15 +84,3 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ## Open
 
-### ISS-013: Most catalog languages produce no symbols
-
-- **Symptom**: `symbol_lookup` never resolves a name in most newly indexable languages (Zig, Nim,
-  Svelte, Vue, Terraform, Nix, V, Odin, Gleam, and others); the file is searchable but contributes
-  no symbols.
-- **Where flagged**: 2026-11-17, during the catalog consolidation (ADR-016).
-- **Cause**: `tools/gen_language_catalog.py` only ships the 29 curated `SYMBOL_NODES` maps; the
-  pack's `process()` fallback (`parse._process_symbols`) named a symbol for just 6 of 29 unmapped
-  languages sampled.
-- **Suggested fix**: add `SYMBOL_NODES` entries to the generator for languages users report, keeping
-  `catalog.VERSION` unchanged (no index migration needed). Verify each node type against the real
-  grammar before committing.

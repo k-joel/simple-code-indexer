@@ -148,6 +148,7 @@ def _status_payload(
         "embed_ok": embed.LAST_OK is True,
         "languages_loaded": len(registry),
         "languages_with_symbol_maps": len(registry.mapped_grammars()),
+        "languages_without_symbol_maps": len(catalog.SYMBOL_GAPS),
         "languages_indexed": len(languages_seen),
         "data_formats_excluded": len(catalog.DATA_FORMATS),
         "grammars_ready": len(_parsers),

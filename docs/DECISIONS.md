@@ -474,14 +474,15 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   "data formats are not indexed" rule and hardens it: a filename match still runs first, so
   `CMakeLists.txt` resolves to `cmake` even though `.txt` belongs to the denied `vimdoc` language.
 - **Consequences:** Language coverage goes 36 → 322 indexable languages at zero startup cost, with no
-  storage-format change. Symbols are not free: only ~29 languages have a curated node map or extractor.
-  `symbol_lookup` now returns a `coverage` signal (`none`/`partial`/`full`) plus a hint when a language
-  produced no symbols, and unmapped languages get one attempt through the pack's `process()` analysis
-  (`SYMBOL_FALLBACK=0`, measured to name a symbol for 6 of 29 unmapped languages sampled). Prefetch is
-  bounded to the symbol-mapped grammars so startup cannot trigger a ~370-grammar download storm.
-  `catalog.VERSION` is stored in `meta` and drives a targeted reconcile (drop rows that are no longer
-  allowed or whose stored language changed) rather than a full re-embed. Fixing a wrong mapping is now
-  a generator edit plus regeneration, not a user drop-in — accepted because the folder was empty.
+  storage-format change. Symbol coverage was the gap this ADR left open — only ~29 languages had a
+  curated node map — and [ADR-020](#adr-020-symbol-maps-are-derived-from-the-packs-tags-queries-at-catalog-generation-time)
+  closes it by deriving maps from each grammar's tags query (167 languages) and recording the rest in
+  `catalog.SYMBOL_GAPS`. `symbol_lookup` reports a `coverage` signal (`none`/`partial`/`full`) plus a
+  hint when a language produced no symbols. Prefetch stays a bounded set (`catalog.PREFETCH`) so
+  startup cannot trigger a ~370-grammar download storm. `catalog.VERSION` is stored in `meta` and
+  drives a targeted reconcile (drop rows that are no longer allowed or whose stored language changed)
+  rather than a full re-embed. Fixing a wrong mapping is now a generator edit plus regeneration, not a
+  user drop-in — accepted because the folder was empty.
 
 ## ADR-017: sqlite-vec is the default vector store; FAISS and Qdrant opt-in
 
@@ -546,3 +547,68 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   server that never receives a handshake never opens an index, which is correct, and one that lands in
   an editor install or the home directory fails loudly instead of building an empty index. Discovery
   stays isolated: core code knows only the generic hook, the marker key, and the ancestor walk.
+
+## ADR-020: Symbol maps are derived from the pack's tags queries at catalog-generation time
+
+- **Context:** ADR-016 replaced the plugin folder with a generated catalog but kept only 29 curated
+  `SYMBOL_NODES` maps, so 293 indexable languages produced no symbols at all (ISS-013). Hand-writing
+  maps does not scale and does not stay correct: of 77 maps drafted by hand for this decision, 40
+  named node types that do not exist in the installed grammar — `elm`'s `type_alias`, `fortran`'s
+  `type`, `perl`'s `function_definition` had all been silently dead. The pack ships two authoritative
+  sources per grammar that were both unused: a **tags query** (`get_tags_query`) — the grammar
+  authors' own list of `@definition.*` / `@name` captures, which names the real declaration node
+  types — and a `symbols=True` mode on `process()` that the fallback never enabled.
+- **Decision:** `tools/gen_language_catalog.py` builds each language's map in three tiers, highest
+  first: a hand-verified `SYMBOL_NODES` entry; the grammar's tags query, parsed as S-expressions and
+  validated against the grammar's own node-kind table; and a shape heuristic over node-kind names
+  (`*_definition`, `*_declaration`, `*_def`, …) for the ~225 grammars that ship neither. A node type
+  the grammar does not have is a hard error in the generator, not a silent skip, so a pack rename is
+  caught at regeneration. Name resolution moved into `parse._symbol_name`, which tries the name-bearing
+  field conventions and then a bounded search that skips body/type/value fields, because grammars
+  disagree on both the field (`name:`, `declarator:`, `function:`, `attrpath:`) and whether the name
+  is nested. Languages that hold a declaration in a label list, block label, head symbol, or an
+  enclosing assignment get an extractor instead of a map. `get_status` reports the residual
+  `SYMBOL_GAPS`, and `catalog.PREFETCH` is a hand-picked bounded set so the map for most of the
+  catalog cannot turn startup into a whole-pack download.
+- **Consequences:** Symbol coverage goes 29 → 167 languages at zero runtime cost, and a pack upgrade
+  is still a reviewable diff. The laws that follow: a map cannot fix a grammar whose declarations are
+  found by neither a field nor a node-kind shape, so `SYMBOL_GAPS` (155 languages) is expected to stay
+  non-empty; template hosts (`vue`, `svelte`, `astro`, `heex`) index no symbols from their embedded
+  `<script>` blocks under this decision — [ADR-021](#adr-021-embedded-regions-are-indexed-through-the-grammars-injections-query-opt-in-per-host)
+  closed that gap with an injection pass; and a map change must bump `SYMBOL_MAP_VERSION`, never
+  `CATALOG_VERSION`, because the former triggers a symbols-only re-parse whereas the latter drops rows
+  and forces a re-embed.
+
+## ADR-021: Embedded regions are indexed through the grammar's injections query, opt-in per host
+
+**Status**: Accepted
+**Date**: 2026-11-22
+**Deciders**: @k-joel, agent session (ISS-014)
+
+- **Context:** ADR-020 closed symbol coverage for grammars whose declarations are their own nodes, but
+  a whole class of languages declares nothing useful in the host grammar: Vue/Svelte/Astro component
+  code lives in a `<script>` block, Heex in `<%= %>` directives, Blade in `@php`, Templ in a `script`
+  block. Those regions are parsed by a *different* grammar and are reachable only through tree-sitter
+  injections, which `extract_symbols` never ran. The pack ships an injections query per grammar
+  (`get_injections_query`), but it is authored for syntax highlighting: it also targets CSS, comments,
+  regexes, HTML, bash and doc comments, and one region can match several patterns.
+- **Decision:** `parse.extract_from_tree` runs an injection pass for a language whose generated
+  `LanguageSpec.injections` flag is set (`astro`, `blade`, `heex`, `svelte`, `templ`, `vue` — the hosts
+  whose own grammar declares nothing). The target language comes from the pattern's
+  `#set! injection.language` property or, for Svelte, from the capture name (`@javascript`,
+  `@typescript`). Only code targets are indexed — `elixir`, `javascript`, `php_only`, `typescript` —
+  and a region matching several patterns is deduplicated by span, keeping the more specific language
+  (TypeScript over JavaScript). Symbols are shifted by the region's start line, so they point at the
+  host file. `php_only` is not a pack grammar and is parsed through `php` behind a `<?php ` prefix; a
+  `<script lang="ts">` upgrades the hard-coded `javascript` target to `typescript`, because the
+  JavaScript grammar turns `interface`/`enum`/generics into ERROR nodes. The pass recurses only through
+  `_extract_local`, so a host's injections are never followed twice. Twig and Jinja get extractors
+  instead of injections, because their declarations are template tags rather than embedded code.
+- **Consequences:** Symbol-mapped languages go 167 → 174 and `SYMBOL_GAPS` 155 → 148, with no schema
+  or storage change; `SYMBOL_MAP_VERSION` is bumped so existing indexes re-parse once. The cost is one
+  extra query match and a re-parse per embedding file, and the injection pass is deliberately not
+  applied to every one of the 142 grammars that ship a query: a highlighting query targets CSS,
+  comments, and regexes too, so enabling it wholesale would index selectors and comments as symbols.
+  Heex `<script>`/`<style>` tags stay unindexed because their query captures the whole tag and its
+  `#offset!` directives are not exposed by the binding; the limitation is recorded rather than
+  worked around with a host-specific offset table.

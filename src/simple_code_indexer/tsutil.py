@@ -26,12 +26,25 @@ def text(node: Any, source: str) -> str:
 
 
 def signature(node: Any, source: str) -> str:
-    """Node text up to its body — e.g. `uint32_t f(const Widget&)`."""
+    """Node text up to its body — e.g. `uint32_t f(const Widget&)`.
+
+    Declaration nodes with no `body` field (`type_spec`, `namespace_definition`,
+    Zig's `FnProto`) would otherwise return the entire node, body included. For
+    those the signature stops at the first `{` or newline, which keeps it to the
+    declaration line.
+    """
     body = node.child_by_field_name("body")
     end = body.start_byte if body is not None else node.end_byte
-    return (
+    raw = (
         source.encode("utf-8")[node.start_byte : end]
         .decode("utf-8")
         .rstrip()
         .rstrip(";")
     )
+    if body is not None:
+        return raw
+    for marker in ("{", "\n"):
+        cut = raw.find(marker)
+        if cut > 0:
+            raw = raw[:cut]
+    return raw.rstrip().rstrip(";")

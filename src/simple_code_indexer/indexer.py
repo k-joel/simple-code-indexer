@@ -20,6 +20,7 @@ from simple_code_indexer import db, embed, parse, vector_store
 from simple_code_indexer.config import Settings, is_allowed, is_temp_name
 from simple_code_indexer.errors import EmbedError, VectorStoreUnavailable
 from simple_code_indexer.ignore import IgnoreRules
+from simple_code_indexer.languages import catalog
 from simple_code_indexer.models import Chunk, FileRecord
 
 logger = logging.getLogger(__name__)
@@ -105,8 +106,18 @@ class SweepRequest:
     """Queue sentinel: run a reconciliation sweep in the writer thread."""
 
 
+class SymbolsRequest:
+    """Queue sentinel: re-extract symbols for every indexed file once.
+
+    Separate from `SWEEP_REQUEST` because it is a different unit of work: it
+    re-parses files but never re-chunks or re-embeds them, so it cannot be folded
+    into a sweep (which skips unchanged files by `(mtime, size)`).
+    """
+
+
 SWEEP_REQUEST = SweepRequest()
-WorkQueue = queue.Queue[WorkItem | SweepRequest]
+SYMBOLS_REQUEST = SymbolsRequest()
+WorkQueue = queue.Queue[WorkItem | SweepRequest | SymbolsRequest]
 
 
 def new_work_queue(maxsize: int = 500) -> WorkQueue:
@@ -343,6 +354,59 @@ def reembed_pending(settings: Settings) -> int:
     return reembedded
 
 
+def backfill_symbols(settings: Settings) -> int:
+    """Re-extract symbols for every indexed file; returns files updated.
+
+    Needed because a symbol map can improve without any file changing: the
+    sha256 short circuit in `index_one_file` and the `(mtime, size)` check in
+    `sweep` both skip untouched files, so a catalog upgrade would otherwise
+    never reach an existing index.
+
+    This is a symbols-only pass on purpose. It re-reads and re-parses each file
+    and rewrites `symbols`, but never re-chunks, re-embeds, or touches the vector
+    store, so an upgrade costs one parse per file and no embedding work. Files
+    that can no longer be read (deleted, ignored, outside the workspace) are
+    skipped; the next sweep removes the stale rows.
+    """
+    with db.connect(settings.index_db_path) as conn:
+        db.ensure_schema(conn)
+        rows = conn.execute("SELECT id, path FROM files ORDER BY path").fetchall()
+        if not rows:
+            db.set_meta(conn, "symbol_map_version", catalog.SYMBOL_MAP_VERSION)
+            return 0
+        targets = [(int(row["id"]), str(row["path"])) for row in rows]
+
+    updated = 0
+    for file_id, rel in targets:
+        path = settings.workspace_root / rel
+        try:
+            source = path.read_bytes().decode("utf-8", errors="replace")
+        except OSError:
+            logger.debug("symbol backfill skipped unreadable %s", rel)
+            continue
+        try:
+            symbols = parse.extract_symbols(path, source)
+        except Exception:
+            logger.warning("symbol backfill failed for %s", rel, exc_info=True)
+            continue
+        try:
+            with db.connect(settings.index_db_path) as conn, conn:
+                db.replace_file_symbols(conn, file_id, symbols)
+            updated += 1
+        except sqlite3.Error:
+            logger.warning("symbol backfill write failed for %s", rel, exc_info=True)
+
+    with db.connect(settings.index_db_path) as conn, conn:
+        db.set_meta(conn, "symbol_map_version", catalog.SYMBOL_MAP_VERSION)
+    logger.info(
+        "symbol backfill: re-parsed %d/%d file(s) for catalog %s",
+        updated,
+        len(targets),
+        catalog.SYMBOL_MAP_VERSION,
+    )
+    return updated
+
+
 def sweep(settings: Settings, rules: IgnoreRules | None = None) -> SweepStats:
     """Walk the workspace; re-index drift, drop deleted paths."""
     global LAST_SWEEP, LAST_SWEEP_STATS, SWEEP_GENERATION
@@ -448,6 +512,15 @@ def remove_file(settings: Settings, path: Path) -> None:
     logger.debug("removed %s from the index", rel)
 
 
+def _work_label(item: WorkItem | SweepRequest | SymbolsRequest) -> str:
+    """Short queue-item label for logs."""
+    if isinstance(item, SweepRequest):
+        return "sweep"
+    if isinstance(item, SymbolsRequest):
+        return "symbol-backfill"
+    return str(item)
+
+
 def writer_loop(
     settings: Settings,
     work_queue: WorkQueue,
@@ -472,12 +545,14 @@ def writer_loop(
             continue
         logger.debug(
             "index queue: %s (%d waiting)",
-            "sweep" if isinstance(item, SweepRequest) else item,
+            _work_label(item),
             work_queue.qsize(),
         )
         try:
             if isinstance(item, SweepRequest):
                 sweep(settings, rules)
+            elif isinstance(item, SymbolsRequest):
+                backfill_symbols(settings)
             elif item.deleted:
                 remove_file(settings, item.path)
             else:

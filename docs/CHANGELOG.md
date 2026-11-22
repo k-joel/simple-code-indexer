@@ -119,7 +119,60 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ## [Unreleased]
 
+### Added
+
+- **`symbol_lookup` now works for 167 of the 322 indexable languages, up from 29** (ADR-020).
+  Symbol maps are derived at catalog-generation time from each grammar's own tags query
+  (`get_tags_query`), which names the real declaration node types; grammars that ship no tags query
+  fall back to a shape heuristic over their node kinds, and a hand-verified map covers the ones
+  neither reaches. Zig, Nim, Terraform, Nix, V, Odin, Gleam, CSS, SQL, Proto, Verilog, Haskell, R,
+  Elixir, Clojure, and the rest now resolve a real name instead of indexing no symbols.
+- `LanguageSpec.symbol_nodes` values accept a `<kind>@<field>` form, which requires the node to have
+  that field. It exists for grammars that reuse one node type for a declaration and a look-alike —
+  Haskell's `function` is both a definition (`name:`) and a type arrow (`result:`).
+- New extractors for grammars whose declarations the generic walker cannot reach: `extract_hcl`
+  (block labels — `resource "aws_instance" "web"` becomes `aws_instance.web`), `extract_cmake`
+  (`function()`/`macro()` names live in `argument_list`), `extract_sexpr_definitions` (Lisp forms
+  selected by head symbol), `extract_elixir` (a `call` whose target is a `def*` keyword), and
+  `extract_r_assignment` (`name <- function(...)`, named through the enclosing assignment).
+- `catalog.SYMBOL_GAPS` lists the languages that genuinely cannot resolve a symbol, and
+  `get_status.languages_without_symbol_maps` reports its size.
+- The pack's `process(symbols=True)` extractor is now enabled alongside `structure`; it sees
+  declarations the structure pass misses (Go `type` specs, Lua globals).
+- **`symbol_lookup` now resolves declarations inside embedded blocks** for Vue, Svelte, Astro, Heex,
+  Blade, and Templ (ADR-021). Each host's own injections query is run, the captured region is parsed
+  with the embedded grammar, and its symbols are reported at their line in the host file — so a
+  function in a `<script setup lang="ts">` block, a `def` in a Heex `<% %>` directive, or a `function`
+  in a Blade `@php` block is now findable. Typed script blocks are parsed as TypeScript, so
+  `interface`, `enum`, and generic declarations are indexed rather than dropped.
+- Twig and Jinja templates now resolve `{% macro %}` and `{% block %}` names, and Templ resolves its
+  `templ`, `script`, and `css` declarations. Symbol-mapped languages go 167 → 174 and
+  `catalog.SYMBOL_GAPS` 155 → 148.
+
 ### Changed
+
+- **A symbol-map upgrade now re-parses the index once without re-embedding.** `catalog.VERSION`
+  drives a destructive reconcile, so it cannot be used for a map change; `SYMBOL_MAP_VERSION` stamps
+  `meta.symbol_map_version` instead and `indexer.backfill_symbols` rewrites only the `symbols` table.
+  Chunking, embeddings, and the vector store are untouched, so an upgrade costs one parse per file.
+- Grammar prefetch is now a fixed 44-language set in `catalog.PREFETCH` rather than "every
+  symbol-mapped grammar". With a map for most of the catalog the old rule would have downloaded the
+  whole pack on first run; a language outside the set still extracts symbols and loads its grammar
+  on first index.
+- The Make-style `signature` for a node with no `body` field now stops at the declaration line
+  instead of returning the whole node, so Zig's `FnProto` and similar no longer include the body.
+
+### Fixed
+
+- `symbol_lookup` no longer returns a language keyword as a symbol name. Grammars that declare
+  through a nested node (protobuf's `message`), a selector list (CSS `rule_set`), or a head symbol
+  (Clojure `defn`) resolved to the keyword itself before.
+- Setup and the harness loader no longer adopt a source checkout they are not running from. A
+  `site-packages` install nested inside some other project that happens to hold a
+  `src/simple_code_indexer/` tree made the wizard link that project and the loader read its
+  `harnesses/` drop-ins; both now require the tree that contains the running module.
+
+### Changed (install model)
 
 - **The project is now published to PyPI and installed with `uv tool install`** (ADR-019).
   `uvx simple-code-indexer setup` installs a version-pinned environment; harness entries launch

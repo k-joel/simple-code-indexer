@@ -929,24 +929,59 @@ Writes happen only in the writer role. Readers use `try_connect_readonly`.
 - `extract_symbols` loads the grammar lazily; a missing or broken grammar falls
   back to a regex scan for `def`/`function`/`fn`/`class`/`interface`.
 - `extract_from_tree` tries, in order: the entry's `extract` callable
-  (`languages/extractors.py`: Python, Make, C/C++ declarator chain); the generic
-  walk over `SYMBOL_NODES` merged with the default map; and, when that yields
-  nothing for an unmapped language, the pack's own `process()` analysis
-  (`SYMBOL_FALLBACK=0` disables). A signature is the node text up to its `body`
-  field, with the trailing `;` stripped.
+  (`languages/extractors.py`: Python, Make, C/C++ declarator chain, HCL/Terraform
+  block labels, CMake commands, Lisp head symbols, Elixir `def*` calls, R
+  assignments, Twig macros/blocks, Jinja macros/blocks); the generic walk over
+  `SYMBOL_NODES` merged with the default map; and, only for a language with no
+  node map, the pack's own `process()` analysis (`SYMBOL_FALLBACK=0` disables),
+  which reads both `structure` and `symbols=True` and merges them by `(name, line)`.
+- **Embedded regions are indexed for the injection hosts** (ISS-014). A generated
+  `LanguageSpec.injections` flag (`astro`, `blade`, `heex`, `svelte`, `templ`,
+  `vue`) makes `extract_from_tree` also run the grammar's own injections query
+  (`get_injections_query`), re-parse each captured region with the target grammar
+  and its map/extractor, and shift the symbols onto the host file's lines. The
+  target language comes from `#set! injection.language` or, for Svelte, from the
+  capture name (`@javascript`/`@typescript`). Only `elixir`, `javascript`,
+  `php_only`, and `typescript` regions are indexed — style/comment/regex/markup
+  targets carry no lookup-able declaration. `php_only` (not a pack grammar) is
+  parsed through `php` behind a `<?php ` prefix; a `<script lang="ts">` upgrades
+  `javascript` to `typescript`; overlapping matches are deduplicated by span,
+  keeping the more specific language. Injection extraction calls the *local*
+  path, so a host's injections are never followed recursively.
+- **Symbol maps are generated, not hand-written** (ADR-020). For every registered
+  language the generator takes, in order: a hand-verified `SYMBOL_NODES` entry;
+  the grammar's own tags query (`get_tags_query`, parsed as S-expressions and
+  validated against the grammar's node-kind table); a shape heuristic over
+  node-kind names (`*_definition`, `*_declaration`, `*_def`, …). A node type the
+  grammar lacks is a generator error, so a pack rename fails regeneration instead
+  of silently emptying a map. A map value may be `<kind>@<field>`, requiring that
+  field on the node (Haskell's `function` is both a definition and a type arrow).
+- `_symbol_name` resolves the declared name across grammar conventions: the
+  name-bearing fields (`name`, `declarator`, `function`, `variable_type_function`,
+  `attrpath`, …), then a bounded breadth-first search that skips body/type/value
+  fields. A declaration with no resolvable name produces no symbol.
+- `catalog.SYMBOL_GAPS` names the registered languages with no map and no
+  extractor; `get_status.languages_without_symbol_maps` reports its size.
 - `chunk_source` emits line-aligned windows: `CHUNK_LINES = 30`,
   `CHUNK_CHARS = 1200`, `CHUNK_OVERLAP_LINES = 15`. A long line may end a window
   early, but the next window starts at the first uncovered line, so no content
   is skipped. `CHUNKER_VERSION` (`windows/30x15/1200`) is part of the vector
   identity.
 - Grammars are prefetched on a daemon thread at writer startup
-  (`PREFETCH_GRAMMARS=0` disables). Only the symbol-mapped grammars
-  (`mapped_grammars()`, ~30) are prefetched: pulling all ~370 would trigger a
-  download storm for no benefit.
+  (`PREFETCH_GRAMMARS=0` disables). Only `catalog.PREFETCH` (44 hand-picked
+  grammars) is loaded: a map exists for most of the catalog, so prefetching every
+  symbol-mapped grammar would download the whole pack for no benefit. A language
+  outside the set extracts symbols and loads its grammar on first index.
 - `catalog.VERSION` is stored as `meta.language_catalog_version`.
   `runtime._reconcile_language_catalog` compares it at startup and drops rows
   whose path is no longer allowed or whose stored `language` no longer matches
   detection; the startup sweep re-indexes them. No schema change, no re-embed.
+- `catalog.SYMBOL_MAP_VERSION` is stored as `meta.symbol_map_version`. When it
+  differs, the writer enqueues `indexer.SYMBOLS_REQUEST` before the startup
+  sweep; `indexer.backfill_symbols` re-reads and re-parses each indexed file and
+  rewrites only `symbols`. It never re-chunks, re-embeds, or touches the vector
+  store, so a map upgrade costs one parse per file. A map change must bump this
+  constant, never `catalog.VERSION`, which drops rows and forces a re-embed.
 
 ### 7.4 `embed.py` and `model_prompts.py`
 
@@ -1314,7 +1349,8 @@ message.
   "vector_index": "d:/projects/my-app/.simple-ci/index.db#vec_chunks",
   "embed_ok": true,
   "languages_loaded": 322,
-  "languages_with_symbol_maps": 29,
+  "languages_with_symbol_maps": 167,
+  "languages_without_symbol_maps": 155,
   "languages_indexed": 4,
   "data_formats_excluded": 49,
   "grammars_ready": 36,
@@ -1351,6 +1387,9 @@ message.
   `sweep_seconds` reports the configured interval (`0` = periodic sweeps off).
 - `ignored_dirs` / `ignored_files` are what the last sweep pruned via
   `.gitignore` (0 before the first sweep completes).
+- `languages_with_symbol_maps` counts grammars that can produce symbols;
+  `languages_without_symbol_maps` is `len(catalog.SYMBOL_GAPS)` — languages that
+  fall back to the generic five node types and the pack's `process()`.
 - `config_file` is null when no config file exists; `config_files` has 0 or 1
   entries.
 - `workspace_source` is `env` (`WORKSPACE_ROOT`), `roots` (the client's

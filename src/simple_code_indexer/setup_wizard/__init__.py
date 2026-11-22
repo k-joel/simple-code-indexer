@@ -59,15 +59,19 @@ def _default_repo_root() -> Path | None:
     """The source checkout, when the running package *is* that checkout.
 
     Detection is deliberately strict: the parent must contain this package's own
-    module tree. A plain `pyproject.toml` search is not enough, because an
-    installed package almost always lives inside *some* project
-    (`.venv/Lib/site-packages/...`), and adopting that project would make the
-    wizard build and install the wrong tree. A wheel has no `src/` beside it, so
-    this returns None there. Never fall back to `Path.cwd()`: the cwd is the
+    module tree, and that tree must be the one this module executes from. A plain
+    `pyproject.toml` search is not enough, because an installed package almost
+    always lives inside *some* project (`.venv/Lib/site-packages/...`), and
+    adopting that project would make the wizard build and install the wrong tree.
+    Requiring the tree to contain this file also rejects a project that merely
+    holds a `src/simple_code_indexer/` sibling. A wheel has no `src/` beside it,
+    so this returns None there. Never fall back to `Path.cwd()`: the cwd is the
     user's project, which is what gets indexed, not what gets installed.
     """
-    for parent in Path(__file__).resolve().parents:
-        if (parent / "src" / "simple_code_indexer" / "__init__.py").is_file():
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        tree = (parent / "src" / "simple_code_indexer").resolve()
+        if tree in here.parents:
             return parent
     return None
 

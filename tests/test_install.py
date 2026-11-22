@@ -109,6 +109,50 @@ def test_an_unrelated_project_above_site_packages_is_not_a_checkout(
     assert harnesses_pkg._repo_harnesses_dir() is None
 
 
+def test_a_sibling_src_tree_does_not_make_a_checkout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A project that merely holds a src/simple_code_indexer/ is still not us.
+
+    The walk must claim the tree this module executes from, so a site-packages
+    copy nested inside a checkout cannot adopt the checkout's harness drop-ins.
+    """
+    from simple_code_indexer import harnesses as harnesses_pkg
+    from simple_code_indexer import setup_wizard as wizard_pkg
+
+    site = (
+        tmp_path
+        / "checkout"
+        / ".venv"
+        / "Lib"
+        / "site-packages"
+        / "simple_code_indexer"
+    )
+    site.mkdir(parents=True)
+    foreign = tmp_path / "checkout" / "src" / "simple_code_indexer" / "__init__.py"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("", encoding="utf-8")
+    fake_module = site / "__init__.py"
+    fake_module.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(harnesses_pkg, "__file__", str(fake_module))
+    monkeypatch.setattr(wizard_pkg, "__file__", str(fake_module))
+
+    assert harnesses_pkg._repo_harnesses_dir() is None
+    assert wizard_pkg._default_repo_root() is None
+
+
+def test_the_mirrored_checkout_check_agrees_with_the_harness_one() -> None:
+    """`_default_repo_root` and `_repo_harnesses_dir` must agree on this tree."""
+    from simple_code_indexer.harnesses import _repo_harnesses_dir
+    from simple_code_indexer.setup_wizard import _default_repo_root
+
+    root = _default_repo_root()
+
+    assert root is not None
+    assert _repo_harnesses_dir() == root / "harnesses"
+
+
 def test_install_spec_from_a_checkout_editable_names_the_checkout(
     tmp_path: Path,
 ) -> None:

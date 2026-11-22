@@ -146,6 +146,12 @@ class WriterRuntime:
             daemon=True,
         )
         self._writer_thread.start()
+        # Symbol maps can improve without any file changing, and both the
+        # sha256 and (mtime, size) checks would skip those files forever. Queued
+        # before the sweep so the backfill re-parses once and the sweep then only
+        # picks up files that genuinely changed.
+        if _symbol_maps_stale(settings):
+            work_queue.put(indexer.SYMBOLS_REQUEST)
         work_queue.put(indexer.SWEEP_REQUEST)
         self._observer = watcher.start_watcher(settings, work_queue)
         logger.info("startup: watcher started")
@@ -389,6 +395,31 @@ def _dormant_sweep(
                 )
         except Exception:
             logger.exception("cannot request a temporary sweep")
+
+
+def _symbol_maps_stale(settings: Settings) -> bool:
+    """True when the index was built with an older symbol map.
+
+    The stamp lives in `meta`; it is written by `indexer.backfill_symbols`, which
+    the writer queue drives. A database that does not exist yet is not stale —
+    the startup sweep indexes everything with the current map anyway.
+    """
+    if not settings.index_db_path.exists():
+        return False
+    try:
+        with db.connect(settings.index_db_path) as conn:
+            stored = db.get_meta(conn, "symbol_map_version")
+    except sqlite3.Error:
+        logger.debug("cannot read symbol map version", exc_info=True)
+        return False
+    if stored == catalog.SYMBOL_MAP_VERSION:
+        return False
+    logger.info(
+        "symbol maps changed (%s -> %s): re-parsing indexed files for symbols",
+        stored or "none",
+        catalog.SYMBOL_MAP_VERSION,
+    )
+    return True
 
 
 def _reconcile_language_catalog(settings: Settings) -> None:

@@ -13,6 +13,7 @@ from simple_code_indexer import (
 )
 from simple_code_indexer.config import IGNORE_DIRS, Settings
 from simple_code_indexer.errors import EmbedError
+from simple_code_indexer.languages import catalog
 from simple_code_indexer.registry import get_registry
 
 FIXTURE = """\
@@ -352,3 +353,51 @@ def test_sweep_generation_advances(tmp_path: Path) -> None:
     before = indexer.SWEEP_GENERATION
     indexer.sweep(settings)
     assert indexer.SWEEP_GENERATION == before + 1
+
+
+def test_backfill_symbols_rewrites_symbols_only(tmp_path: Path) -> None:
+    """A symbol-map upgrade re-parses files without re-chunking or re-embedding."""
+    settings = _settings(tmp_path)
+    source = tmp_path / "widget.cpp"
+    source.write_text(FIXTURE, encoding="utf-8")
+    indexer.index_one_file(settings, source)
+
+    with db.connect(settings.index_db_path) as conn:
+        before = db.stats(conn)
+        with conn:
+            conn.execute("DELETE FROM symbols")
+        assert db.stats(conn)["symbols"] == 0
+
+    updated = indexer.backfill_symbols(settings)
+
+    assert updated == 1
+    with db.connect(settings.index_db_path) as conn:
+        after = db.stats(conn)
+        assert after["symbols"] > 0
+        # Only the symbols table moved; chunks and embedding state are untouched.
+        assert after["chunks"] == before["chunks"]
+        assert after["files"] == before["files"]
+
+
+def test_backfill_symbols_is_stamped_with_the_map_version(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    (tmp_path / "widget.cpp").write_text(FIXTURE, encoding="utf-8")
+    indexer.index_one_file(settings, tmp_path / "widget.cpp")
+
+    indexer.backfill_symbols(settings)
+
+    with db.connect(settings.index_db_path) as conn:
+        assert db.get_meta(conn, "symbol_map_version") == catalog.SYMBOL_MAP_VERSION
+
+
+def test_backfill_symbols_tolerates_a_missing_file(tmp_path: Path) -> None:
+    """A path deleted while the backfill runs is skipped, not fatal."""
+    settings = _settings(tmp_path)
+    source = tmp_path / "gone.cpp"
+    source.write_text(FIXTURE, encoding="utf-8")
+    indexer.index_one_file(settings, source)
+    source.unlink()
+
+    assert indexer.backfill_symbols(settings) == 0
+    with db.connect(settings.index_db_path) as conn:
+        assert db.get_meta(conn, "symbol_map_version") == catalog.SYMBOL_MAP_VERSION

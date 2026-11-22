@@ -235,14 +235,17 @@ def _repo_harnesses_dir() -> Path | None:
     """`<checkout>/harnesses`, or None when running from an installed wheel.
 
     The check mirrors `setup_wizard._default_repo_root`: the parent must hold this
-    package's own `src/` tree. A plain `pyproject.toml` search would adopt the
-    enclosing project of an installed package (`.venv/Lib/site-packages/...`) and
-    load its drop-ins. Falling back to `Path.cwd() / "harnesses"` would make the
-    workspace directory appear twice in the search path.
+    package's own `src/` tree. The tree has to be the one this module executes
+    from, not merely a tree that exists — an installed package
+    (`.venv/Lib/site-packages/...`) sitting inside some checkout would otherwise
+    load that checkout's drop-ins. A plain `pyproject.toml` search has the same
+    problem and is equally rejected. Falling back to `Path.cwd() / "harnesses"`
+    would make the workspace directory appear twice in the search path.
     """
     here = Path(__file__).resolve()
     for parent in here.parents:
-        if (parent / "src" / "simple_code_indexer" / "__init__.py").is_file():
+        tree = (parent / "src" / "simple_code_indexer").resolve()
+        if tree in here.parents:
             return parent / "harnesses"
     return None
 

@@ -108,6 +108,7 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 | [009](#run-009-destructive-publish-a-release-to-pypi) | Publish a release to PyPI |
 | [010](#run-010-operator-install-the-editable-development-environment) | Install the editable development environment |
 | [011](#run-011-operator-validate-the-prod-wheel-install) | Validate the prod wheel install |
+| [012](#run-012-safe-verify-symbol-coverage-for-a-workspace) | Verify symbol coverage for a workspace |
 
 ## RUN-001 (SAFE): Probe the backing services
 
@@ -361,11 +362,14 @@ Rebuilds `src/simple_code_indexer/languages/catalog.py` from the pack's publishe
 2. Regenerate and review the diff:
 
    ```
-   uv run python tools/gen_language_catalog.py
+   uv run python tools/gen_language_catalog.py --report
    git diff --stat src/simple_code_indexer/languages/catalog.py
    ```
 
-   The tool fails loudly instead of guessing: an unresolvable display name means a new upstream row needs an entry in `ALIASES`.
+   `--report` prints every language's symbol map and the residual `SYMBOL_GAPS`. The tool fails
+   loudly instead of guessing: an unresolvable display name means a new upstream row needs an
+   entry in `ALIASES`, and a node type the grammar does not have means the pack renamed something
+   and a map is silently dead.
 
 3. Confirm the invariants before committing:
 
@@ -373,9 +377,15 @@ Rebuilds `src/simple_code_indexer/languages/catalog.py` from the pack's publishe
    uv run pytest tests/test_language_catalog.py -q
    ```
 
-   That suite asserts unique extension/filename ownership, that every grammar exists in the pack, and that no data-format extension leaks into the allowlist.
+   That suite asserts unique extension/filename ownership, that every grammar exists in the pack,
+   that no data-format extension leaks into the allowlist, and that every symbol map uses known
+   kind names and that `SYMBOL_GAPS` matches the languages with no map.
 
-4. Bump `CATALOG_VERSION` in the generator only when the change should force existing indexes to reconcile (a language id change, or a path that was indexed becoming denied). Then regenerate again — the constant is emitted into the catalog. Without a bump, the startup reconcile is a no-op and stale rows stay as they are.
+4. Bump `CATALOG_VERSION` in the generator only when the change should force existing indexes to
+   reconcile (a language id change, or a path that was indexed becoming denied). Bump
+   `SYMBOL_MAP_VERSION` — **not** `CATALOG_VERSION` — when only symbol maps changed: the writer
+   then re-parses indexed files once (`indexer.backfill_symbols`) without re-embedding anything.
+   Regenerate again after either bump — both constants are emitted into the catalog.
 
 **Troubleshooting**
 
@@ -565,3 +575,49 @@ Builds a real wheel from this checkout, installs it into the **same** uv tool en
 - **`--refresh` did not pick up a source-only edit**: uv's build cache is keyed on `pyproject.toml`/`setup.py`/`setup.cfg` and the presence of `src`, not file contents. `ensure_tool` already passes `--refresh`; if it still serves stale code, clear the cache with `uv cache clean`.
 - **Wheel install says `No source checkout found`**: uvx/wheel runs have nothing local to build, so it pins `simple-code-indexer==<version>` from PyPI. Use RUN-010 if you meant to test this tree.
 - **Import still resolves to `<repo>\src\...`**: the force-reinstall did not flip the flavour. Confirm the command exited 0, then repeat step 2.
+
+## RUN-012 (SAFE): Verify symbol coverage for a workspace
+
+Checks whether `symbol_lookup` can resolve symbols in the languages a workspace actually contains, and distinguishes "no such symbol" from "this language cannot produce symbols". It does not rebuild the index or change any configuration.
+
+1. Read the catalog's coverage split:
+
+   ```
+   uv run python -c "from simple_code_indexer.languages import catalog; from simple_code_indexer.registry import load_registry; r = load_registry(); print('maps:', len(r.mapped_grammars()), 'gaps:', len(catalog.SYMBOL_GAPS))"
+   ```
+
+   Expected: `maps:` in the 170s and `gaps:` equal to `len(SYMBOL_GAPS)`. A language listed in
+   `SYMBOL_GAPS` is a known limitation, not a bug; a Vue, Svelte, Astro, Heex, Blade, Templ, Twig, or
+   Jinja file is not a gap any more (ADR-021).
+
+2. Ask the live server which languages it indexed and whether they produced symbols:
+
+   ```
+   uv run python tests/mcp_probe.py
+   ```
+
+   `symbol_lookup` on a name that does not exist returns `coverage` (`none`/`partial`/`full`), `languages_indexed`, `languages_with_symbols`, and a `hint` naming the languages that cannot resolve.
+
+3. For a symbol that should exist, look it up by name:
+
+   ```
+   $env:PROBE_SYMBOL = 'add_two'
+   uv run python tests/mcp_probe.py
+   ```
+
+   Expected: `found: true` with `kind`, `line`, and `signature` populated. A `found: false` whose `coverage` names the language means that language is a gap; a `found: false` with `coverage: full` means the name genuinely is not indexed.
+
+4. If a language was recently added to a map, confirm the symbols-only backfill ran rather than assuming it did:
+
+   ```
+   Get-Content .simple-ci\log\writer.log | Select-String 'symbol backfill'
+   ```
+
+   Expected: one `symbol backfill: re-parsed N/M file(s)` line after the upgrade, with `chunks_indexed` and `vectors_indexed` unchanged in `get_status`.
+
+**Troubleshooting**
+
+- **`languages_without_symbol_maps` is unexpectedly large**: `SYMBOL_GAPS` is generated; a stale catalog means the constant predates the derivation. Re-run RUN-007.
+- **A Vue/Svelte/Astro/Heex/Blade/Templ declaration does not resolve**: confirm the host entry carries `injections=True` in `catalog.ENTRIES`, then check that the region's injected language is one of `elixir`/`javascript`/`php_only`/`typescript` — the other targets are deliberately not indexed. Heex `<script>`/`<style>` tags stay unindexed because their query relies on `#offset!`, which the binding does not expose (see NOTES.md).
+- **A language has a map but still resolves nothing**: its tags query may describe node types the grammar uses differently from the sample the map was verified against. Re-run `tools/gen_language_catalog.py --report` and check that language's entry.
+- **Symbols did not change after a catalog update**: the map version was not bumped, so no backfill was enqueued. Bump `SYMBOL_MAP_VERSION` in the generator (not `CATALOG_VERSION`) and restart the writer.

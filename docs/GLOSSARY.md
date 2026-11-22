@@ -111,8 +111,28 @@ A language in the catalog that must never be indexed — serialization, document
 _Avoid_: non-code file, text file
 
 **Symbol coverage**:
-Whether the indexed languages can resolve symbols at all. Reported by `symbol_lookup` as `none`/`partial`/`full` so a missing symbol is distinguishable from a language that produced no symbols; the hint points the caller at `search_code`.
+Whether the indexed languages can resolve symbols at all. Reported by `symbol_lookup` as `none`/`partial`/`full` so a missing symbol is distinguishable from a language that produced no symbols; the hint points the caller at `search_code`. The catalog-level counterpart is `catalog.SYMBOL_GAPS`.
 _Avoid_: symbol accuracy, symbol quality
+
+**Symbol node map**:
+A language's `node type -> symbol kind` table in the catalog, derived by the generator from the grammar's own tags query, a shape heuristic over its node kinds, or a hand-verified override. A map value may be `<kind>@<field>` to require a field (Haskell's `function` is both a definition and a type arrow).
+_Avoid_: symbol rules, symbol plugin
+
+**Injection host**:
+A language whose real declarations live in a region another grammar parses — a Vue/Svelte/Astro `<script>` block, a Heex `<%= %>` directive, a Blade `@php` block, a Templ `script` block. Its `LanguageSpec.injections` flag makes symbol extraction follow the grammar's own injections query into that region.
+_Avoid_: template language, embedded language
+
+**Injection target**:
+The embedded grammar an injection host's region is parsed with (`javascript`, `typescript`, `elixir`, `php_only`). Only these four are indexed; the query's CSS, comment, regex, and markup targets are ignored because they declare nothing a caller looks up.
+_Avoid_: sub-language, inner language
+
+**Symbol backfill**:
+The one-off, symbols-only re-parse the writer runs when `meta.symbol_map_version` differs from `catalog.SYMBOL_MAP_VERSION`. It rewrites `symbols` and never re-chunks or re-embeds, so a map upgrade cannot touch the vector store.
+_Avoid_: symbol reindex, symbol migration
+
+**Symbol gap**:
+A registered language that has neither a symbol map nor an extractor, listed in `catalog.SYMBOL_GAPS` and reported as `get_status.languages_without_symbol_maps`. It still gets the generic node types and the pack's `process()` analysis.
+_Avoid_: unsupported language, missing language
 
 **Symbol**:
 A named code definition extracted from a file (function, class, method, etc.) with kind, line range, and signature.

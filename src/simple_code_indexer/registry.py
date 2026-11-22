@@ -140,11 +140,19 @@ def load_registry() -> PluginRegistry:
 
 
 def prefetch_grammars(registry: PluginRegistry | None = None) -> None:
-    """Best-effort load every symbol-mapped grammar (never raises)."""
+    """Best-effort load the grammars in `catalog.PREFETCH` (never raises).
+
+    Deliberately *not* every symbol-mapped grammar: a map exists for nearly the
+    whole catalog, and loading them all would download the entire pack on first
+    run. A language outside the prefetch set still extracts symbols; its grammar
+    loads on the first file indexed (ADR-016).
+    """
     from simple_code_indexer import parse
 
     reg = registry if registry is not None else get_registry()
-    grammars = reg.mapped_grammars()
+    grammars = tuple(
+        sorted(name for name in catalog.PREFETCH if reg.spec(name) is not None)
+    )
     loaded = 0
     for grammar in grammars:
         try:

@@ -8,9 +8,9 @@ import pytest
 
 from simple_code_indexer import db, server
 from simple_code_indexer.config import IGNORE_DIRS, Settings
+from simple_code_indexer.languages.spec import LanguageSpec
 from simple_code_indexer.models import FileRecord, Symbol
-from simple_code_indexer.parse import extract_symbols
-from simple_code_indexer.registry import get_registry
+from simple_code_indexer.parse import _parser, extract_from_tree, extract_symbols
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -105,19 +105,37 @@ def test_a_found_symbol_is_unaffected_by_coverage(tmp_path: Path) -> None:
 
 
 def test_fallback_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`SYMBOL_FALLBACK=0` disables the pack's `process()` step."""
     monkeypatch.setenv("SYMBOL_FALLBACK", "0")
-    # Elixir has no curated map; the pack names a Module but is now disabled.
-    assert extract_symbols(Path("a.ex"), "defmodule Demo do\nend\n") == []
+    spec = LanguageSpec(
+        name="demo",
+        grammar="elixir",
+        extensions=frozenset(),
+        filenames=frozenset(),
+        symbol_nodes={},
+    )
+    source = "defmodule Demo do\nend\n"
+    tree = _parser("elixir").parse(source.encode())
+    assert extract_from_tree(spec, tree.root_node, source) == []
 
 
 def test_unmapped_language_falls_back_to_the_pack() -> None:
-    # `d` has no curated map and the generic walker finds nothing, so the only
-    # way to get a symbol is the pack's own analysis.
-    spec = get_registry().spec("d")
-    assert spec is not None and not spec.symbol_mapped
-    names = [
-        s.name for s in extract_symbols(Path("a.d"), "int add(int a) { return a; }\n")
-    ]
+    """A language with no map relies on the pack's own analysis.
+
+    The spec is built explicitly rather than taken from the catalog: nearly every
+    catalog language now has a map, so a real unmapped grammar is not a stable
+    fixture.
+    """
+    spec = LanguageSpec(
+        name="demo",
+        grammar="d",
+        extensions=frozenset(),
+        filenames=frozenset(),
+        symbol_nodes={},
+    )
+    source = "int add(int a) { return a; }\n"
+    tree = _parser("d").parse(source.encode())
+    names = [s.name for s in extract_from_tree(spec, tree.root_node, source)]
     assert "add" in names
 
 
