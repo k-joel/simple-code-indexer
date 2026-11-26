@@ -732,10 +732,20 @@ install — where no checkout exists — pins `simple-code-indexer==<version>`. 
 path is handed to `uv tool install` with or without `--editable`: editable (the
 default) links the working tree, a wheel build (`--wheel`) installs a copy. Both
 land in the same environment root, so the harness entry is identical and only
-`uv-receipt.toml` records which flavour is live. A reinstall always passes
-`--force`: `install.tool_env_root()` covers a live environment, and
-`install.entrypoint_present()` covers a shim in `uv tool dir --bin` that
-outlived a deleted environment, which uv refuses to overwrite otherwise.
+`uv-receipt.toml` records which flavour is live.
+
+`ensure_tool()` branches on whether the calling process is itself running out of
+that environment (`install.running_from_env()`, true for `uvx simple-code-indexer
+setup` and for a harness entry). Such a run cannot reinstall it — uv rewrites the
+console script and Windows refuses to overwrite the running executable image —
+so it returns early when `install.environment_satisfies()` reads the wanted
+editable link or pinned version off the receipt, and otherwise raises with the
+`uv tool install …` command to run from outside. Every other reinstall replaces
+the package **in place**, never with `--force` (which deletes the environment
+first and fails while any reader holds `Scripts\python.exe`).
+`install.entrypoint_present()` gates `--force` to its one useful case: a shim in
+`uv tool dir --bin` that outlived a deleted environment, which uv refuses to
+overwrite otherwise (ISS-016).
 
 Per workspace (gitignore `.simple-ci/`):
 
@@ -1515,6 +1525,12 @@ uvx simple-code-indexer setup ──► uv tool install simple-code-indexer==<ve
 
 The uv tool environment is the stable launch target: it is version-pinned, needs
 no checkout, and is removed with `uv tool uninstall` (which `uninstall` runs).
+The one exception is Windows when the uninstall is itself executing from that
+environment (`uvx simple-code-indexer uninstall` reuses the installed tool): the
+running image cannot be deleted, so `uninstall` removes everything else, leaves
+the environment intact, and prints the `uv tool uninstall simple-code-indexer`
+command to run once the process exits. POSIX unlinks a running executable and
+removes it in-process (ISS-001).
 The launcher must not change cwd; all workspace inference depends on it.
 `--editable` (the default from a checkout) and `--wheel` install into that same
 environment, so flipping between a live working tree and a built artifact never
@@ -1533,6 +1549,12 @@ writes harness entries, config, compose files, and model downloads.
 - `SIMPLE_CI_MODE=embedded` — most tests exercise the single-process writer;
   sidecar tests override it explicitly.
 - `SIMPLE_CI_NO_TUI=1` — the real prompter never draws a TUI.
+- `HOME`/`USERPROFILE` (and `APPDATA`/`LOCALAPPDATA` on Windows) — a per-test
+  profile, so a path that forgets to thread `home` cannot reach a real
+  `~/.simple-ci/config.yaml` or a real client config (ISS-023).
+  `TREE_SITTER_LANGUAGE_PACK_CACHE_DIR` is pinned to the developer's existing
+  cache, because the pack derives its download directory from the profile and
+  would otherwise re-download every grammar.
 
 ### 12.2 Test layers
 

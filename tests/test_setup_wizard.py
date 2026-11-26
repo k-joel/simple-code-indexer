@@ -1129,6 +1129,103 @@ def test_install_only_installs_the_tool_and_writes_no_config(
     assert any(call[:3] == ["/usr/bin/uv", "tool", "install"] for call in calls)
 
 
+def test_install_only_never_repins_to_an_interpreter_that_is_missing(
+    tmp_path: Path, monkeypatch, real_install
+) -> None:
+    """A fake or stale `uv tool dir` must not reach a client config (ISS-023).
+
+    The repin is the one write `--install-only` performs outside the tool
+    environment, and it acts on real config files. Pointing an entry at a
+    `<tools>/…/pythonw.exe` that does not exist disables the server silently,
+    so a missing interpreter is a refusal, not a rewrite.
+    """
+    _project, home, repo = _workspace(tmp_path)
+    (tmp_path / "tools" / install_mod.TOOL_NAME).mkdir(parents=True)
+    config = home / ".simple-ci" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    cursor_config = home / ".cursor" / "mcp.json"
+    cursor_config.parent.mkdir(parents=True)
+    before = '{"mcpServers": {"simple-code-indexer": {"command": "keep"}}}'
+    cursor_config.write_text(before, encoding="utf-8")
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "setup": {
+                    "harnesses": [{"name": "cursor", "config": str(cursor_config)}]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SIMPLE_CI_CONFIG", str(config))
+
+    class ToolRunner(Runner):
+        def which(self, name: str) -> str | None:
+            return "/usr/bin/uv" if name == "uv" else None
+
+        def run(
+            self, argv: list[str], *, timeout: float = 15.0, cwd=None
+        ) -> CommandResult:
+            if argv[1:3] == ["tool", "dir"]:
+                return CommandResult(0, str(tmp_path / "tools"))
+            return CommandResult(0)
+
+    monkeypatch.setattr(provision, "Runner", ToolRunner)
+
+    assert wizard_run(["--install-only", "--repo-root", str(repo)]) == 1
+    assert cursor_config.read_text(encoding="utf-8") == before
+
+
+def test_install_only_reads_the_config_simple_ci_config_names(
+    tmp_path: Path, monkeypatch, real_install
+) -> None:
+    """The record must come from the documented override, not `Path.home()`.
+
+    Reading `.simple-ci/config.yaml` directly ignores `SIMPLE_CI_CONFIG`, which
+    is exactly how a test's fake tool directory reached the developer's real
+    `~/.commandcode/mcp.json` (ISS-023).
+    """
+    _project, home, repo = _workspace(tmp_path)
+    (tmp_path / "tools" / install_mod.TOOL_NAME).mkdir(parents=True)
+    real_home_record = tmp_path / "untouched" / "config.yaml"
+    real_home_record.parent.mkdir(parents=True)
+    real_home_record.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "setup": {"harnesses": [{"name": "cursor", "config": "nowhere.json"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    chosen = tmp_path / "chosen" / "config.yaml"
+    chosen.parent.mkdir(parents=True)
+    chosen.write_text(
+        yaml.safe_dump({"version": 1, "setup": {"harnesses": []}}), encoding="utf-8"
+    )
+    monkeypatch.setenv("SIMPLE_CI_CONFIG", str(chosen))
+    monkeypatch.setattr(
+        configfile, "global_config_path", lambda home=None: real_home_record
+    )
+
+    class ToolRunner(Runner):
+        def which(self, name: str) -> str | None:
+            return "/usr/bin/uv" if name == "uv" else None
+
+        def run(
+            self, argv: list[str], *, timeout: float = 15.0, cwd=None
+        ) -> CommandResult:
+            if argv[1:3] == ["tool", "dir"]:
+                return CommandResult(0, str(tmp_path / "tools"))
+            return CommandResult(0)
+
+    monkeypatch.setattr(provision, "Runner", ToolRunner)
+
+    assert wizard_run(["--install-only", "--repo-root", str(repo)]) == 0
+    assert not (home / ".simple-ci").exists()
+
+
 def test_install_only_dry_run_runs_nothing(
     tmp_path: Path, monkeypatch, real_install
 ) -> None:
@@ -1213,7 +1310,12 @@ def test_install_only_refreshes_the_recorded_entries(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(configfile, "global_config_path", lambda home=None: config)
+    monkeypatch.setenv("SIMPLE_CI_CONFIG", str(config))
+    interpreter = install_mod.InstallResult(
+        root=tools, platform=sys.platform
+    ).interpreter
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_bytes(b"stub")
 
     class ToolRunner(Runner):
         def which(self, name: str) -> str | None:

@@ -1561,8 +1561,19 @@ def _install_only(args: argparse.Namespace) -> int:
 
 
 def _repin_recorded_harnesses(prompts: Prompter, *, dry_run: bool) -> int:
-    """Rewrite the recorded entries to the tool environment; returns failures."""
-    config_path = configfile.global_config_path()
+    """Rewrite the recorded entries to the tool environment; returns failures.
+
+    The record is read through `configfile.find_config_file`, so it obeys
+    ``SIMPLE_CI_CONFIG`` instead of going behind it to ``Path.home()``. An entry
+    is only rewritten to an interpreter that exists: a harness entry is a launch
+    command, so pointing it at a missing executable silently disables the
+    server, and a wrong `uv tool dir` (a stale or fake one) must not reach a
+    client config at all.
+    """
+    config_path = configfile.find_config_file(Path.cwd())
+    if config_path is None:
+        prompts.say("No config file to repoint; nothing to update.")
+        return 0
     record = uninstall.read_record(config_path)
     if not record.harnesses:
         prompts.say(f"No harness entries recorded in {config_path}; nothing to update.")
@@ -1582,6 +1593,12 @@ def _repin_recorded_harnesses(prompts: Prompter, *, dry_run: bool) -> int:
         )
         return 1
     result = install.InstallResult(root=root, platform=sys.platform)
+    if not dry_run and not result.interpreter.is_file():
+        prompts.say(
+            f"{result.interpreter} is missing, so {root} cannot launch the server. "
+            "Leaving the recorded entries untouched; reinstall the tool and re-run."
+        )
+        return 1
     specs = {spec.name: spec for spec in load_harnesses()}
     failures = 0
     for item in record.harnesses:

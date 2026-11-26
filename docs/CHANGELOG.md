@@ -203,6 +203,26 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ### Fixed
 
+- `--install-only` can no longer repoint a harness entry at an interpreter that does not exist.
+  The repin read the recorded harnesses from `~/.simple-ci/config.yaml` directly instead of
+  honouring `SIMPLE_CI_CONFIG`, so a run under a redirected (or fake) `uv tool dir` wrote that
+  path into real client configs; the entry then failed to spawn with no visible error. The record
+  is now read through the documented config resolution, and a missing
+  `<tool-env>/Scripts/pythonw.exe` is reported as a failure with the entries left untouched.
+- `uvx simple-code-indexer uninstall` on Windows no longer fails with
+  `Access is denied (os error 5)` while deleting the tool environment it is itself executing from.
+  It now detects the self-hosted case, removes everything else (entries, config, compose services,
+  model cache), leaves the environment intact, and prints `uv tool uninstall simple-code-indexer`
+  to run once the process exits; POSIX still removes the environment in-process.
+- `uvx simple-code-indexer setup` no longer fails with `Access is denied (os error 5)` or
+  `being used by another process (os error 32)` on Windows. uvx runs the setup from inside the
+  tool environment it was about to reinstall, and Windows will not let uv overwrite the
+  `simple-code-indexer.exe` / `python.exe` that are executing. A run that is itself serving from
+  that environment now skips the reinstall when the receipt already matches (an editable link to
+  the same checkout, or the pinned version) and otherwise reports the `uv tool install` command
+  to run from outside. Reinstalls from outside no longer pass `--force`, which also failed
+  whenever a harness's reader was live; they replace the package in place and still flip
+  editable↔wheel in the one environment the harness entries point at.
 - `symbol_lookup` no longer returns a language keyword as a symbol name. Grammars that declare
   through a nested node (protobuf's `message`), a selector list (CSS `rule_set`), or a head symbol
   (Clojure `defn`) resolved to the keyword itself before.
@@ -213,7 +233,7 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 - `docs/`-adjacent process guidance for the ACP end-to-end run now says the harness identity is
   asserted from `harness lookup: chain=…` / `reader session … harness=<image>(<pid>)` in
   `reader.log`, instead of the `parent watchdog: watching …` line, which only ever reaches stderr
-  (`ref-docs/acp-test-process.md` §7.1). It also documents stopping `opencode-cli serve --service`
+  (`references/acp-test-process.md` §7.1). It also documents stopping `opencode-cli serve --service`
   before the run, because a freshly written global entry is picked up by that always-on process and
   makes `get_status.sessions` read 2.
 
@@ -249,7 +269,7 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ### Added
 
-- **`ref-docs/acp-test-process.md` and `ref-docs/mcp-test-process.md` now document the uv install
+- **`references/acp-test-process.md` and `references/mcp-test-process.md` now document the uv install
   model**: tool environment via `uv tool dir`, the `<tool-env>/Scripts/pythonw.exe -m
   simple_code_indexer serve` entry, editable vs wheel flavours from `uv-receipt.toml`, and
   `simple-code-indexer install` instead of the deleted `setup.py --install-only` copy flow.
@@ -296,8 +316,8 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   a human in the loop. The MCP server is injected per ACP session; OpenCode 2.2.5 also starts its
   configured entry first, so a checkout-only run masks that entry with a byte-exact backup and
   restores it afterwards. Standard library only.
-- [ref-docs/acp-test-process.md](../ref-docs/acp-test-process.md) documents that automated run,
-  and [ref-docs/opencode-acp-mode.md](../ref-docs/opencode-acp-mode.md) documents ACP mode itself
+- [references/acp-test-process.md](../references/acp-test-process.md) documents that automated run,
+  and [references/opencode-acp-mode.md](../references/opencode-acp-mode.md) documents ACP mode itself
   (transport, editor setup, MCP injection, permissions, troubleshooting).
 - The workspace can come from the client's MCP `roots/list`, from a harness plugin, or from cwd
   (ADR-018). `roots/list` is probed once after the handshake (`SIMPLE_CI_ROOTS_TIMEOUT_S`, default
@@ -337,7 +357,7 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   writer daemon's command line, and rebuilds a deleted index via `PROBE_WAIT_INDEX` before any
   retrieval check. OpenCode's configured MCP entry is masked for checkout-only runs and restored
   afterwards; the procedure is verified with both `faiss` and `sqlite-vec`. See
-  [ref-docs/acp-test-process.md](../ref-docs/acp-test-process.md).
+  [references/acp-test-process.md](../references/acp-test-process.md).
 - The server now resolves the workspace and starts the writer/reader **after** the MCP handshake
   (`notifications/initialized`, with the first `tools/*` call as a fallback), because `roots/list`
   is only legal on an initialized session. The startup banner and the file log therefore begin
@@ -442,7 +462,7 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 - `setup.py --install-only`: copy this checkout to the per-user install directory and exit,
   without prompts, config, services, harness entries, or an environment sync of the copy.
   `--install-dir` and `--dry-run` are honored.
-- `ref-docs/mcp-test-process.md`: a repeatable end-to-end MCP integration test that installs
+- `references/mcp-test-process.md`: a repeatable end-to-end MCP integration test that installs
   from scratch, hands the live session to a secondary harness agent, and verifies indexing,
   retrieval and shutdown.
 - Harness lifecycle watchdog: the server now exits when a process in its launch chain

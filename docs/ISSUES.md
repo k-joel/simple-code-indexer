@@ -83,4 +83,3 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 ---
 
 ## Open
-

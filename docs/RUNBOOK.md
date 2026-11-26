@@ -446,9 +446,9 @@ Irreversible: a published version can never be re-uploaded. Requires the `pypi` 
    uvx simple-code-indexer setup --dry-run
    ```
 
-4. Repoint an existing dev install at the published version. `setup` always force-reinstalls the
-   tool environment, so no extra flag is needed — but it picks **editable** while a checkout is
-   detectable. Run from outside a checkout, or force the prod flavour with `--wheel` (details in
+4. Repoint an existing dev install at the published version. `setup` reinstalls the tool
+   environment in place, so no extra flag is needed — but it picks **editable** while a checkout is
+   detectable. Run from outside a checkout, or set the prod flavour with `--wheel` (details in
    RUN-010 and RUN-011):
 
    ```
@@ -510,6 +510,8 @@ Installs this checkout as a **uv tool** and links it, so the harnesses you alrea
 - **`No source checkout found; installing the published wheel.`**: nothing to link, so this run silently took the wheel path. If you meant dev, pass `--repo-root <repo>`.
 - **`uv tool install failed for <spec>`**: uv printed the build log above the error. Fix the build first; the resolver is usually a `pyproject.toml`/`uv.lock` mismatch.
 - **`error: Executable already exists: simple-code-indexer.exe (use --force to overwrite)`**: a previous environment was removed but its shim survived in `uv tool dir --bin`, so `uv tool list` says "No tools installed". `install` detects the shim and passes `--force` by itself; if you hit this from a raw `uv tool install`, delete the leftover shim (or add `--force`) and re-run step 2.
+- **`error: failed to remove file ...\Scripts\simple-code-indexer.exe: ... being used by another process (os error 32)`** or **`error: failed to remove directory ...\Scripts: Access is denied (os error 5)`**: uv tried to rewrite the tool environment while a process was running from it. `uvx simple-code-indexer setup` is the normal cause (uvx runs setup from inside the environment); `ensure_tool` now detects that, skips when the receipt already matches, and otherwise prints the `uv tool install …` line to run from outside. If the installer refuses because *another* process holds the shim, stop that process first (`get_status`, `daemon.json`). `uninstall` handles the same lock: when it detects it is running from that environment on Windows, it removes everything else and prints `uv tool uninstall simple-code-indexer` to run once the process exits.
+- **`Already installed (...); keeping the running environment.`**: expected from `uvx … install` when the running environment already holds the requested editable link. Nothing is broken; run the printed command from outside if you really want to rebuild.
 - **Edits still not visible**: the harness is running the previous process. Restart it, then re-check step 4.
 - **`ImportError`/`ModuleNotFoundError` after deleting or moving the checkout**: this flavour cannot survive losing its tree by design. Re-clone and repeat step 2, or switch to RUN-011.
 
@@ -525,7 +527,7 @@ Builds a real wheel from this checkout, installs it into the **same** uv tool en
    $before = (Get-FileHash $py -Algorithm SHA256).Hash
    ```
 
-2. Install the built wheel (builds `<repo>` and force-reinstalls; `--refresh` busts uv's stale local-build cache):
+2. Install the built wheel (builds `<repo>` and reinstalls in place; `--refresh` busts uv's stale local-build cache):
 
    ```
    uv run simple-code-indexer install --wheel
@@ -574,7 +576,13 @@ Builds a real wheel from this checkout, installs it into the **same** uv tool en
 - **Entry hash differs after step 4**: something rewrote the entry — usually a `setup` run against a different harness config. Re-run `setup` and compare again; treat any remaining difference as a defect.
 - **`--refresh` did not pick up a source-only edit**: uv's build cache is keyed on `pyproject.toml`/`setup.py`/`setup.cfg` and the presence of `src`, not file contents. `ensure_tool` already passes `--refresh`; if it still serves stale code, clear the cache with `uv cache clean`.
 - **Wheel install says `No source checkout found`**: uvx/wheel runs have nothing local to build, so it pins `simple-code-indexer==<version>` from PyPI. Use RUN-010 if you meant to test this tree.
-- **Import still resolves to `<repo>\src\...`**: the force-reinstall did not flip the flavour. Confirm the command exited 0, then repeat step 2.
+- **Import still resolves to `<repo>\src\...`**: the reinstall did not flip the flavour. Confirm the command exited 0, then repeat step 2.
+- **A harness entry names a `…\Temp\…` or other nonexistent interpreter**: the server never starts and the client shows only a failed spawn. This is what ISS-023 caused; `--install-only` now refuses that rewrite and leaves the entry alone. Repair both the entry and the record with a real tool environment, then restart the harness:
+  ```
+  $exe = Join-Path (Join-Path (uv tool dir) 'simple-code-indexer') 'Scripts\pythonw.exe'
+  Test-Path $exe            # must be True before repointing
+  uv run simple-code-indexer install    # repoints the recorded entries at $exe
+  ```
 
 ## RUN-012 (SAFE): Verify symbol coverage for a workspace
 
@@ -670,7 +678,7 @@ configs (NOTES.md).
    Under a project entry the probe prints `workspace_source: arg` and the workspace it was pinned to.
 
 5. Prove the client itself picks the entry up (OpenCode; see
-   `ref-docs/opencode-acp-mode.md` §8 for the log evidence):
+   `references/opencode-acp-mode.md` §8 for the log evidence):
 
    ```
    uv run python tests/acp_probe.py <workspace> --agent opencode
