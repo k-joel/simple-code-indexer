@@ -435,7 +435,7 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   Goose and Pi entries, pinning this checkout's absolute path in files that belong to every project
   on the machine. The result was a global entry that silently indexed one fixed tree for every
   project opened afterwards, and a git-tracked repo path leaking into user-home config. The
-  behaviour was even documented as a step (`ref-docs/mcp-test-process.md` §4.4) and as a harness
+  behaviour was even documented as a step (`references/mcp-test-process.md` §4.4) and as a harness
   capability (the three plugins emit `cwd` from `WORKSPACE_ROOT`), so each new session re-created
   it. ADR-022 later added an explicit *project* scope, so this rule is now stated per scope.
 - **Decision:** A **global** harness entry contains **only** install-scoped data: the interpreter

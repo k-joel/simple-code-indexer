@@ -9,7 +9,7 @@ See [README.md](README.md) for the detailed overview.
 This project has four dedicated folders for non-production files. Pick the right one based on purpose:
 
 - [docs/](docs/) — Project documentation: the issue tracker, changelog, benchmarks, and tools inventory.
-- [ref-docs/](ref-docs/) — All reference documentation: research docs, best-practices guides, and instruction manuals.
+- [references/](references/) — All reference documentation: research docs, best-practices guides, and instruction manuals.
 - [artifacts/](artifacts/) — All intermediate/throwaway artifact files (markdown, test files, scratch outputs, etc.) that aren't production code.
 - [tools/](tools/) — All internal scripts and tools used to support development (e.g. formatting, analysis, build helpers).
 

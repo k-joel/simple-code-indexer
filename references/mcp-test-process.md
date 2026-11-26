@@ -23,7 +23,7 @@ Primary agent (Command Code / any coding agent)
 
 To start a run, the human prompts the primary agent with:
 
-> I want to test MCP integration. Follow the instructions here: `ref-docs/mcp-test-process.md`
+> I want to test MCP integration. Follow the instructions here: `references/mcp-test-process.md`
 
 The primary agent owns §1–§5 and §7. The secondary agent only ever sees the handoff document
 (§9.1), which the primary agent fills in with run-specific facts.
@@ -764,7 +764,7 @@ harness process rather than assuming a UI ancestor (a reused service is the harn
 
 ## Appendix D — conventions
 
-- Reports live in `artifacts/` (gitignored, throwaway). Reference docs live in `ref-docs/`.
+- Reports live in `artifacts/` (gitignored, throwaway). Reference docs live in `references/`.
 - Name run documents `artifacts/mcp-handoff.md`, `artifacts/mcp-results.md`,
   `artifacts/mcp-final-report.md`; add a date suffix for repeat runs.
 - Log new defects in `docs/ISSUES.md` with the next free `ISS-n`; delete them when fixed.
