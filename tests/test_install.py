@@ -198,10 +198,14 @@ def test_ensure_tool_installs_and_returns_the_environment(tmp_path: Path) -> Non
     assert any("Installing" in message for message in messages)
 
 
-def test_ensure_tool_forces_an_editable_reinstall_when_present(
-    tmp_path: Path,
-) -> None:
-    """--force is what lets one env flip flavours without changing the entry."""
+def test_ensure_tool_reinstalls_an_editable_env_in_place(tmp_path: Path) -> None:
+    """No --force: the setup that runs this holds the env's own python.exe.
+
+    `uvx simple-code-indexer setup` executes from inside this environment, so a
+    forced reinstall would try to delete the interpreter it is running on and
+    fail with `Access is denied` on Windows. A plain install flips flavours just
+    as well and leaves the shared interpreter alone.
+    """
     runner = FakeRunner()
     runner.tool_dir = str(tmp_path / "tools")
     runner.creates_tool_env = True
@@ -214,14 +218,7 @@ def test_ensure_tool_forces_an_editable_reinstall_when_present(
         output=lambda _: None,
     )
 
-    assert [
-        "/uv",
-        "tool",
-        "install",
-        "--editable",
-        "--force",
-        str(tmp_path),
-    ] in runner.calls
+    assert ["/uv", "tool", "install", "--editable", str(tmp_path)] in runner.calls
 
 
 def test_ensure_tool_refreshes_a_wheel_reinstall_when_present(
@@ -244,7 +241,6 @@ def test_ensure_tool_refreshes_a_wheel_reinstall_when_present(
         "/uv",
         "tool",
         "install",
-        "--force",
         "--refresh",
         "simple-code-indexer==1.2.3",
     ] in runner.calls
@@ -354,6 +350,134 @@ def test_ensure_tool_raises_when_uv_fails() -> None:
         assert "uv tool install failed" in str(exc)
     else:
         raise AssertionError("ensure_tool should raise on a non-zero exit")
+
+
+def _env_with_receipt(tmp_path: Path, receipt: str) -> Path:
+    root = tmp_path / "tools" / install.TOOL_NAME
+    root.mkdir(parents=True)
+    (root / "uv-receipt.toml").write_text(receipt, encoding="utf-8")
+    return root
+
+
+def test_running_from_env_detects_uvx_and_harness_launches(tmp_path: Path) -> None:
+    """Both launch paths execute an interpreter inside the environment."""
+    root = tmp_path / "env"
+    inside = root / "Scripts" / "python.exe"
+    outside = tmp_path / "other" / "python.exe"
+
+    assert install.running_from_env(root, executable=inside) is True
+    assert install.running_from_env(root, executable=outside) is False
+
+
+def test_an_editable_link_to_the_same_checkout_is_satisfied(tmp_path: Path) -> None:
+    root = _env_with_receipt(
+        tmp_path,
+        f'[tool]\nrequirements = [{{ name = "{install.TOOL_NAME}", '
+        f'editable = "{tmp_path.as_posix()}" }}]\n',
+    )
+
+    assert install.environment_satisfies(root, str(tmp_path), editable=True) is True
+
+
+def test_an_editable_link_to_another_checkout_is_not_satisfied(tmp_path: Path) -> None:
+    """The wizard must still be able to repoint at the tree it is running from."""
+    root = _env_with_receipt(
+        tmp_path,
+        f'[tool]\nrequirements = [{{ name = "{install.TOOL_NAME}", '
+        f'editable = "{(tmp_path / "elsewhere").as_posix()}" }}]\n',
+    )
+
+    assert install.environment_satisfies(root, str(tmp_path), editable=True) is False
+
+
+def test_a_wheel_from_the_checkout_is_never_satisfied(tmp_path: Path) -> None:
+    """A rebuild is how source edits reach a wheel, so it must still run."""
+    root = _env_with_receipt(
+        tmp_path,
+        f'[tool]\nrequirements = [{{ name = "{install.TOOL_NAME}", '
+        f'directory = "{tmp_path.as_posix()}" }}]\n',
+    )
+
+    assert install.environment_satisfies(root, str(tmp_path), editable=False) is False
+
+
+def test_a_missing_receipt_is_not_satisfied(tmp_path: Path) -> None:
+    root = tmp_path / "tools" / install.TOOL_NAME
+    root.mkdir(parents=True)
+
+    assert install.environment_satisfies(root, str(tmp_path), editable=True) is False
+
+
+def test_ensure_tool_skips_a_self_reinstall_when_already_satisfied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`uvx simple-code-indexer setup` must not rewrite the shim it runs from.
+
+    uv replaces the console script on every install, and Windows will not
+    overwrite the executable image of the running process.
+    """
+    monkeypatch.setattr(install, "running_from_env", lambda _root, **_kw: True)
+    root = _env_with_receipt(
+        tmp_path,
+        f'[tool]\nrequirements = [{{ name = "{install.TOOL_NAME}", '
+        f'editable = "{tmp_path.as_posix()}" }}]\n',
+    )
+    runner = FakeRunner()
+    runner.tool_dir = str(tmp_path / "tools")
+    messages: list[str] = []
+
+    assert (
+        install.ensure_tool(
+            runner, spec=str(tmp_path), editable=True, output=messages.append
+        )
+        == root
+    )
+    assert not any(call[1:3] == ["tool", "install"] for call in runner.calls)
+    assert any("Already installed" in message for message in messages)
+
+
+def test_ensure_tool_explains_a_self_reinstall_it_cannot_do(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flavour change from inside the environment needs an outside command."""
+    monkeypatch.setattr(install, "running_from_env", lambda _root, **_kw: True)
+    _env_with_receipt(
+        tmp_path,
+        f'[tool]\nrequirements = [{{ name = "{install.TOOL_NAME}", '
+        f'editable = "{tmp_path.as_posix()}" }}]\n',
+    )
+    runner = FakeRunner()
+    runner.tool_dir = str(tmp_path / "tools")
+
+    with pytest.raises(ConfigError) as excinfo:
+        install.ensure_tool(
+            runner,
+            spec="simple-code-indexer==9.9.9",
+            editable=False,
+            output=lambda _: None,
+        )
+
+    assert "uv tool install simple-code-indexer==9.9.9" in str(excinfo.value)
+
+
+def test_ensure_tool_reinstalls_in_place_when_not_running_from_the_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An outside install still refreshes; it just cannot force-delete a live env."""
+    monkeypatch.setattr(install, "running_from_env", lambda _root, **_kw: False)
+    _env_with_receipt(
+        tmp_path,
+        f'[tool]\nrequirements = [{{ name = "{install.TOOL_NAME}", '
+        f'editable = "{tmp_path.as_posix()}" }}]\n',
+    )
+    runner = FakeRunner()
+    runner.tool_dir = str(tmp_path / "tools")
+
+    install.ensure_tool(
+        runner, spec=str(tmp_path), editable=True, output=lambda _: None
+    )
+
+    assert ["/uv", "tool", "install", "--editable", str(tmp_path)] in runner.calls
 
 
 def test_remove_tool_is_a_noop_when_absent(tmp_path: Path) -> None:

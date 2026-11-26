@@ -16,9 +16,12 @@ Only ``uv-receipt.toml`` records which is installed.
 
 from __future__ import annotations
 
+import importlib.metadata
 import sys
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from simple_code_indexer.errors import ConfigError
 from simple_code_indexer.setup_wizard.provision import CommandResult, Runner
@@ -79,6 +82,78 @@ def entrypoint_present(runner: Runner) -> bool:
     return any(entry.stem == TOOL_NAME for entry in bin_dir.iterdir())
 
 
+def installed_requirement(root: Path) -> dict[str, Any] | None:
+    """The ``[tool].requirements`` row for this tool in the env's uv receipt."""
+    try:
+        document = tomllib.loads((root / "uv-receipt.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    tool = document.get("tool")
+    requirements = tool.get("requirements") if isinstance(tool, dict) else None
+    if not isinstance(requirements, list):
+        return None
+    for item in requirements:
+        if isinstance(item, dict) and item.get("name") == TOOL_NAME:
+            return item
+    return None
+
+
+def _same_directory(raw: object, expected: Path) -> bool:
+    if not isinstance(raw, str) or not raw:
+        return False
+    try:
+        return Path(raw).expanduser().resolve() == expected.resolve()
+    except OSError:
+        return False
+
+
+def running_from_env(root: Path, *, executable: Path | None = None) -> bool:
+    """Whether this process *is* that environment's install.
+
+    True for both documented launch paths: ``uvx simple-code-indexer …`` reuses
+    an installed tool (unless ``--isolated``), and a harness entry runs
+    ``<env>/Scripts/pythonw.exe -m simple_code_indexer serve``.
+    """
+    current = executable or Path(sys.executable)
+    try:
+        resolved = current.resolve()
+        boundary = root.resolve()
+    except OSError:
+        return False
+    return boundary in resolved.parents
+
+
+def environment_satisfies(root: Path, spec: str, *, editable: bool) -> bool:
+    """Whether the environment already holds what this run would install.
+
+    Consulted only for a process running out of that environment, where a
+    reinstall cannot work: uv rewrites the console script, and Windows will not
+    overwrite the executable image that is running. Both cheap cases are
+    provable from the receipt — an editable link to the same checkout (nothing
+    is built, so there is nothing to redo) and a registry install of the version
+    being requested. A wheel built from a local path is deliberately *not*
+    satisfied, because a rebuild would pick up source edits.
+    """
+    requirement = installed_requirement(root)
+    if requirement is None:
+        return False
+    if editable:
+        return _same_directory(requirement.get("editable"), Path(spec))
+    if (
+        Path(spec).is_dir()
+        or requirement.get("editable")
+        or requirement.get("directory")
+    ):
+        return False
+    pinned = spec.rpartition("==")[2] if "==" in spec else ""
+    if not pinned:
+        return False
+    try:
+        return importlib.metadata.version(TOOL_NAME) == pinned
+    except importlib.metadata.PackageNotFoundError:
+        return False
+
+
 def ensure_uv(runner: Runner, *, output) -> str | None:
     """Find `uv`, installing it from astral.sh when missing.
 
@@ -136,11 +211,24 @@ def ensure_tool(
 ) -> Path:
     """Install (or reinstall) the tool and return its environment root.
 
-    An existing environment is always force-reinstalled: that is what lets the
-    *same* environment flip between an editable link and a built wheel without
-    touching the entry path the harnesses recorded. A surviving entrypoint shim
-    counts as existing too, because uv refuses to overwrite it without
-    ``--force`` even when the environment itself is gone.
+    A run that is *itself* executing out of this environment (``uvx
+    simple-code-indexer setup``, or a harness entry) cannot reinstall it: uv
+    rewrites the console script and Windows refuses to overwrite the running
+    executable image, and ``--force`` additionally deletes an environment whose
+    ``Scripts\\python.exe`` is open. When the receipt already matches the
+    request there is nothing to do, so such a run returns early; otherwise it
+    reports the command to run from outside rather than failing on a lock.
+
+    Every other install replaces the package **in place**, never with
+    ``--force``: that flag deletes the environment directory first, which also
+    fails while a harness's reader (`<env>/Scripts/pythonw.exe`) is live. A
+    plain install leaves the interpreter and sibling executables alone and still
+    flips one environment between an editable link and a built wheel without
+    moving the entry path the harnesses recorded.
+
+    ``--force`` remains for the one state that needs it: a surviving entrypoint
+    shim with no environment behind it. uv refuses to overwrite that shim
+    otherwise, even though the environment is gone (ISS-016).
 
     ``--refresh`` applies to wheel installs only. It busts uv's local-build
     cache, which is keyed on ``pyproject.toml``/``setup.py``/``setup.cfg`` and
@@ -150,10 +238,20 @@ def ensure_tool(
     """
     uv = runner.which("uv") or "uv"
     argv = [uv, "tool", "install"]
-    env_present = tool_env_root(runner) is not None
+    root = tool_env_root(runner)
+    env_present = root is not None
+    if root is not None and running_from_env(root):
+        if environment_satisfies(root, spec, editable=editable):
+            output(f"Already installed ({spec}); keeping the running environment.")
+            return root
+        raise ConfigError(
+            f"{root} is serving this command, so it cannot reinstall itself.\n"
+            f"Run this instead: uv tool install {'--editable ' if editable else ''}"
+            f"{spec}"
+        )
     if editable:
         argv.append("--editable")
-    if env_present or entrypoint_present(runner):
+    if not env_present and entrypoint_present(runner):
         argv.append("--force")
     if env_present and not editable:
         argv.append("--refresh")

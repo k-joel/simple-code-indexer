@@ -106,6 +106,7 @@ class Uninstaller:
         self.assume_yes = assume_yes
         self.server_name = server_name
         self._failures = 0
+        self._tool_env_pending = False
 
     def run(self) -> int:
         try:
@@ -157,7 +158,7 @@ class Uninstaller:
 
         harness_failures = self._remove_harnesses(record)
         self._compose_down(compose_file)
-        install.remove_tool(self.runner, self.prompts.say)
+        self._remove_tool_env()
         if harness_failures:
             self.prompts.say(
                 f"Keeping {config_path} so a re-run can retry the harness edits."
@@ -176,6 +177,12 @@ class Uninstaller:
         if self._failures:
             self.prompts.say(f"Uninstall finished with {self._failures} failure(s).")
             return 1
+        if self._tool_env_pending:
+            self.prompts.say(
+                "Uninstalled everything except the tool environment. "
+                f"Remove it after this exits: uv tool uninstall {install.TOOL_NAME}"
+            )
+            return 0
         self.prompts.say("Uninstalled. Restart your harnesses to drop the server.")
         return 0
 
@@ -199,8 +206,15 @@ class Uninstaller:
                 plan.append(f"remove the MCP entry from {item.config} ({item.name})")
         if compose_file.is_file():
             plan.append(f"stop the compose services from {compose_file}")
-        if install.tool_env_root(self.runner) is not None:
-            plan.append(f"remove the uv tool environment ({install.TOOL_NAME})")
+        tool_root = install.tool_env_root(self.runner)
+        if tool_root is not None:
+            if self._tool_env_is_self(tool_root):
+                plan.append(
+                    "remove the uv tool environment after this exits "
+                    f"(uv tool uninstall {install.TOOL_NAME})"
+                )
+            else:
+                plan.append(f"remove the uv tool environment ({install.TOOL_NAME})")
         if config_path.is_file():
             plan.append(f"delete {config_path}")
         if docker_dir.is_dir():
@@ -261,6 +275,32 @@ class Uninstaller:
                 "Docker could not stop the compose services"
                 + (f": {detail}" if detail else "")
             )
+
+    def _tool_env_is_self(self, root: Path) -> bool:
+        """Whether this process is executing out of the tool environment.
+
+        Windows locks the image of a running executable, so `uv tool uninstall`
+        fails with `Access is denied` on the ``Scripts`` directory of the
+        environment that is running it. POSIX unlinks a running executable
+        happily, so only Windows has to defer the removal.
+        """
+        if self.platform != "win32":
+            return False
+        return install.running_from_env(root)
+
+    def _remove_tool_env(self) -> None:
+        root = install.tool_env_root(self.runner)
+        if root is None:
+            return
+        if not self._tool_env_is_self(root):
+            install.remove_tool(self.runner, self.prompts.say)
+            return
+        self._tool_env_pending = True
+        self.prompts.say(
+            "This command is running from the tool environment, so Windows "
+            "cannot delete it while it runs."
+        )
+        self.prompts.say(f"After it exits, run: uv tool uninstall {install.TOOL_NAME}")
 
     def _delete_tree(self, path: Path | None, label: str) -> None:
         if path is None or not path.is_dir():

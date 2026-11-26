@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from simple_code_indexer.setup_wizard import install, uninstall
 from simple_code_indexer.setup_wizard import run as wizard_run
-from simple_code_indexer.setup_wizard import uninstall
 from simple_code_indexer.setup_wizard.prompts import Prompter
 from simple_code_indexer.setup_wizard.provision import CommandResult, Runner
 
@@ -39,15 +39,24 @@ class FakeRunner(Runner):
     def __init__(self, *, docker: bool = True) -> None:
         self.docker = docker
         self.calls: list[list[str]] = []
+        self.tool_dir: Path | None = None
 
     def which(self, name: str) -> str | None:
-        return "/usr/bin/docker" if self.docker and name == "docker" else None
+        if name == "docker" and self.docker:
+            return "/usr/bin/docker"
+        if name == "uv" and self.tool_dir is not None:
+            return "/usr/bin/uv"
+        return None
 
     def run(self, argv: list[str], *, timeout: float = 15.0, cwd=None) -> CommandResult:
         self.calls.append(list(argv))
         if argv[:2] == ["docker", "info"]:
             return CommandResult(0 if self.docker else 1)
         if argv[:2] == ["docker", "compose"]:
+            return CommandResult(0)
+        if argv[:3] == ["/usr/bin/uv", "tool", "dir"] and len(argv) == 3:
+            return CommandResult(0, f"{self.tool_dir}\n")
+        if argv[:3] == ["/usr/bin/uv", "tool", "uninstall"]:
             return CommandResult(0)
         return CommandResult(1)
 
@@ -116,15 +125,23 @@ def _uninstaller(
     *,
     prompts: ScriptedPrompter | None = None,
     runner: FakeRunner | None = None,
+    platform: str = "win32",
     **options,
 ) -> uninstall.Uninstaller:
     return uninstall.Uninstaller(
         home=home,
         prompts=prompts or ScriptedPrompter(),
         runner=runner or FakeRunner(),
-        platform="win32",
+        platform=platform,
         **options,
     )
+
+
+def _installed_tool_runner(tmp_path: Path) -> FakeRunner:
+    runner = FakeRunner(docker=False)
+    runner.tool_dir = tmp_path / "tools"
+    (runner.tool_dir / install.TOOL_NAME).mkdir(parents=True)
+    return runner
 
 
 def test_uninstall_removes_everything_the_install_created(tmp_path: Path) -> None:
@@ -141,6 +158,57 @@ def test_uninstall_removes_everything_the_install_created(tmp_path: Path) -> Non
     assert ["docker", "compose", "-f", str(compose), "down", "--remove-orphans"] in (
         runner.calls
     )
+
+
+def test_a_self_hosted_tool_env_is_left_for_a_manual_uninstall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ISS-001: Windows cannot delete the interpreter executing the uninstall."""
+    home, _target, _compose = _prepare(tmp_path)
+    runner = _installed_tool_runner(tmp_path)
+    monkeypatch.setattr(install, "running_from_env", lambda _root, **_kw: True)
+    prompts = ScriptedPrompter()
+
+    code = _uninstaller(
+        home, tmp_path, prompts=prompts, runner=runner, assume_yes=True
+    ).run()
+
+    assert code == 0
+    assert not any(call[1:3] == ["tool", "uninstall"] for call in runner.calls)
+    assert any("after this exits" in message for message in prompts.messages)
+    assert any(
+        f"uv tool uninstall {install.TOOL_NAME}" in message
+        for message in prompts.messages
+    )
+
+
+def test_a_tool_env_not_hosting_this_process_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, _target, _compose = _prepare(tmp_path)
+    runner = _installed_tool_runner(tmp_path)
+    monkeypatch.setattr(install, "running_from_env", lambda _root, **_kw: False)
+
+    code = _uninstaller(home, tmp_path, runner=runner, assume_yes=True).run()
+
+    assert code == 0
+    assert any(call[1:3] == ["tool", "uninstall"] for call in runner.calls)
+
+
+def test_posix_uninstall_removes_the_environment_it_runs_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POSIX unlinks a running executable, so only Windows has to defer."""
+    home, _target, _compose = _prepare(tmp_path)
+    runner = _installed_tool_runner(tmp_path)
+    monkeypatch.setattr(install, "running_from_env", lambda _root, **_kw: True)
+
+    code = _uninstaller(
+        home, tmp_path, runner=runner, platform="linux", assume_yes=True
+    ).run()
+
+    assert code == 0
+    assert any(call[1:3] == ["tool", "uninstall"] for call in runner.calls)
 
 
 def test_keep_models_leaves_the_cache_and_the_global_directory(

@@ -140,6 +140,10 @@ uvx simple-code-indexer uninstall --yes --keep-models   # same, but keep the dow
 Uninstall is record-driven: it removes exactly what setup wrote. Workspace `.simple-ci/`
 indexes, externally managed containers, and endpoints you configured yourself are left alone.
 
+On Windows, `uvx simple-code-indexer uninstall` cannot delete the tool environment it is
+executing from. It removes everything else and prints `uv tool uninstall simple-code-indexer`
+to run after it exits.
+
 ## Using it
 
 After the wizard finishes, **restart your harness** (MCP entries are read at session start),
