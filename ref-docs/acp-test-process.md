@@ -303,8 +303,17 @@ does **not** prove the entry the harness launches.
 | Tool environment exists | `Join-Path (uv tool dir) 'simple-code-indexer'` is a directory, `Scripts\pythonw.exe` present (Windows) / `bin/python` (POSIX) |
 | Flavour | `uv-receipt.toml` says `editable = "<repo>"` (§5.1) |
 | Workspace clean | `<repo>\.simple-ci\index.db` deleted (Stage 6.1), no `simple_code_indexer` process for it |
+| No service reader | `opencode service status` reports `stopped`, or no `opencode-cli serve --service` process holds a session for this workspace (see below) |
 | Harness version | `opencode --version` (2.2.5+) and `opencode acp --help` |
 | Model reachable | one prompt answered in the TUI or via `opencode run` |
+
+**Stop the desktop service before the run when the entry is new.** A global entry is loaded by the
+always-on `opencode-cli serve --service` process as soon as it is written, and that process starts
+its own reader for the workspace — `get_status.sessions` then reads `2` and the driver's
+`one registered session` check fails on a harness artifact, not a server defect. `opencode service
+stop` (verified 2026-11-26) removes it; ACP spawns a private per-process server and is unaffected.
+Confirm with `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like
+'*simple_code_indexer*' }` — only an idle writer daemon may answer.
 
 ---
 
@@ -521,8 +530,9 @@ Get-Content "$repo\.simple-ci\log\writer.log" -Tail 80
 
 Assert, in the current session slice (from `starting (pid=...)` / `writer runtime ready`):
 
-- `serving on stdio (…, role=reader)`, `parent watchdog: watching <harness>` — the harness is the
-  ACP process, not a GUI;
+- `serving on stdio (…, role=reader)`, plus `harness lookup: chain=…` and `reader session …`
+  naming the harness — the harness must be the ACP process (`opencode-cli.exe`), not a GUI or the
+  desktop `serve --service`;
 - `tool=get_status`, `tool=symbol_lookup`, `tool=search_code` lines — one per call;
 - `sweep: checked=N indexed=… unchanged=…` with no `errors>0`;
 - `semantic search: N vector hit(s)` and `embed request ok`;

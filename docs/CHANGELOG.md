@@ -210,6 +210,12 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   `site-packages` install nested inside some other project that happens to hold a
   `src/simple_code_indexer/` tree made the wizard link that project and the loader read its
   `harnesses/` drop-ins; both now require the tree that contains the running module.
+- `docs/`-adjacent process guidance for the ACP end-to-end run now says the harness identity is
+  asserted from `harness lookup: chain=…` / `reader session … harness=<image>(<pid>)` in
+  `reader.log`, instead of the `parent watchdog: watching …` line, which only ever reaches stderr
+  (`ref-docs/acp-test-process.md` §7.1). It also documents stopping `opencode-cli serve --service`
+  before the run, because a freshly written global entry is picked up by that always-on process and
+  makes `get_status.sessions` read 2.
 
 ### Changed (install model)
 
