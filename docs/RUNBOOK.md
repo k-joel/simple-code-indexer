@@ -183,6 +183,7 @@ Runs lint, type checking, and tests. It does not format files, stage changes, or
 **Troubleshooting**
 
 - **Pytest cannot write its temporary or cache directory**: keep `-p no:cacheprovider` and replace the `--basetemp` value with a writable directory.
+- **Many tests fail with `tree_sitter_language_pack.DownloadError: Could not determine a cache directory`**: the pack could not find (or create) the profile's cache root. The autouse fixture in `tests/conftest.py` always sets `TREE_SITTER_LANGUAGE_PACK_CACHE_DIR`, so this means the override was cleared — an outer test or harness that deletes `TREE_SITTER_LANGUAGE_PACK_CACHE_DIR` from the environment will bring it back. To prove the clean-runner path locally, point `LOCALAPPDATA` at a nonexistent directory (so no developer cache is found) and re-run.
 
 ## RUN-003 (OPERATOR): Verify a live MCP session with the stdio probes
 

@@ -159,6 +159,13 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ### Fixed
 
+- The Windows CI job no longer fails 52 tests on a clean runner. `tests/conftest.py`
+  always sets `TREE_SITTER_LANGUAGE_PACK_CACHE_DIR` — the developer's existing grammar
+  cache, or a session-scoped temp directory — because the pack refuses to create the
+  platform cache root itself and the redirected test profile has no `AppData\Local`.
+- CI actions moved off the deprecated Node 20 runtime: `astral-sh/setup-uv` v6 → v7,
+  `actions/upload-artifact` v4 → v7, `actions/download-artifact` v4 → v8, and
+  `softprops/action-gh-release` v2 → v3.
 - Cursor's newer standalone agent CLI (`agent`) is now recognised as an install of Cursor, alongside
   the editor's `cursor` shell command.
 - Command Code is detected by `command-code` on every platform (`cmdc` on Windows, where bare `cmd`

@@ -3,13 +3,11 @@ import os
 import pytest
 
 
-def _grammar_cache_dir() -> str | None:
+def _existing_grammar_cache_dir() -> str | None:
     """The pack's default cache root under the *real* profile, if it exists.
 
-    The fixture below moves `HOME`/`USERPROFILE`, which the pack uses to find its
-    cache; without this pin every parse test would try to re-download ~300
-    grammars. `TREE_SITTER_LANGUAGE_PACK_CACHE_DIR` is the documented override,
-    so the cache stays shared and spawned servers inherit the same answer.
+    Reusing it keeps the developer's downloaded grammars: the fixture below moves
+    `HOME`/`USERPROFILE`, which is where the pack looks for its cache.
     """
     if os.name == "nt":
         root = os.environ.get("LOCALAPPDATA")
@@ -23,11 +21,27 @@ def _grammar_cache_dir() -> str | None:
     return candidate if os.path.isdir(candidate) else None
 
 
-_GRAMMAR_CACHE = _grammar_cache_dir()
+@pytest.fixture(scope="session")
+def _grammar_cache(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """One grammar cache for the whole session, at a path the pack always accepts.
+
+    `TREE_SITTER_LANGUAGE_PACK_CACHE_DIR` is the documented override and must
+    always be set, never only when a developer already has a cache: the pack
+    derives its download directory from the profile the fixture below moves, and
+    on Windows it refuses to create `%LOCALAPPDATA%` itself. A fresh redirected
+    profile has no `AppData\\Local`, so the pack raised `DownloadError` before
+    downloading anything — every parse-dependent test failed on windows-latest.
+    A session directory also keeps a cold run to one download per grammar instead
+    of one per test.
+    """
+    existing = _existing_grammar_cache_dir()
+    if existing is not None:
+        return existing
+    return str(tmp_path_factory.mktemp("grammar-cache"))
 
 
 @pytest.fixture(autouse=True)
-def _no_ambient_config(monkeypatch, tmp_path) -> None:
+def _no_ambient_config(monkeypatch, tmp_path, _grammar_cache) -> None:
     """Never let a developer's ~/.simple-ci/config.yaml change test defaults."""
     monkeypatch.setenv("SIMPLE_CI_CONFIG", "none")
     # Existing tests exercise the single-process writer; sidecar tests override.
@@ -49,5 +63,9 @@ def _no_ambient_config(monkeypatch, tmp_path) -> None:
     if os.name == "nt":
         monkeypatch.setenv("APPDATA", str(home / "AppData" / "Roaming"))
         monkeypatch.setenv("LOCALAPPDATA", str(home / "AppData" / "Local"))
-    if _GRAMMAR_CACHE is not None:
-        monkeypatch.setenv("TREE_SITTER_LANGUAGE_PACK_CACHE_DIR", _GRAMMAR_CACHE)
+    # The pack reads its cache from the profile too (on Windows: `%LOCALAPPDATA%`),
+    # and refuses to create that directory itself — a redirected profile has no
+    # `AppData\Local`, so it raised `DownloadError` before downloading anything and
+    # every parse-dependent test failed on a clean runner. The override must always
+    # be set, and it is inherited by spawned servers so they agree on the path.
+    monkeypatch.setenv("TREE_SITTER_LANGUAGE_PACK_CACHE_DIR", _grammar_cache)

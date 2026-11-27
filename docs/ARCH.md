@@ -1591,8 +1591,12 @@ writes harness entries, config, compose files, and model downloads.
   profile, so a path that forgets to thread `home` cannot reach a real
   `~/.simple-ci/config.yaml` or a real client config (ISS-023).
   `TREE_SITTER_LANGUAGE_PACK_CACHE_DIR` is pinned to the developer's existing
-  cache, because the pack derives its download directory from the profile and
-  would otherwise re-download every grammar.
+  cache, or to a session-scoped temp directory when there is none, because the
+  pack derives its download directory from the profile and would otherwise
+  re-download every grammar. The override is **always** set: the pack refuses to
+  create the platform cache root itself, and the redirected profile has no
+  `AppData\Local`, so leaving it unset made every parse-dependent test raise
+  `DownloadError` on a clean runner.
 
 ### 12.2 Test layers
 

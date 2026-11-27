@@ -26,7 +26,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
@@ -56,7 +56,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
 
       - name: Build
         # --no-sources: build exactly what PyPI would receive.
@@ -83,7 +83,7 @@ jobs:
           uv run --isolated --no-project --with ./dist/*.tar.gz simple-code-indexer version
 
       - name: Store distributions
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
