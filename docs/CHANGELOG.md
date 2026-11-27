@@ -123,7 +123,7 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 - **Four more harnesses**: Hermes Agent (`~/.hermes/config.yaml`, `mcp_servers`), OpenClaw
   (`~/.openclaw/openclaw.json`, `mcp.servers`; merged only — the shipped OpenClaw build has no MCP
-  CLI or config key yet, ISS-001), Kilo Code (`~/.config/kilo/kilo.jsonc` plus the project pair,
+  CLI or config key yet, ISS-004), Kilo Code (`~/.config/kilo/kilo.jsonc` plus the project pair,
   `mcp`, via the config merge) and Cline (`cline_mcp_settings.json` in `~/.cline/data/settings/` and
   VS Code's `globalStorage`, written with `cline mcp add`). See ARCH §7.15 for each client's layout.
 - **Harness detection probes the client's CLI** (ADR-025). The wizard runs `<binary> --version`

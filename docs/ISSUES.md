@@ -84,7 +84,19 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ## Open
 
-### ISS-001: OpenClaw's shipped CLI has no MCP support, so its plugin can only merge
+### ISS-003: `test_daemon_registers_then_exits_after_grace` is timing-flaky in a full run
+
+- **Symptom**: `uv run pytest` occasionally fails that one test (its `_wait_until` for the ready
+  file or the lease release times out at 20 s) while `pytest tests/test_sidecar_daemon.py` passes
+  every time — observed twice on 2026-11-27, both under a full-suite run.
+- **Where flagged**: 2026-11-27, full-suite gates while changing harness detection and env vars.
+- **Cause**: `tests/test_sidecar_daemon.py:147` budgets 20 s for a spawned daemon to take the lease,
+  start its runtime and exit after a 1 s grace; under full-suite load the spawn plus interpreter
+  start consumes most of that window, so the deadline is too tight rather than the daemon misbehaving.
+- **Suggested fix**: raise the two `_wait_until` timeouts (and the `_start` deadline) or drive them
+  from a shared constant, then run the full suite a few times in a row to confirm.
+
+### ISS-004: OpenClaw's shipped CLI has no MCP support, so its plugin can only merge
 
 - **Symptom**: `openclaw mcp status` fails with "unknown command 'mcp'", and
   `openclaw config set mcp.servers.<name> <json> --strict-json` writes the value and then exits 1

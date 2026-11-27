@@ -11,7 +11,7 @@ outright — `openclaw config set mcp.servers.<name> …` writes the file and th
 exits with "Unrecognized key: mcp", which would leave a config the client
 refuses to load. The wizard's merge is therefore the only writer until a
 release that documents MCP ships it; add `cli_add` (`openclaw mcp set <name>
-<json>` / `openclaw mcp unset <name>`) at that point. See ISSUES.md.
+<json>` / `openclaw mcp unset <name>`) at that point. See ISS-004.
 
 Stdio definitions take `command`/`args`/`env`; `requestTimeoutMs` is left at the
 client default.
