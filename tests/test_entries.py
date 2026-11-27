@@ -286,6 +286,80 @@ def test_verify_reports_a_missing_entry(tmp_path: Path) -> None:
     assert reason is not None and "no" in reason
 
 
+def test_verify_requires_the_harness_marker(tmp_path: Path) -> None:
+    """A resolver-owning plugin must name itself, or the server cannot ask it."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    spec = _spec("commandcode")
+    path = tmp_path / "home" / ".commandcode" / "mcp.json"
+    path.parent.mkdir(parents=True)
+    command = _command(tmp_path)
+    unmarked = [*command, "--harness", "someone-else"]
+
+    def write(argv: list[str]) -> None:
+        path.write_text(
+            json.dumps(
+                {"mcpServers": {SERVER: {"command": argv[0], "args": argv[1:]}}}
+            ),
+            encoding="utf-8",
+        )
+
+    write(command)
+    assert "does not name its harness" in (
+        entries.verify(spec, path, Scope.GLOBAL, SERVER, workspace) or ""
+    )
+
+    write(unmarked)
+    assert "does not name its harness" in (
+        entries.verify(spec, path, Scope.GLOBAL, SERVER, workspace) or ""
+    )
+
+    write([*command, "--harness", "commandcode"])
+    assert entries.verify(spec, path, Scope.GLOBAL, SERVER, workspace) is None
+
+
+def test_verify_flags_an_entry_that_carries_env(tmp_path: Path) -> None:
+    """Entries carry arguments, never environment variables (ADR-024)."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    spec = _spec("cursor")
+    path = workspace / ".cursor" / "mcp.json"
+    path.parent.mkdir(parents=True)
+    entries.install_entry(
+        spec,
+        scope=Scope.PROJECT,
+        workspace=workspace,
+        home=tmp_path,
+        server_name=SERVER,
+        command=_command(tmp_path),
+        env={"SIMPLE_CI_HARNESS": "cursor"},
+        runner=RecordingRunner(),
+        dry_run=False,
+        say=lambda _message: None,
+    )
+
+    reason = entries.verify(spec, path, Scope.PROJECT, SERVER, workspace)
+
+    assert reason is not None and "environment variables" in reason
+
+
+def test_no_entry_carries_env(tmp_path: Path) -> None:
+    """Every builtin, both scopes: no env block, and the flag where it is due."""
+    for spec in load_harnesses(user_dirs=[]):
+        for scope in (Scope.GLOBAL, Scope.PROJECT):
+            argv = entries.launch_argv(spec, _command(tmp_path), scope, tmp_path)
+            built = spec.entry(argv, {})
+            assert not any(built.get(key) for key in ("env", "environment", "envs")), (
+                spec.name,
+                scope,
+            )
+            has_marker = "--harness" in argv
+            assert has_marker is (spec.workspace_resolver is not None), (
+                spec.name,
+                scope,
+            )
+
+
 def test_remove_uses_the_recorded_file(tmp_path: Path) -> None:
     workspace = tmp_path / "project"
     workspace.mkdir()

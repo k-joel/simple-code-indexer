@@ -1978,6 +1978,7 @@ def test_a_global_entry_is_never_pinned(tmp_path: Path) -> None:
     ]["simple-code-indexer"]
     assert entry["args"] == ["-m", "simple_code_indexer", "serve"]
     assert "--workspace" not in entry["args"]
+    assert "--harness" not in entry["args"]
 
 
 def test_switching_scope_removes_the_old_entry(tmp_path: Path) -> None:

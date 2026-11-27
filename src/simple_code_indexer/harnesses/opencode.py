@@ -62,8 +62,8 @@ def cli_add(
 ) -> list[str] | None:
     """`opencode mcp add [--global] <name> -- <command>`.
 
-    Project scope is the CLI's default, so no flag is needed there. `--env`
-    is repeated per key; today the wizard passes none.
+    Project scope is the CLI's default, so no flag is needed there. `--env` is
+    not passed: entries carry arguments, never environment variables (ADR-024).
     """
     del workspace
     argv = ["opencode", "mcp", "add"]

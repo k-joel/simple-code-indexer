@@ -8,8 +8,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from simple_code_indexer.harnesses import RUNTIME_ENV
-
 NAME = "commandcode"
 LABEL = "Command Code"
 HOME_DIRS = [".commandcode"]
@@ -39,10 +37,11 @@ def entry(command: list[str], env: dict[str, str]) -> dict[str, Any]:
         "transport": "stdio",
         "enabled": True,
         "command": command[0],
-        "env": {**env, RUNTIME_ENV: NAME},
     }
     if len(command) > 1:
         value["args"] = command[1:]
+    if env:
+        value["env"] = dict(env)
     return value
 
 

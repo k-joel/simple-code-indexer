@@ -71,7 +71,10 @@ def test_ensure_started_resolves_the_workspace_once(
         return workspace
 
     def fake_load(
-        *, mcp_workspace: Path | None = None, cli_workspace: Path | None = None
+        *,
+        mcp_workspace: Path | None = None,
+        cli_workspace: Path | None = None,
+        cli_harness: str | None = None,
     ) -> Settings:
         loads.append(mcp_workspace)
         return settings
@@ -111,7 +114,10 @@ def test_a_workspace_pin_skips_the_roots_probe(tmp_path: Path, monkeypatch) -> N
         return workspace
 
     def fake_load(
-        *, mcp_workspace: Path | None = None, cli_workspace: Path | None = None
+        *,
+        mcp_workspace: Path | None = None,
+        cli_workspace: Path | None = None,
+        cli_harness: str | None = None,
     ) -> Settings:
         loads.append((mcp_workspace, cli_workspace))
         return settings

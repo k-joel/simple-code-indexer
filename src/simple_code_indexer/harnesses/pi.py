@@ -39,11 +39,11 @@ def cli_add(
     command: list[str],
     entry: dict[str, Any],
 ) -> list[str] | None:
-    """`pi mcp add [-l] <name> [--env K=V] -- <command>`.
+    """`pi mcp add [-l] <name> -- <command>`.
 
     `--local` selects `.pi/mcp.json`; Pi's global file is the default. Pi's
     `--exposure direct` matches the entry we build, so tools stay on the
-    native list.
+    native list. No `--env`: entries carry arguments, never env (ADR-024).
     """
     del workspace
     argv = ["pi", "mcp", "add"]

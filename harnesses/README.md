@@ -33,13 +33,14 @@ If `FORMAT = "toml"`, the plugin must not set `ROOT_KEY`; the loader writes a
 marker-delimited `[mcp_servers."simple-code-indexer"]` block. A plugin can also
 provide `render(existing, *, name, command, env) -> str` to fully control merging.
 
-A plugin that implements `resolve_workspace` must also put the reserved
-`SIMPLE_CI_HARNESS=<NAME>` key into its entry env (from
-`simple_code_indexer.harnesses.RUNTIME_ENV`). The server then asks that plugin —
-and only that plugin — for the workspace after the MCP handshake. The value is a
-stable harness id, never a path: it is install-scoped, so it is allowed under
-ADR-015. An entry installed before the key existed is still served: when the
-process cwd is not a plausible project (the user home or an ancestor's
+A plugin that implements `resolve_workspace` gets `serve --harness <NAME>`
+appended to its entry by the wizard (from `simple_code_indexer.harnesses`).
+The server then asks that plugin — and only that plugin — for the workspace
+after the MCP handshake. The value is a stable harness id, never a path: it is
+install-scoped, so it is allowed under ADR-015 and, unlike an env var, visible
+in the client's own config. `SIMPLE_CI_HARNESS` is still read as a debug
+fallback. An entry installed before either marker existed is still served: when
+the process cwd is not a plausible project (the user home or an ancestor's
 executable directory), every plugin with a resolver is asked, marked one first.
 Discovery logic (files, sockets, IDE state) belongs in the plugin, not
 in core; see `src/simple_code_indexer/harnesses/commandcode.py` for the
@@ -48,11 +49,22 @@ for matching a live ancestor pid.
 
 **Never put per-project data in an entry** ([ADR-015](../docs/DECISIONS.md#adr-015-harness-entries-are-global-only-no-per-project-data)).
 Entries are written at global scope and serve every project, so `entry()` must not
-derive a `cwd` from `env`, and `env` must never be filled with `WORKSPACE_ROOT`,
-`INDEX_DB`, or `FAISS_PATH`. The server resolves the workspace at runtime
-(`WORKSPACE_ROOT` > MCP roots > the harness hook > cwd; see
-[ADR-018](../docs/DECISIONS.md#adr-018-mcp-roots-first-harness-published-workspace-third)).
-The wizard passes no `env` unless `--no-git-pull` is given.
+derive a `cwd` from `env`, and `env` must never be filled with
+`SIMPLE_CI_WORKSPACE_ROOT`, `SIMPLE_CI_INDEX_DB`, or `SIMPLE_CI_FAISS_PATH`.
+**Entries carry arguments, never environment variables**
+([ADR-024](../docs/DECISIONS.md)): every setting has a parallel CLI flag, and
+the wizard passes an empty `env` to every builtin, so a generated entry has no
+`env` block at all. Environment variables exist for debugging only, and every
+one of ours is prefixed `SIMPLE_CI_`.
+The server resolves the workspace at runtime
+(`SIMPLE_CI_WORKSPACE_ROOT` > `--workspace` > MCP roots > the harness hook > cwd;
+see [ADR-018](../docs/DECISIONS.md#adr-018-mcp-roots-first-harness-published-workspace-third)).
+
+Detection is derived from `BINARIES` + `PROBE_ARGS` + `HOME_DIRS`: the binary is
+run with the probe args (default `--version`) and a zero exit is the strong
+signal; a binary merely on `PATH` counts, and a present directory under
+`HOME_DIRS` is the fallback for harnesses with no CLI at all. Declare a binary
+only when it answers without opening a GUI window.
 
 `%APPDATA%` and `~` are expanded in `HOME_DIRS` and `*_CONFIGS`; entries whose
 variables do not exist on the current platform are ignored.

@@ -533,9 +533,11 @@ class ServerState:
         self,
         exit: Callable[[int], NoReturn] = os._exit,
         workspace: Path | None = None,
+        harness: str | None = None,
     ) -> None:
         self._exit = exit
         self._pinned = workspace
+        self._harness = harness
         self._lock = asyncio.Lock()
         self._cleanup: Callable[[], None] | None = None
         self._finalized = False
@@ -558,7 +560,9 @@ class ServerState:
             )
             try:
                 settings = load_settings(
-                    mcp_workspace=roots, cli_workspace=self._pinned
+                    mcp_workspace=roots,
+                    cli_workspace=self._pinned,
+                    cli_harness=self._harness,
                 )
             except ConfigError as exc:
                 logger.error("%s", exc)
@@ -699,9 +703,9 @@ async def _serve(
             watchdog.close()
 
 
-async def _run(workspace: Path | None = None) -> None:
+async def _run(workspace: Path | None = None, harness: str | None = None) -> None:
     logging_setup.install_excepthooks()
-    state = ServerState(workspace=workspace)
+    state = ServerState(workspace=workspace, harness=harness)
     watchdog = parent_watch.ParentWatchdog() if parent_watch.enabled() else None
 
     try:
@@ -729,10 +733,10 @@ async def _run(workspace: Path | None = None) -> None:
         state.cleanup_once()
 
 
-def main(workspace: Path | None = None) -> None:
+def main(workspace: Path | None = None, harness: str | None = None) -> None:
     logging_setup.configure_console()
     try:
-        asyncio.run(_run(workspace))
+        asyncio.run(_run(workspace, harness))
     except ConfigError as exc:
         logger.error("%s", exc)
         raise SystemExit(1) from None

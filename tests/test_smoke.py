@@ -56,7 +56,7 @@ def test_serve_passes_unknown_flags_through(monkeypatch) -> None:
     """A stray argument in a harness config must not leave a dead pipe."""
     imported: list[bool] = []
 
-    def fake_server_main(workspace=None) -> None:
+    def fake_server_main(workspace=None, harness=None) -> None:
         imported.append(True)
 
     monkeypatch.setattr("simple_code_indexer.server.main", fake_server_main)
@@ -69,7 +69,7 @@ def test_serve_reads_the_workspace_pin(monkeypatch, tmp_path) -> None:
     """A project-scope entry pins its workspace with `serve --workspace <dir>`."""
     seen: list[object] = []
 
-    def fake_server_main(workspace=None) -> None:
+    def fake_server_main(workspace=None, harness=None) -> None:
         seen.append(workspace)
 
     monkeypatch.setattr("simple_code_indexer.server.main", fake_server_main)
@@ -78,6 +78,21 @@ def test_serve_reads_the_workspace_pin(monkeypatch, tmp_path) -> None:
     assert cli._cli_main(["serve", f"--workspace={tmp_path}"]) == 0
     assert cli._cli_main(["serve"]) == 0
     assert seen == [tmp_path, tmp_path, None]
+
+
+def test_serve_reads_the_harness_marker(monkeypatch) -> None:
+    """`serve --harness <name>` names the plugin allowed to publish a workspace."""
+    seen: list[object] = []
+
+    def fake_server_main(workspace=None, harness=None) -> None:
+        seen.append(harness)
+
+    monkeypatch.setattr("simple_code_indexer.server.main", fake_server_main)
+
+    assert cli._cli_main(["serve", "--harness", "commandcode"]) == 0
+    assert cli._cli_main(["serve", "--harness=commandcode"]) == 0
+    assert cli._cli_main(["serve"]) == 0
+    assert seen == ["commandcode", "commandcode", None]
 
 
 def test_the_module_entry_point_runs_the_cli() -> None:

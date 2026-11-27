@@ -379,7 +379,9 @@ def test_commandcode_marks_the_stdio_transport() -> None:
     assert entry["enabled"] is True
     assert entry["command"] == "uvx"
     assert entry["args"] == ["--from", "/repo", NAME]
-    assert entry["env"] == {harnesses_pkg.RUNTIME_ENV: "commandcode"}
+    # No env marker: the wizard passes `--harness commandcode` instead (ADR-024).
+    assert "env" not in entry
+    assert harnesses_pkg.entry_argv(entry) == COMMAND
 
 
 LOCAL_CONFIGS = {

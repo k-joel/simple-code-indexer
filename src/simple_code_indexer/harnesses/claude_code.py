@@ -27,7 +27,8 @@ def cli_add(
     """`claude mcp add <scope> <name> -- <command>`.
 
     Everything after `--` is passed to the server untouched, so the workspace
-    pin survives. The `-e/--env` flag is the only way to set entry env.
+    pin and the `--harness` marker survive. No `-e/--env` is used: entries carry
+    arguments, never environment variables (ADR-024).
     """
     del workspace, entry
     cli_scope = "user" if scope == "global" else scope

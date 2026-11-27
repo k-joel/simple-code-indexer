@@ -113,7 +113,7 @@ def test_an_implausible_cwd_asks_legacy_entries_for_a_workspace(
     monkeypatch.setattr(config, "_implausible_reason", reason)
     calls: list[bool] = []
 
-    def fake(cwd_arg: Path, *, require_marker: bool = True):
+    def fake(cwd_arg: Path, *, require_marker: bool = True, name=None):
         calls.append(require_marker)
         return None if require_marker else (workspace, "commandcode")
 
@@ -137,7 +137,7 @@ def test_a_plausible_cwd_is_not_overridden_by_a_legacy_entry(
     monkeypatch.setattr(config, "_implausible_reason", lambda path: None)
     calls: list[bool] = []
 
-    def fake(cwd_arg: Path, *, require_marker: bool = True):
+    def fake(cwd_arg: Path, *, require_marker: bool = True, name=None):
         calls.append(require_marker)
         return None if require_marker else (workspace, "commandcode")
 
@@ -220,7 +220,7 @@ def test_the_workspace_argument_beats_roots_and_the_harness(
     published.mkdir()
     monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
     monkeypatch.setattr(
-        harnesses, "discover_workspace", lambda cwd: (published, "commandcode")
+        harnesses, "discover_workspace", lambda cwd, **_: (published, "commandcode")
     )
 
     settings = load_settings(mcp_workspace=roots, cli_workspace=pinned)
@@ -268,7 +268,7 @@ def test_harness_published_workspace_wins_over_the_cwd(
     workspace.mkdir()
     monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
     monkeypatch.setattr(
-        harnesses, "discover_workspace", lambda cwd: (workspace, "commandcode")
+        harnesses, "discover_workspace", lambda cwd, **_: (workspace, "commandcode")
     )
 
     settings = load_settings()
@@ -288,7 +288,7 @@ def test_mcp_roots_beat_the_harness_published_workspace(
     published.mkdir()
     monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
     monkeypatch.setattr(
-        harnesses, "discover_workspace", lambda cwd: (published, "commandcode")
+        harnesses, "discover_workspace", lambda cwd, **_: (published, "commandcode")
     )
 
     settings = load_settings(mcp_workspace=roots)

@@ -24,12 +24,14 @@ from pathlib import Path
 from typing import Any
 
 from simple_code_indexer.harnesses import (
+    HARNESS_FLAG,
     HarnessSpec,
     Scope,
     _json,
     _yaml,
     entry_argv,
     expand_config_path,
+    harness_flag,
     pinned_command,
     spawnable,
 )
@@ -70,6 +72,24 @@ def scope_for(spec: HarnessSpec, scope: str) -> str:
     installed globally; the caller warns when this differs from the request.
     """
     return scope if spec.supports(scope) else Scope.GLOBAL
+
+
+def launch_argv(
+    spec: HarnessSpec, command: list[str], scope: str, workspace: Path
+) -> list[str]:
+    """The argv an entry for `spec` carries at `scope` — the one place it is built.
+
+    A project entry is pinned to its workspace (ADR-022), and a plugin with a
+    ``resolve_workspace`` hook also names itself, because the server must know
+    which plugin may publish a workspace (ADR-018, ADR-024). Everything else is
+    the plain server command; no entry carries environment variables.
+    """
+    argv = (
+        pinned_command(command, workspace) if scope == Scope.PROJECT else list(command)
+    )
+    if spec.workspace_resolver is not None:
+        argv = harness_flag(argv, spec.name)
+    return argv
 
 
 def cli_target(
@@ -167,11 +187,7 @@ def install_entry(
     *that* file, so the caller records a path it can clean up later.
     """
     effective = scope_for(spec, scope)
-    pinned = (
-        pinned_command(command, workspace)
-        if effective == Scope.PROJECT
-        else list(command)
-    )
+    pinned = launch_argv(spec, command, effective, workspace)
     entry = spec.entry(pinned, env)
     explicit = target is not None
     if target is None:
@@ -296,8 +312,10 @@ def verify(
     """None when `path` holds a usable entry, else why not.
 
     A project entry must carry the pin; a global entry must not (ADR-015).
-    This is a warning, not a rejection: a client that rewrote the entry its own
-    way still gets reported accurately rather than silently accepted.
+    A resolver-owning plugin must name itself with ``--harness`` and no entry
+    may carry environment variables (ADR-024). This is a warning, not a
+    rejection: a client that rewrote the entry its own way still gets reported
+    accurately rather than silently accepted.
     """
     entry = read_entry(spec, path, server_name)
     if entry is None:
@@ -310,7 +328,31 @@ def verify(
         return f"the entry is not pinned to {workspace}"
     if scope != Scope.PROJECT and pinned is not None:
         return f"the global entry is pinned to {pinned}"
+    if spec.workspace_resolver is not None and spec.name not in _harness_names(argv):
+        return f"the entry does not name its harness ({HARNESS_FLAG} {spec.name})"
+    if _entry_env(entry):
+        return "the entry carries environment variables; pass a flag instead"
     return None
+
+
+def _harness_names(argv: list[str]) -> set[str]:
+    """Every value passed as `--harness`, in both spellings."""
+    names: set[str] = set()
+    for index, item in enumerate(argv):
+        if item == HARNESS_FLAG and index + 1 < len(argv):
+            names.add(argv[index + 1])
+        elif item.startswith(HARNESS_FLAG + "="):
+            names.add(item.partition("=")[2])
+    return names
+
+
+def _entry_env(entry: dict[str, Any]) -> dict[str, Any]:
+    """The entry's environment block, whichever key this client spells it with."""
+    for key in ("env", "environment", "envs"):
+        value = entry.get(key)
+        if isinstance(value, dict) and value:
+            return value
+    return {}
 
 
 def read_entry(

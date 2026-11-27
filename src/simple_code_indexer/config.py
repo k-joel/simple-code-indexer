@@ -181,7 +181,9 @@ def _prompt(
 
 
 def resolve_workspace_root(
-    mcp_workspace: Path | None = None, cli_workspace: Path | None = None
+    mcp_workspace: Path | None = None,
+    cli_workspace: Path | None = None,
+    harness: str | None = None,
 ) -> tuple[Path, str]:
     """WORKSPACE_ROOT > --workspace > MCP roots > harness workspace > cwd.
 
@@ -189,11 +191,12 @@ def resolve_workspace_root(
     ``harness:<name>`` or ``cwd`` — so the choice is observable through
     ``get_status.workspace_source`` (ADR-018, ADR-022).
 
-    Discovery is normally sealed by the entry's `SIMPLE_CI_HARNESS` marker. An
-    entry installed before that marker existed gets no marker at all, so when
-    the cwd is implausible (the editor's own install directory, the home
-    directory) every plugin with a resolver is asked instead. A plausible cwd
-    is never overridden: a terminal launch keeps indexing where it was started.
+    Discovery is normally sealed by the entry's ``--harness <name>`` argument,
+    with `SIMPLE_CI_HARNESS` still read as a debug fallback (ADR-024). An entry
+    installed before either existed gets no marker at all, so when the cwd is
+    implausible (the editor's own install directory, the home directory) every
+    plugin with a resolver is asked instead. A plausible cwd is never
+    overridden: a terminal launch keeps indexing where it was started.
     """
     env_root = os.environ.get("WORKSPACE_ROOT")
     if env_root:
@@ -205,9 +208,9 @@ def resolve_workspace_root(
     cwd = Path.cwd().resolve()
     from simple_code_indexer import harnesses
 
-    found = harnesses.discover_workspace(cwd)
+    found = harnesses.discover_workspace(cwd, name=harness)
     if found is None and _implausible_reason(cwd) is not None:
-        found = harnesses.discover_workspace(cwd, require_marker=False)
+        found = harnesses.discover_workspace(cwd, require_marker=False, name=harness)
     if found is not None:
         return found[0], f"harness:{found[1]}"
     return cwd, "cwd"
@@ -403,13 +406,16 @@ def _log_level(file_value: str | None, env_value: str | None) -> str:
 
 
 def load_settings(
-    *, mcp_workspace: Path | None = None, cli_workspace: Path | None = None
+    *,
+    mcp_workspace: Path | None = None,
+    cli_workspace: Path | None = None,
+    cli_harness: str | None = None,
 ) -> Settings:
     from simple_code_indexer.registry import get_registry
 
     registry = get_registry()
     workspace_root, workspace_source = resolve_workspace_root(
-        mcp_workspace, cli_workspace
+        mcp_workspace, cli_workspace, cli_harness
     )
     _reject_implausible_workspace(workspace_root, workspace_source)
     config_paths = configfile.config_paths(workspace_root)

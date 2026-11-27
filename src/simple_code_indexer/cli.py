@@ -49,39 +49,51 @@ def _parser() -> argparse.ArgumentParser:
 
 def _serve(argv: list[str]) -> int:
     # Unknown flags are ignored on purpose: a stray argument in a harness config
-    # must never leave the pipe without a server. `--workspace` is the one
-    # exception — a project-scope entry pins its workspace with it (ADR-022).
-    workspace, rest = _workspace_arg(argv)
+    # must never leave the pipe without a server. `--workspace` and `--harness`
+    # are the exceptions — a project-scope entry pins its workspace (ADR-022) and
+    # a resolver-owning entry names its plugin (ADR-024).
+    workspace, rest = _flag_arg(argv, "--workspace")
+    harness, rest = _flag_arg(rest, "--harness")
     _parser().parse_known_args(rest)
     logging_setup.configure_console()
     from simple_code_indexer.server import main as server_main
 
-    server_main(workspace=workspace)
+    path = _absolute(workspace)
+    server_main(workspace=path, harness=harness)
     return 0
 
 
-def _workspace_arg(argv: list[str]) -> tuple[Path | None, list[str]]:
-    """Split the `--workspace` pin out of `argv`; last occurrence wins."""
+def _flag_arg(argv: list[str], flag: str) -> tuple[str | None, list[str]]:
+    """Split `flag value` / `flag=value` out of `argv`; last occurrence wins.
+
+    Hand-rolled rather than argparse because `serve` must tolerate unknown
+    flags (stdout is the MCP transport) and these two are the only ones it reads.
+    """
     found: str | None = None
     rest: list[str] = []
     index = 0
     while index < len(argv):
         item = argv[index]
-        if item == "--workspace":
+        if item == flag:
             if index + 1 < len(argv):
                 found = argv[index + 1]
                 index += 1
-        elif item.startswith("--workspace="):
+        elif item.startswith(flag + "="):
             found = item.partition("=")[2]
         else:
             rest.append(item)
         index += 1
-    if not found:
-        return None, rest
-    path = Path(found).expanduser()
+    return found, rest
+
+
+def _absolute(raw: str | None) -> Path | None:
+    """A `--workspace` value as an absolute path (relative resolves against cwd)."""
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
     if not path.is_absolute():
         path = Path.cwd() / path
-    return path, rest
+    return path
 
 
 def _setup(argv: list[str]) -> int:

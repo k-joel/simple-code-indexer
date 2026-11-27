@@ -329,19 +329,21 @@ def default_user_harness_dirs(workspace: Path | None = None) -> list[Path]:
 
 
 def discover_workspace(
-    cwd: Path, *, require_marker: bool = True
+    cwd: Path, *, require_marker: bool = True, name: str | None = None
 ) -> tuple[Path, str] | None:
     """Workspace published by the harness that launched this session.
 
-    The entry names its plugin through `RUNTIME_ENV`; only that plugin is
-    asked, and only it can answer (ADR-018). ``require_marker=False`` asks every
-    plugin that declares a resolver (the marked one first): an entry installed
-    before the marker existed then keeps working after a package update, with no
-    setup re-run. Fail-soft: an unknown plugin, a resolver
-    that raises, or a result that is not an existing directory all fall through
-    to the caller's next workspace source.
+    The entry names its plugin through ``--harness <NAME>`` (``HARNESS_FLAG``);
+    only that plugin is asked, and only it can answer (ADR-018). ``name`` is the
+    parsed argument; when it is absent, ``SIMPLE_CI_HARNESS`` is still honoured
+    so a hand-written or pre-ADR-024 entry keeps resolving. ``require_marker=False``
+    asks every plugin that declares a resolver (the marked one first): an entry
+    installed before either marker existed then keeps working after a package
+    update, with no setup re-run. Fail-soft: an unknown plugin, a resolver that
+    raises, or a result that is not an existing directory all fall through to
+    the caller's next workspace source.
     """
-    name = os.environ.get(RUNTIME_ENV)
+    name = name or os.environ.get(RUNTIME_ENV)
     if require_marker and not name:
         return None
     specs = load_harnesses(user_dirs=default_user_harness_dirs(cwd))

@@ -27,7 +27,6 @@ from simple_code_indexer.harnesses import (
     HarnessSpec,
     Scope,
     load_harnesses,
-    pinned_command,
 )
 from simple_code_indexer.setup_wizard import (
     catalog,
@@ -103,11 +102,11 @@ def _stored_prompt(
     return default
 
 
-def _pinned(command: list[str], scope: str, workspace: Path) -> list[str]:
-    """The argv an entry at `scope` carries; only a project entry is pinned."""
-    if scope == Scope.PROJECT:
-        return pinned_command(command, workspace)
-    return list(command)
+def _pinned(
+    spec: HarnessSpec, command: list[str], scope: str, workspace: Path
+) -> list[str]:
+    """The argv an entry for `spec` carries; delegates to the one builder."""
+    return entries.launch_argv(spec, command, scope, workspace)
 
 
 def _record(
@@ -1391,7 +1390,7 @@ class Wizard:
                     + write.render(
                         spec,
                         SERVER_NAME,
-                        _pinned(command, outcome.scope, self.cwd),
+                        _pinned(spec, command, outcome.scope, self.cwd),
                         {},
                     )
                 )
