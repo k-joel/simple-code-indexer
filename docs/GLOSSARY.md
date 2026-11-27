@@ -243,6 +243,18 @@ or `<workspace>/harnesses/`) that declares one harness's detection folders, glob
 config paths, and how to merge a server entry into its file. Overrides a builtin by `NAME`.
 _Avoid_: adapter, integration, connector
 
+**Harness detection**:
+The wizard's proof that a harness is installed, in decreasing strength: `cli` (its binary answered
+`PROBE_ARGS`, default `--version`), `binary` (the binary is on `PATH`), `dir` (its config directory
+exists). The three are ORed, and the winning reason is shown in the harness menu and by
+`setup --harnesses`. _Avoid_: scan, discover, install check
+
+**Harness marker**:
+The install-scoped `serve --harness <NAME>` argument a resolver-owning plugin's entry carries, so
+the server knows which single plugin may publish a session's workspace (ADR-018, ADR-024). The
+`SIMPLE_CI_HARNESS` environment variable is only a debug fallback.
+_Avoid_: harness id, runtime tag, SIMPLE_CI_HARNESS
+
 ## Search
 
 **search_code**:

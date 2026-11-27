@@ -229,9 +229,7 @@ class Prompter:
                 prompter.Separator(),
             ]
             choices.extend(
-                prompter.Choice(
-                    title=label, value=index, checked=index in set(default)
-                )
+                prompter.Choice(title=label, value=index, checked=index in set(default))
                 for index, label in enumerate(options)
             )
             answer = prompter.checkbox(question, choices=choices).ask()

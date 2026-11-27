@@ -685,3 +685,94 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   — a dimension change invalidates the vector binding and re-embeds (the normal identity rule, not
   a new one). A 768-dim table is also ~3× smaller and cheaper to scan than 2560.
 
+## ADR-024: Flags are for production, environment variables are for debugging
+
+**Status**: Accepted
+**Date**: 2026-11-27
+
+- **Context:** A generated harness entry injected `SIMPLE_CI_HARNESS=<NAME>` into its `env` block,
+  and the server wrote `WORKSPACE_ROOT`/`INDEX_DB` into a spawned daemon's environment. Both were
+  invisible in the client's own config (a user reading `.mcp.json` could not tell why the server
+  picked a workspace), easy to forget when hand-writing an entry, and unreadable in a process
+  listing. Environment variables were also a mix of prefixed (`SIMPLE_CI_CONFIG`,
+  `SIMPLE_CI_MODE`) and bare names (`WORKSPACE_ROOT`, `INDEX_DB`, `EMBED_*`, `LOG_LEVEL`,
+  `SQLITE_VEC_*`, `PREFETCH_GRAMMARS`, `SYMBOL_FALLBACK`), so a `LOG_LEVEL` or `MODE` in a process
+  environment could not be attributed to this project at all.
+- **Decision:**
+  1. **Every setting has a parallel CLI argument.** A generated entry carries arguments, never
+     environment variables: `serve` reads `--workspace`, `--harness` and `--index-db`, and the
+     wizard builds an entry's argv in exactly one place (`entries.launch_argv`). A builtin plugin's
+     `entry()` receives an empty `env`, so a written entry has no `env` block; `entries.verify`
+     reports one that does, whichever key the client uses (`env`, `environment`, `envs`).
+  2. **`--harness <NAME>` replaces the `SIMPLE_CI_HARNESS` entry key.** It names the plugin allowed
+     to publish a session's workspace (ADR-018). The variable is still *read* as a debug and
+     pre-ADR-024 fallback — the flag wins — so an older entry keeps resolving.
+  3. **Every variable of ours is prefixed `SIMPLE_CI_`.** `env.get("LOG_LEVEL")` reads
+     `SIMPLE_CI_LOG_LEVEL` first and a bare legacy name second, with a one-shot deprecation
+     warning. `simple_code_indexer/env.py` is the only seam, imports nothing from the package, and
+     is shared by `config`, `mcp_roots`, `registry`, `parse` and the sidecar. Third-party names
+     (`COMSPEC`, `ProgramFiles`, `HF_TOKEN`, `XDG_RUNTIME_DIR`, `APPDATA`, `LOCALAPPDATA`, `HOME`,
+     Cline's own `CLINE_*`) are never renamed.
+  4. **A child process is production.** The sidecar daemon is spawned with `--workspace` and
+     `--index-db` arguments, not with `WORKSPACE_ROOT`/`INDEX_DB` in its environment.
+- **Consequences:** An entry is self-describing: what it does is what it says, and it survives being
+  copied between clients. The flag parser stays hand-rolled and tolerant (`cli._flag_arg`, last
+  occurrence wins), because `serve` must still ignore unknown arguments — stdout is the MCP
+  transport. Env vars remain the fast path for a one-off debug session and for tests, and stay
+  documented as such. A new knob must ship a flag (or be `config.yaml`-only); a knob that exists
+  only as an env var is a review failure. `status` deliberately has no `--harness`/`--index-db`
+  flags: it is a terminal command and `parse_known_args` ignores them.
+
+## ADR-025: Harness detection probes the client CLI, with a directory fallback
+
+**Status**: Accepted
+**Date**: 2026-11-27
+
+- **Context:** The wizard preselected a harness when one of its `HOME_DIRS` existed *or* a `BINARIES`
+  name was on `PATH`. Directory existence survives uninstall — `~/.cursor`, `~/.config/kilo` and
+  friends are commonly left behind — so the menu offered harnesses that were gone. `PATH` lookup
+  alone is not proof either, and it is actively wrong for names that belong to another tool: `zed`
+  on `PATH` is usually authzed's SpiceDB CLI, and `cmd` on Windows is the shell.
+- **Decision:** `HarnessSpec.detection()` resolves the plugin's binary, runs it with `PROBE_ARGS`
+  (default `--version`) under a 10 s cap, and treats a zero exit as the strong signal (`cli`). A
+  binary that is merely on `PATH` is the weaker `binary`, and a present directory under `HOME_DIRS`
+  is `dir`. The three are **ORed**, never exclusive, and the winning reason is shown in the menu
+  (`— detected: cursor --version` / `— detected: config dir .cursor`) and by
+  `setup --harnesses`. Plugins may override `PROBE_ARGS`; declaring a binary is opt-in, so a
+  client whose executable is a GUI that would open a window on `--version` declares none (Claude
+  Desktop, Zed) and is detected by directory. The probe lives in
+  `harnesses/_probe.py` behind a `Runnable` protocol (`which`/`run`), so the wizard's
+  `provision.Runner` and its test fake drop in with no `harnesses → setup_wizard` import. Windows
+  `.cmd`/`.bat` shims are routed through `cmd /c` by the shared `spawnable()`, because `subprocess`
+  cannot execute a batch file.
+- **Consequences:** A stale directory can still produce a false positive, which is accepted
+  deliberately: a false *negative* hides a real harness and cannot be corrected from the menu,
+  while a false positive costs one unchecked box. Extension-only harnesses (Kilo and Cline inside
+  an editor, with no CLI on `PATH`) remain preselectable. The cap is 10 s because an npm-installed
+  CLI behind a Windows shim needs 2–4 s to answer (measured: `openclaw` 4.2 s, `command-code`
+  2.1 s); a wizard run probes up to 17 harnesses, so a silent binary costs the cap once and then
+  falls through to `binary`/`dir`.
+
+## ADR-026: The harness menu prefills from the recorded selection, not detection
+
+**Status**: Accepted
+**Date**: 2026-11-27
+
+- **Context:** Preselecting detected harnesses is right for a first run and wrong for a re-run: a
+  user who deliberately installed only two of five detected clients had to untick the other three
+  on every `setup`, and a client that was temporarily uninstalled (or whose probe started failing)
+  silently dropped out of the preselection.
+- **Decision:** `setup.harnesses` in the global config is the record of what the user chose, and it
+  wins: when it is non-empty the menu preselects exactly those names, whatever detection says. Only
+  a first run — or a config that records nothing, e.g. after `--harnesses none` — preselects the
+  detected set. `--harnesses <value>` still overrides both. The menu leads with two shortcut rows,
+  "Select all detected" and "Unselect all", handled after the answer with *unselect* taking
+  precedence so clearing is never silently ignored, and the numbered fallback gained the matching
+  `all-detected` and `none` tokens. `--harnesses` with no value is a read-only report of every
+  plugin's proof, config path and scope; it exits before any prompt or write.
+- **Consequences:** A re-run is stable and reflects intent rather than the machine's current state,
+  and a user who wants newly installed clients re-detected clears the selection once (or deselects
+  and re-adds). The two meanings of `--harnesses` — bare lists, valued selects — are distinguished
+  by an argparse `nargs="?"` sentinel, and combining the bare form with `--uninstall`/`--install-only`
+  is a parser error so the read-only path can never be mistaken for an action.
+

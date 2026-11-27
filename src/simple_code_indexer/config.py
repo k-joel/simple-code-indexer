@@ -448,8 +448,7 @@ def load_settings(
     vector_store = _vector_store(qdrant, file_vector_store, env_vector_store)
     vec_chunk_size, vec_mmap_size, vec_cache_size = _sqlite_vec_section(sqlite_vec)
     faiss_path = _faiss_path(
-        env.get("FAISS_PATH")
-        or configfile.get_str(faiss, "path", where="faiss"),
+        env.get("FAISS_PATH") or configfile.get_str(faiss, "path", where="faiss"),
         workspace_root,
     )
 

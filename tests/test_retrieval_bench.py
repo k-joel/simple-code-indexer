@@ -137,7 +137,11 @@ def test_local_path_derives_a_scratch_qdrant_collection(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.setenv("SIMPLE_CI_WORKSPACE_ROOT", str(workspace))
-    for name in ("SIMPLE_CI_INDEX_DB", "SIMPLE_CI_FAISS_PATH", "SIMPLE_CI_QDRANT_COLLECTION"):
+    for name in (
+        "SIMPLE_CI_INDEX_DB",
+        "SIMPLE_CI_FAISS_PATH",
+        "SIMPLE_CI_QDRANT_COLLECTION",
+    ):
         monkeypatch.delenv(name, raising=False)
     settings = load_settings()
 

@@ -121,15 +121,61 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ### Added
 
+- **Four more harnesses**: Hermes Agent (`~/.hermes/config.yaml`, `mcp_servers`), OpenClaw
+  (`~/.openclaw/openclaw.json`, `mcp.servers`; merged only — the shipped OpenClaw build has no MCP
+  CLI or config key yet, ISS-001), Kilo Code (`~/.config/kilo/kilo.jsonc` plus the project pair,
+  `mcp`, via the config merge) and Cline (`cline_mcp_settings.json` in `~/.cline/data/settings/` and
+  VS Code's `globalStorage`, written with `cline mcp add`). See ARCH §7.15 for each client's layout.
+- **Harness detection probes the client's CLI** (ADR-025). The wizard runs `<binary> --version`
+  (10 s cap, overridable per plugin with `PROBE_ARGS`) and treats a zero exit as installed; a
+  binary merely on `PATH` and a present config directory remain weaker fallbacks, so
+  extension-only and GUI clients are still offered. The menu says which signal won —
+  `— detected: cursor --version` versus `— detected: config dir .cursor`. A config directory left
+  behind by an uninstall no longer counts as the only evidence.
+- **The harness menu prefills from the last answered selection** (ADR-026). A re-run preselects
+  exactly what `setup.harnesses` recorded instead of re-detecting, so a client that was deliberately
+  left out stays out. Two shortcut rows, "Select all detected" and "Unselect all", lead the
+  checkbox; the non-interactive prompt accepts `all-detected` and `none`. `--harnesses` with no
+  value prints a read-only table of every harness, how it was detected, and its config path and
+  scope.
+- `serve --harness <name>` names the plugin allowed to publish a session's workspace, and
+  `serve --index-db <path>` overrides the index location. Generated harness entries use the first
+  instead of an environment variable.
+
+### Changed
+
+- **Generated harness entries carry arguments, never environment variables** (ADR-024). Command
+  Code's entry no longer injects `SIMPLE_CI_HARNESS`; it passes `serve --harness commandcode`.
+  `entries.verify` warns about any entry that still carries an `env`/`environment`/`envs` block.
+- **Every environment variable of ours is prefixed `SIMPLE_CI_`**: `SIMPLE_CI_WORKSPACE_ROOT`,
+  `SIMPLE_CI_INDEX_DB`, `SIMPLE_CI_VECTOR_STORE`, `SIMPLE_CI_EMBED_*`, `SIMPLE_CI_SWEEP_SECONDS`,
+  `SIMPLE_CI_LOG_*`, `SIMPLE_CI_QDRANT_*`, `SIMPLE_CI_SQLITE_VEC_*`, `SIMPLE_CI_PREFETCH_GRAMMARS`
+  and `SIMPLE_CI_SYMBOL_FALLBACK`. The old bare names still work with a one-shot deprecation
+  warning, and the prefixed name wins when both are set. Third-party variables (`COMSPEC`,
+  `ProgramFiles`, `HF_TOKEN`, `XDG_RUNTIME_DIR`) are unchanged. See the table in ARCH §6.4.
+- The sidecar daemon is spawned with `--workspace` and `--index-db` instead of inheriting
+  `WORKSPACE_ROOT`/`INDEX_DB`.
+
+### Fixed
+
+- Cursor's newer standalone agent CLI (`agent`) is now recognised as an install of Cursor, alongside
+  the editor's `cursor` shell command.
+- Command Code is detected by `command-code` on every platform (`cmdc` on Windows, where bare `cmd`
+  is the shell), not by directory existence alone.
+- `opencode-cli` is no longer used for detection: the desktop bundle ships it outside `PATH`, so it
+  only remains a fallback for the client CLI.
+
+### Harness entries, project scope (ADR-022)
+
 - **Harness entries can now be installed per project, not just globally** (ADR-022). `setup` asks
   for a scope after the harness selection: `global` (the default, and mandatory when run from the
   home directory) or `project`, which writes the client's own project config — `.mcp.json`,
   `.cursor/mcp.json`, `opencode.json`, `.vscode/mcp.json`, `.codex/config.toml`, and so on — and pins
   it with `serve --workspace <dir>`. Global entries stay workspace-free, as before.
 - `serve --workspace <dir>` sets the workspace explicitly, beating MCP roots and the
-  harness-published workspace and losing only to `WORKSPACE_ROOT`; `get_status.workspace_source`
-  reports `arg`. It is also treated as an opt-in for the implausible-directory refusal, like
-  `WORKSPACE_ROOT`.
+  harness-published workspace and losing only to `SIMPLE_CI_WORKSPACE_ROOT`;
+  `get_status.workspace_source` reports `arg`. It is also treated as an opt-in for the
+  implausible-directory refusal, like `SIMPLE_CI_WORKSPACE_ROOT`.
 - `setup --harness-scope {global,project}` and `--gitignore` / `--no-gitignore` skip the two new
   prompts, so a project install can be scripted.
 - A project install offers to add its config file and `.simple-ci/` to `.gitignore` (only inside a

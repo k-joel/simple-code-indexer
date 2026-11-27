@@ -83,3 +83,20 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 ---
 
 ## Open
+
+### ISS-001: OpenClaw's shipped CLI has no MCP support, so its plugin can only merge
+
+- **Symptom**: `openclaw mcp status` fails with "unknown command 'mcp'", and
+  `openclaw config set mcp.servers.<name> <json> --strict-json` writes the value and then exits 1
+  with `<root>: Unrecognized key: "mcp"` — `mcpServers` and `servers` are rejected the same way.
+  The wizard therefore reports `openclaw could not add the server` and falls back to the merge.
+- **Where flagged**: 2026-11-27, adding the OpenClaw harness plugin and running a real setup.
+- **Cause**: the installed build (`openclaw` 2026.2.26, `bc50708`) predates the MCP surface the docs
+  describe (`docs.openclaw.ai/cli/mcp`, `…/gateway/config-extensions`); its config schema accepts no
+  MCP key at all, so `harnesses/openclaw.py` deliberately declares no `cli_add` and the merge writes
+  a block this build will not load.
+- **Suggested fix**: re-check on a release that ships `openclaw mcp`; if the config schema then
+  accepts `mcp.servers`, add `cli_add`/`cli_remove` (`openclaw mcp set <name> <json>` /
+  `openclaw mcp unset <name>`) to `harnesses/openclaw.py`, extend
+  `tests/test_harnesses.py::test_cli_adapters_build_the_documented_argv`, and re-run
+  `simple-code-indexer setup --harnesses openclaw`.

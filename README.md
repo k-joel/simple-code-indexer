@@ -27,7 +27,7 @@ lives in `~/.simple-ci/config.yaml`.
 - **Symbols, not just text.** `symbol_lookup` resolves definitions via tree-sitter, with
   specialized extractors for Python, C/C++, and Make, and a `coverage` signal when a language
   cannot produce symbols.
-- **One-command setup.** An interactive wizard writes the MCP entry into 13 supported harnesses
+- **One-command setup.** An interactive wizard writes the MCP entry into 17 supported harnesses
   (see below) — you never edit a client config by hand.
 - **Local-first.** sqlite-vec is the default store: vectors live in the same `index.db` as the
   chunks, so a save and its vectors commit together. FAISS (a separate index file) and Qdrant
@@ -180,10 +180,17 @@ genuine no-match:
 
 ## Supported harnesses
 
-The wizard writes the MCP entry into each client's global config:
+The wizard writes the MCP entry into each client's global config (or the project config, when a
+project scope is chosen):
 
 Claude Code · Claude Desktop · Codex CLI · Gemini CLI · OpenCode · Cursor · Windsurf (Devin
-Local) · VS Code · Zed · Goose · Pi · Command Code · MiMoCode
+Local) · VS Code · Zed · Goose · Pi · Command Code · MiMoCode · Hermes Agent · OpenClaw ·
+Kilo Code · Cline
+
+Detection is by the client's own CLI where it has one (`cursor --version`) and by its config
+directory where it does not, and `simple-code-indexer setup --harnesses` prints which signal
+matched for every supported client. Once you have answered the harness question once, a re-run
+preselects your recorded choice rather than re-detecting.
 
 To support a client that is not on the list, drop a plugin module into
 [`harnesses/`](harnesses/) — see [harnesses/README.md](harnesses/README.md) for the contract.
@@ -191,12 +198,14 @@ To support a client that is not on the list, drop a plugin module into
 ## Configuration
 
 One global file, `~/.simple-ci/config.yaml`. Precedence: **environment variable > YAML >
-default**. The wizard writes it; this is the whole file for the default sqlite-vec backend:
+default** — and every environment variable is prefixed `SIMPLE_CI_` (`SIMPLE_CI_LOG_LEVEL`, not
+`LOG_LEVEL`); they exist for debugging, so prefer the file or a flag in normal use. The wizard
+writes it; this is the whole file for the default sqlite-vec backend:
 
 ```yaml
 version: 1
 mode: sidecar              # read-only sessions + one writer daemon (default); SIMPLE_CI_MODE overrides
-vector_store: sqlite-vec   # VECTOR_STORE overrides; faiss | qdrant also supported
+vector_store: sqlite-vec   # SIMPLE_CI_VECTOR_STORE overrides; faiss | qdrant also supported
 embedding:
   base_url: http://localhost:8080
   model: embeddinggemma-2
@@ -211,7 +220,7 @@ Optional sqlite-vec tuning (defaults shown): `sqlite_vec.chunk_size: 64`,
 re-embeds the workspace.
 
 For FAISS, set `vector_store: faiss` (the separate `vectors.faiss` file; `faiss.path` /
-`FAISS_PATH`). For Qdrant, set `vector_store: qdrant` and add a `qdrant:` block with `url` (a
+`SIMPLE_CI_FAISS_PATH`). For Qdrant, set `vector_store: qdrant` and add a `qdrant:` block with `url` (a
 `service:` block lets the server start that container at boot; services are fail-soft — the
 server never refuses to start when Docker is down, lexical search keeps working).
 Model-specific query and document prompt prefixes are applied automatically;
@@ -230,7 +239,7 @@ Where things land:
 | `<project>/.simple-ci/vectors.faiss` | FAISS vectors (per workspace, `vector_store: faiss` only) |
 | `<project>/.simple-ci/log/` | `writer.log` + `reader.log` (sidecar) or `embed.log` (embedded) |
 
-Logs are DEBUG by default with rotation (`log.max_bytes`, `log.backups`, `LOG_LEVEL`). File
+Logs are DEBUG by default with rotation (`log.max_bytes`, `log.backups`, `SIMPLE_CI_LOG_LEVEL`). File
 contents are never logged — only paths, sizes, line ranges, and counts.
 
 ## Troubleshooting

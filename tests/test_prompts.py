@@ -184,7 +184,9 @@ def test_unselect_all_wins_over_select_all_detected(monkeypatch) -> None:
     fake = FakeQuestionary(checkbox=["__select_detected__", "__unselect_all__"])
     _install_fake(monkeypatch, fake)
 
-    assert Prompter(interactive=True).ask_harness_multi("which", ["a"], detected=[0]) == []
+    assert (
+        Prompter(interactive=True).ask_harness_multi("which", ["a"], detected=[0]) == []
+    )
 
 
 def test_harness_multi_falls_back_to_numbered_answers() -> None:

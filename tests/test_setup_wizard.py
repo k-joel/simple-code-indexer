@@ -1996,7 +1996,9 @@ def test_the_first_run_preselects_the_detected_harnesses(tmp_path: Path) -> None
     assert names.index("zed") not in default
 
 
-def test_listing_the_harnesses_writes_nothing(tmp_path: Path, monkeypatch, capsys) -> None:
+def test_listing_the_harnesses_writes_nothing(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
     from simple_code_indexer.setup_wizard import run as wizard_run
 
     project, home, _repo = _workspace(tmp_path)

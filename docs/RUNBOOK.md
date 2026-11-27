@@ -648,7 +648,18 @@ configs (NOTES.md).
    Set-Location "$root\proj"
    ```
 
-2. Install the project entry, skipping the interactive questions:
+2. See what the wizard would preselect and why (read-only; writes nothing):
+
+   ```
+   uvx simple-code-indexer setup --harnesses
+   ```
+
+   Expected: one row per harness with its proof — `cli: cursor --version`,
+   `binary: <name> on PATH` or `dir: config dir ~/.config/kilo` — its config path, and whether it
+   has a project scope. An installed client that shows `-` means neither its CLI nor its config
+   directory was found (ADR-025).
+
+3. Install the project entry, skipping the interactive questions:
 
    ```
    uvx simple-code-indexer setup --harness-scope project --harnesses opencode --gitignore \
@@ -657,9 +668,9 @@ configs (NOTES.md).
 
    Expected: `opencode (project): …` naming the workspace file, then
    `Added to .gitignore: opencode.json, .simple-ci/`. A client with no project config (Goose,
-   Claude Desktop) prints its **global** fallback instead, with the reason.
+   Claude Desktop, Hermes, OpenClaw, Cline) prints its **global** fallback instead, with the reason.
 
-3. Confirm the pin and the absence of a global entry:
+4. Confirm the pin, the harness marker and the absence of a global entry:
 
    ```
    Get-Content opencode.json
@@ -667,9 +678,11 @@ configs (NOTES.md).
    ```
 
    Expected: `args` ends with `--workspace <abs workspace>`; the second command is `False`. A global
-   entry would instead have no `--workspace` and would live in the home profile.
+   entry would instead have no `--workspace` and would live in the home profile. Entries must carry
+   **no** `env`/`environment`/`envs` block — a marker is an argument now (ADR-024). Only a
+   resolver-owning client (Command Code) carries `--harness <name>`; the others have no resolver.
 
-4. Prove the server resolves the pin (`workspace_source` must be `arg`, not `cwd`):
+5. Prove the server resolves the pin (`workspace_source` must be `arg`, not `cwd`):
 
    ```
    uv run python tests/mcp_probe.py
@@ -677,7 +690,7 @@ configs (NOTES.md).
 
    Under a project entry the probe prints `workspace_source: arg` and the workspace it was pinned to.
 
-5. Prove the client itself picks the entry up (OpenCode; see
+6. Prove the client itself picks the entry up (OpenCode; see
    `references/opencode-acp-mode.md` §8 for the log evidence):
 
    ```

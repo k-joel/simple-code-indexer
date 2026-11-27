@@ -837,29 +837,36 @@ Precedence is **environment variable > global YAML value > default**. Discovery:
 
 | YAML key | Environment | Default |
 |---|---|---|
-| `vector_store` | `VECTOR_STORE` | `sqlite-vec` (`qdrant` when a non-empty `qdrant:` section exists and no key is set) |
-| `qdrant.url` | `QDRANT_URL` | `http://localhost:6333` |
-| `qdrant.collection` | `QDRANT_COLLECTION` | derived per workspace |
-| `faiss.path` | `FAISS_PATH` | `<index dir>/vectors.faiss` |
-| `sqlite_vec.chunk_size` | `SQLITE_VEC_CHUNK_SIZE` | `64` |
-| `sqlite_vec.mmap_size` | `SQLITE_VEC_MMAP_SIZE` | `1073741824` (mapping limit, not preallocation) |
-| `sqlite_vec.cache_size` | `SQLITE_VEC_CACHE_SIZE` | `-262144` (KiB; negative means KiB) |
-| `embedding.base_url` | `EMBED_BASE_URL` | `http://localhost:8080` |
-| `embedding.model` | `EMBED_MODEL` | `embeddinggemma-2` |
-| `embedding.dim` | `EMBED_DIM` | `768` |
-| `embedding.api_key` | `EMBED_API_KEY` | unset |
-| `embedding.timeout_s` | `EMBED_TIMEOUT_S` | `15` |
-| `embedding.query_prefix` / `document_prefix` | `EMBED_QUERY_PREFIX` / `EMBED_DOCUMENT_PREFIX` | model default; empty disables |
+| `vector_store` | `SIMPLE_CI_VECTOR_STORE` | `sqlite-vec` (`qdrant` when a non-empty `qdrant:` section exists and no key is set) |
+| `qdrant.url` | `SIMPLE_CI_QDRANT_URL` | `http://localhost:6333` |
+| `qdrant.collection` | `SIMPLE_CI_QDRANT_COLLECTION` | derived per workspace |
+| `faiss.path` | `SIMPLE_CI_FAISS_PATH` | `<index dir>/vectors.faiss` |
+| `sqlite_vec.chunk_size` | `SIMPLE_CI_SQLITE_VEC_CHUNK_SIZE` | `64` |
+| `sqlite_vec.mmap_size` | `SIMPLE_CI_SQLITE_VEC_MMAP_SIZE` | `1073741824` (mapping limit, not preallocation) |
+| `sqlite_vec.cache_size` | `SIMPLE_CI_SQLITE_VEC_CACHE_SIZE` | `-262144` (KiB; negative means KiB) |
+| `embedding.base_url` | `SIMPLE_CI_EMBED_BASE_URL` | `http://localhost:8080` |
+| `embedding.model` | `SIMPLE_CI_EMBED_MODEL` | `embeddinggemma-2` |
+| `embedding.dim` | `SIMPLE_CI_EMBED_DIM` | `768` |
+| `embedding.api_key` | `SIMPLE_CI_EMBED_API_KEY` | unset |
+| `embedding.timeout_s` | `SIMPLE_CI_EMBED_TIMEOUT_S` | `15` |
+| `embedding.query_prefix` / `document_prefix` | `SIMPLE_CI_EMBED_QUERY_PREFIX` / `SIMPLE_CI_EMBED_DOCUMENT_PREFIX` | model default; empty disables |
 | `embedding.service` / `qdrant.service` | — | unset (no managed container) |
-| `sweep_seconds` | `SWEEP_SECONDS` | `0` (periodic sweep off) |
-| `debounce_ms` | `DEBOUNCE_MS` | `400` |
+| `sweep_seconds` | `SIMPLE_CI_SWEEP_SECONDS` | `0` (periodic sweep off) |
+| `debounce_ms` | `SIMPLE_CI_DEBOUNCE_MS` | `400` |
 | `mode` | `SIMPLE_CI_MODE` | `sidecar` |
-| `idle_grace_s` | `IDLE_GRACE_S` | `60` |
-| `heartbeat_s` | `HEARTBEAT_S` | `5` |
-| `log.level` | `LOG_LEVEL` | `debug` (file only) |
-| `log.max_bytes` / `log.backups` | `LOG_MAX_BYTES` / `LOG_BACKUPS` | `5000000` / `3` |
-| — | `WORKSPACE_ROOT` | process cwd |
-| — | `INDEX_DB` | `$WORKSPACE_ROOT/.simple-ci/index.db` |
+| `idle_grace_s` | `SIMPLE_CI_IDLE_GRACE_S` | `60` |
+| `heartbeat_s` | `SIMPLE_CI_HEARTBEAT_S` | `5` |
+| `log.level` | `SIMPLE_CI_LOG_LEVEL` | `debug` (file only) |
+| `log.max_bytes` / `log.backups` | `SIMPLE_CI_LOG_MAX_BYTES` / `SIMPLE_CI_LOG_BACKUPS` | `5000000` / `3` |
+| — | `SIMPLE_CI_WORKSPACE_ROOT` | process cwd |
+| — | `SIMPLE_CI_INDEX_DB` | `$SIMPLE_CI_WORKSPACE_ROOT/.simple-ci/index.db` |
+
+Every variable of ours is prefixed `SIMPLE_CI_` (ADR-024). A bare legacy spelling is still read
+once with a deprecation warning, and `simple_code_indexer/env.py` is the only seam
+(`env.get("LOG_LEVEL")` reads `SIMPLE_CI_LOG_LEVEL`, then `LOG_LEVEL`). Servers are configured with
+flags first — `serve --workspace`, `--harness`, `--index-db` — because a generated harness entry
+carries arguments and never an `env` block. Third-party names (`COMSPEC`, `ProgramFiles`,
+`HF_TOKEN`, `XDG_RUNTIME_DIR`, `APPDATA`, `LOCALAPPDATA`, `HOME`, Cline's `CLINE_*`) are untouched.
 
 Prompt resolution is environment > explicit file value > model default. Empty
 string disables that side. Templates are validated at load time for their
@@ -1222,16 +1229,24 @@ search continue. `get_status.services` reports
 
 A harness plugin is a plain module loaded from `src/simple_code_indexer/harnesses/`,
 `<repo>/harnesses/`, or `<workspace>/harnesses/`; a user plugin overrides a builtin by `NAME`. It
-declares `NAME`, `LABEL`, detection dirs/binaries, global **and project** config paths
-(`GLOBAL_CONFIGS` / `LOCAL_CONFIGS`), format (`json`, `toml`, or `yaml`), the config root key, and
-optional `entry`/`render`/`remove` callables. `HarnessSpec` exposes those as data
-(`candidates`, `supports`, `root_key`, `format`), so config readers outside the wizard — the ACP
-probe's configured-entry preflight — resolve paths and entries from the same table instead of
-hardcoding a harness's layout. A plugin may also implement
-`resolve_workspace(cwd) -> Path | None`; it must then put
-`SIMPLE_CI_HARNESS=<NAME>` into its entry env (the reserved `RUNTIME_ENV` key),
-which is how the server knows which single plugin to ask at runtime. That key is
-install-scoped — never a path — so ADR-015 still holds. Writer helpers
+declares `NAME`, `LABEL`, detection dirs/binaries (`HOME_DIRS` / `BINARIES`, with optional
+`PROBE_ARGS`), global **and project** config paths (`GLOBAL_CONFIGS` / `LOCAL_CONFIGS`), format
+(`json`, `toml`, or `yaml`), the config root key, and optional `entry`/`render`/`remove` callables.
+`HarnessSpec` exposes those as data (`detection`, `candidates`, `supports`, `root_key`, `format`), so
+config readers outside the wizard — the ACP probe's configured-entry preflight — resolve paths and
+entries from the same table instead of hardcoding a harness's layout.
+
+Detection has three strengths (ADR-025): the plugin's binary answering `PROBE_ARGS` (default
+`--version`) within 10 s is `cli`, a binary merely on `PATH` is `binary`, and a present directory
+under `HOME_DIRS` is `dir`. They are ORed, so an extension-only client stays preselectable, and the
+winning reason is printed in the menu. Plugins whose executable is a GUI declare no binary.
+
+A plugin may also implement `resolve_workspace(cwd) -> Path | None`; the wizard then appends
+`serve --harness <NAME>` to its entry (`harness_flag`), which is how the server knows which single
+plugin to ask at runtime. That marker is install-scoped — never a path — so ADR-015 still holds, and
+`SIMPLE_CI_HARNESS` is read only as a debug/pre-ADR-024 fallback. Entries carry **arguments, never
+environment variables** (ADR-024): the wizard passes an empty `env` to every builtin, so a written
+entry has no `env` block. Writer helpers
 parse/merge without destroying unrelated keys; JSONC comments are lost on
 rewrite, so the writer backs up the file and refuses to rewrite an unparsable
 document. TOML harness configs are merged with marker comments rather than a
@@ -1247,9 +1262,21 @@ never inspects a harness name: client CLI first (at the path `shutil.which` reso
 `.cmd`/`.bat` shims routed through `cmd /c` on Windows), the wizard's config merge second, and — for
 a client with no project config (Goose, Claude Desktop) — its global entry plus a warning. `ENABLED`
 is for TOML clients only, because the marker-block writer bypasses `entry()`; a JSON plugin puts
-`enabled: true` in its own entry, and only where the client documents the key. Zed declares no
+`enabled: true` in its own entry, and only where the client documents the key (Codex, Pi, Goose,
+MiMo, Command Code, Kilo). Zed declares no
 `BINARIES`/`CLI_BINARIES` at all: `zed` on `PATH` is commonly authzed's SpiceDB CLI, so detection
-uses the config directory.
+uses the config directory. `entries.launch_argv(spec, command, scope, workspace)` is the one place
+an entry's argv is composed: the project pin for project scope plus the harness marker for a
+resolver-owning plugin.
+
+The builtin set is 17 clients: Claude Code, Claude Desktop, Codex, Gemini CLI, OpenCode, Cursor,
+Windsurf/Devin, VS Code, Zed, Command Code, MiMo, Goose, Pi, Hermes Agent, OpenClaw, Kilo Code and
+Cline. The last four were added with their documented layouts: Hermes is YAML under `mcp_servers`
+(global only, because `hermes mcp add` always prompts about tools), OpenClaw is JSON5 under
+`mcp.servers` and prefers `openclaw mcp set <name> <json>`, Kilo is JSONC under `mcp` with the whole
+argv in one `command` array and its env spelled `environment`, and Cline keeps
+`cline_mcp_settings.json` both in `~/.cline/data/settings/` and in VS Code's
+`globalStorage/saoudrizwan.claude-dev/settings/`.
 
 The setup wizard:
 
