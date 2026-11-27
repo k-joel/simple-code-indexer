@@ -339,7 +339,10 @@ Lifetime:
   session after three missed intervals or when the registered server pid dies.
 - After the last session plus `idle_grace_s` (default 60 s), the daemon stops
   accepting, clears its discovery files while it still holds the writer lease,
-  flushes vectors, releases the lease, and exits.
+  flushes vectors, releases the lease, and exits. "Clear" means delete, or
+  truncate to empty when another process holds the file open — Windows denies a
+  delete under a live read handle and readers poll `daemon.json` continuously, so
+  empty content is the absence signal (`read_ready` returns `None`).
 - A reader exits with its stdio session and when its harness process disappears.
   The daemon never watches the harness.
 
@@ -861,12 +864,12 @@ Precedence is **environment variable > global YAML value > default**. Discovery:
 | — | `SIMPLE_CI_WORKSPACE_ROOT` | process cwd |
 | — | `SIMPLE_CI_INDEX_DB` | `$SIMPLE_CI_WORKSPACE_ROOT/.simple-ci/index.db` |
 
-Every variable of ours is prefixed `SIMPLE_CI_` (ADR-024). A bare legacy spelling is still read
-once with a deprecation warning, and `simple_code_indexer/env.py` is the only seam
-(`env.get("LOG_LEVEL")` reads `SIMPLE_CI_LOG_LEVEL`, then `LOG_LEVEL`). Servers are configured with
-flags first — `serve --workspace`, `--harness`, `--index-db` — because a generated harness entry
-carries arguments and never an `env` block. Third-party names (`COMSPEC`, `ProgramFiles`,
-`HF_TOKEN`, `XDG_RUNTIME_DIR`, `APPDATA`, `LOCALAPPDATA`, `HOME`, Cline's `CLINE_*`) are untouched.
+Every variable of ours is prefixed `SIMPLE_CI_`, and only that spelling is read (ADR-024);
+`simple_code_indexer/env.py` is the only seam (`env.get("LOG_LEVEL")` reads `SIMPLE_CI_LOG_LEVEL`).
+Servers are configured with flags first — `serve --workspace`, `--harness`, `--index-db` — because a
+generated harness entry carries arguments and never an `env` block. Third-party names (`COMSPEC`,
+`ProgramFiles`, `HF_TOKEN`, `XDG_RUNTIME_DIR`, `APPDATA`, `LOCALAPPDATA`, `HOME`, Cline's `CLINE_*`)
+are untouched.
 
 Prompt resolution is environment > explicit file value > model default. Empty
 string disables that side. Templates are validated at load time for their
@@ -1144,8 +1147,10 @@ so a killed writer never leaves a stale lock (only the file).
   it started is still alive.
 - `daemon.py` — `SidecarDaemon` starts the writer runtime first, opens the
   listener, publishes discovery files, accepts clients, and reaps sessions that
-  missed heartbeats or whose server process died. It exits after `idle_grace_s`
-  with no sessions.
+  missed heartbeats or whose server process died. Shutdown wakes `accept()` with
+  one authenticated self-connection before closing the listener, because a plain
+  `Listener.close()` does not interrupt a thread already blocked in `accept()`
+  (2 s of every exit otherwise). It exits after `idle_grace_s` with no sessions.
 - `registry.py` — thread-safe `LeaseRegistry`; a lease holds the session id,
   server/harness metadata, the watched server process, and the live connection.
 - Daemon spawn uses `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` on Windows

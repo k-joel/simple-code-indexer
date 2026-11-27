@@ -199,8 +199,9 @@ To support a client that is not on the list, drop a plugin module into
 
 One global file, `~/.simple-ci/config.yaml`. Precedence: **environment variable > YAML >
 default** — and every environment variable is prefixed `SIMPLE_CI_` (`SIMPLE_CI_LOG_LEVEL`, not
-`LOG_LEVEL`); they exist for debugging, so prefer the file or a flag in normal use. The wizard
-writes it; this is the whole file for the default sqlite-vec backend:
+`LOG_LEVEL`); only the prefixed spelling is read. They exist for debugging, so prefer the file or a
+flag in normal use. The wizard writes it; this is the whole file for the default sqlite-vec
+backend:
 
 ```yaml
 version: 1

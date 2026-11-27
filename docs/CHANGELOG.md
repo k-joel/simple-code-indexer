@@ -122,10 +122,10 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 ### Added
 
 - **Four more harnesses**: Hermes Agent (`~/.hermes/config.yaml`, `mcp_servers`), OpenClaw
-  (`~/.openclaw/openclaw.json`, `mcp.servers`; merged only — the shipped OpenClaw build has no MCP
-  CLI or config key yet, ISS-004), Kilo Code (`~/.config/kilo/kilo.jsonc` plus the project pair,
-  `mcp`, via the config merge) and Cline (`cline_mcp_settings.json` in `~/.cline/data/settings/` and
-  VS Code's `globalStorage`, written with `cline mcp add`). See ARCH §7.15 for each client's layout.
+  (`~/.openclaw/openclaw.json`, `mcp.servers`, written with `openclaw mcp set`), Kilo Code
+  (`~/.config/kilo/kilo.jsonc` plus the project pair, `mcp`, via the config merge) and Cline
+  (`cline_mcp_settings.json` in `~/.cline/data/settings/` and VS Code's `globalStorage`, written with
+  `cline mcp add`). See ARCH §7.15 for each client's layout.
 - **Harness detection probes the client's CLI** (ADR-025). The wizard runs `<binary> --version`
   (10 s cap, overridable per plugin with `PROBE_ARGS`) and treats a zero exit as installed; a
   binary merely on `PATH` and a present config directory remain weaker fallbacks, so
@@ -150,9 +150,10 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 - **Every environment variable of ours is prefixed `SIMPLE_CI_`**: `SIMPLE_CI_WORKSPACE_ROOT`,
   `SIMPLE_CI_INDEX_DB`, `SIMPLE_CI_VECTOR_STORE`, `SIMPLE_CI_EMBED_*`, `SIMPLE_CI_SWEEP_SECONDS`,
   `SIMPLE_CI_LOG_*`, `SIMPLE_CI_QDRANT_*`, `SIMPLE_CI_SQLITE_VEC_*`, `SIMPLE_CI_PREFETCH_GRAMMARS`
-  and `SIMPLE_CI_SYMBOL_FALLBACK`. The old bare names still work with a one-shot deprecation
-  warning, and the prefixed name wins when both are set. Third-party variables (`COMSPEC`,
-  `ProgramFiles`, `HF_TOKEN`, `XDG_RUNTIME_DIR`) are unchanged. See the table in ARCH §6.4.
+  and `SIMPLE_CI_SYMBOL_FALLBACK`. **This is a breaking rename**: the bare spellings
+  (`WORKSPACE_ROOT`, `LOG_LEVEL`, `EMBED_MODEL`, …) are no longer read at all — rename them in a
+  shell profile or a hand-written harness entry. Third-party variables (`COMSPEC`, `ProgramFiles`,
+  `HF_TOKEN`, `XDG_RUNTIME_DIR`) are unchanged. See the table in ARCH §6.4.
 - The sidecar daemon is spawned with `--workspace` and `--index-db` instead of inheriting
   `WORKSPACE_ROOT`/`INDEX_DB`.
 
@@ -439,6 +440,15 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ### Fixed
 
+- The sidecar daemon can no longer leave a stale `daemon.json` behind after it exits. Windows
+  refuses to delete a file another process is reading, and every reader polls that file, so the
+  running daemon's shutdown silently failed to remove it while the polling reader kept answering
+  from the dead endpoint; clearing now truncates to empty when the delete is refused, which every
+  reader already treats as "no daemon". This was the intermittent `test_daemon_registers_then_exits_after_grace`
+  failure (ISS-003).
+- A sidecar shutdown is no longer padded by 2 s. Closing the control listener does not interrupt a
+  thread already blocked in `accept()`, so every exit waited out its join timeout; the daemon now
+  wakes that loop with one authenticated self-connection and exits right after `idle_grace_s`.
 - `tests/acp_probe.py` no longer passes on ambient harness config. OpenCode 2.2.5 ignores the
   server the probe injects on `session/new`, so a passing run only ever proved that the
   *configured* `simple-code-indexer` entry launched; with that entry missing it reported a

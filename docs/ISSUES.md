@@ -84,31 +84,111 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ## Open
 
-### ISS-003: `test_daemon_registers_then_exits_after_grace` is timing-flaky in a full run
+### ISS-005: `Scope.LOCAL_ALIAS` keeps a pre-ADR-022 scope spelling alive
 
-- **Symptom**: `uv run pytest` occasionally fails that one test (its `_wait_until` for the ready
-  file or the lease release times out at 20 s) while `pytest tests/test_sidecar_daemon.py` passes
-  every time — observed twice on 2026-11-27, both under a full-suite run.
-- **Where flagged**: 2026-11-27, full-suite gates while changing harness detection and env vars.
-- **Cause**: `tests/test_sidecar_daemon.py:147` budgets 20 s for a spawned daemon to take the lease,
-  start its runtime and exit after a 1 s grace; under full-suite load the spawn plus interpreter
-  start consumes most of that window, so the deadline is too tight rather than the daemon misbehaving.
-- **Suggested fix**: raise the two `_wait_until` timeouts (and the `_start` deadline) or drive them
-  from a shared constant, then run the full suite a few times in a row to confirm.
+- **Symptom**: `Scope.LOCAL_ALIAS = "local"` exists only as a compatibility name; nothing in `src/`
+  reads it, and `tests/acp_probe.py:187` is the last caller that passes the string `"local"`.
+- **Where flagged**: 2026-11-27, sweep for deprecated surface after removing the bare env vars.
+- **Cause**: `src/simple_code_indexer/harnesses/__init__.py:104` (constant) and `:228` (the
+  `candidates` docstring claiming the alias is honoured). `candidates` at `:231` treats anything
+  that is not `Scope.GLOBAL` as project scope, so the alias is not a separate code path — it is a
+  dead name plus a promise the function does not specifically keep.
+- **Suggested fix**: drop `LOCAL_ALIAS`, change `tests/acp_probe.py:187` to
+  `spec.candidates(Scope.PROJECT, …)`, and simplify the `candidates` docstring to name only
+  `global`/`project`; then re-run `uv run pytest tests/test_harnesses.py tests/test_acp_probe.py`.
 
-### ISS-004: OpenClaw's shipped CLI has no MCP support, so its plugin can only merge
+### ISS-006: `env.flag_default` is unused, and `RUNTIME_ENV` is a deprecated read path
 
-- **Symptom**: `openclaw mcp status` fails with "unknown command 'mcp'", and
-  `openclaw config set mcp.servers.<name> <json> --strict-json` writes the value and then exits 1
-  with `<root>: Unrecognized key: "mcp"` — `mcpServers` and `servers` are rejected the same way.
-  The wizard therefore reports `openclaw could not add the server` and falls back to the merge.
-- **Where flagged**: 2026-11-27, adding the OpenClaw harness plugin and running a real setup.
-- **Cause**: the installed build (`openclaw` 2026.2.26, `bc50708`) predates the MCP surface the docs
-  describe (`docs.openclaw.ai/cli/mcp`, `…/gateway/config-extensions`); its config schema accepts no
-  MCP key at all, so `harnesses/openclaw.py` deliberately declares no `cli_add` and the merge writes
-  a block this build will not load.
-- **Suggested fix**: re-check on a release that ships `openclaw mcp`; if the config schema then
-  accepts `mcp.servers`, add `cli_add`/`cli_remove` (`openclaw mcp set <name> <json>` /
-  `openclaw mcp unset <name>`) to `harnesses/openclaw.py`, extend
-  `tests/test_harnesses.py::test_cli_adapters_build_the_documented_argv`, and re-run
-  `simple-code-indexer setup --harnesses openclaw`.
+- **Symptom**: `simple_code_indexer/env.py:42` `flag_default()` has no caller, and
+  `harnesses.RUNTIME_ENV` (`SIMPLE_CI_HARNESS`) is read at
+  `harnesses/__init__.py:346` although `--harness` replaced it (ADR-024) — the fallback survives
+  only so pre-ADR-024 entries keep resolving.
+- **Where flagged**: 2026-11-27, sweep for deprecated surface after removing the bare env vars.
+- **Cause**: `flag_default` was added with the env seam and never used; the `RUNTIME_ENV` read is
+  the deliberate compatibility path described in ADR-024, and four tests in
+  `tests/test_harnesses.py` (`:790`, `:806`, `:828`, `:858`) exercise it.
+- **Suggested fix**: delete `flag_default`. Decide `RUNTIME_ENV` explicitly: either keep it and say
+  so in ADR-024's consequences as a permanent debug surface, or delete the read together with those
+  four tests once no pre-ADR-024 entry is expected to exist.
+
+### ISS-007: Re-added Cline plugin contradicts the removal note, and its path is unverified
+
+- **Symptom**: `harnesses/cline.py` ships a Cline entry again, while `docs/NOTES.md:164` still says
+  the Cline builtin was deleted on 2026-11-08 because `~/.cline/data/settings/cline_mcp_settings.json`
+  vanished after the Cline desktop app restarted and Cline never listed the server.
+- **Where flagged**: 2026-11-27, re-adding Hermes/OpenClaw/Kilo/Cline and sweeping for deprecated
+  surface.
+- **Cause**: `src/simple_code_indexer/harnesses/cline.py` was rewritten against the docs
+  (`docs.cline.bot/cli/cli-reference`), not against a live Cline build; the added
+  `cli_add`/`cli_remove` (`cline mcp add/remove`) and the four `GLOBAL_CONFIGS` paths have never
+  been exercised end to end, and the NOTES removal rationale was not retracted.
+- **Suggested fix**: verify on a current Cline build that `cline mcp add <name> --yes -- <command>`
+  survives a restart and appears in the UI; then replace the NOTES:164 bullet with the verified
+  lifecycle (or drop the plugin again if it does not hold).
+
+### ISS-008: `SIMPLE_CI_HARNESS` is documented in entry-format references that the wizard no longer writes
+
+- **Symptom**: `references/mcp-test-process.md:46`, `references/acp-test-process.md:38` and
+  `references/opencode-acp-mode.md:282` describe `SIMPLE_CI_GIT_PULL` as deleted by ADR-019 but say
+  nothing about `SIMPLE_CI_HARNESS` no longer being written, so a reader following those references
+  hand-writes the old env marker into an entry.
+- **Where flagged**: 2026-11-27, sweep for deprecated surface after removing the bare env vars.
+- **Cause**: those three `references/` files predate ADR-024, which moved the marker to
+  `serve --harness <NAME>`; they are not covered by the harness README that was updated.
+- **Suggested fix**: add one line to each reference's entry-format section naming
+  `serve --harness <NAME>` as the current marker (and `SIMPLE_CI_HARNESS` as debug-only), then grep
+  `references/` for `SIMPLE_CI_HARNESS` to confirm none describe it as required.
+
+### ISS-009: The wizard still migrates a project-local `config.yaml` (ADR-011 leftovers)
+
+- **Symptom**: every `setup` run can print `Found a legacy project config: …
+  .simple-ci/config.yaml` and offer to merge it into the global file — a prompt for a file the
+  server has not read since ADR-011 made config global-only.
+- **Where flagged**: 2026-11-27, sweep for legacy migration code to retire.
+- **Cause**: `src/simple_code_indexer/setup_wizard/__init__.py:406` `_step_migrate_local_config`
+  (called at `:224`), which depends on `configfile.merge_configs`
+  (`src/simple_code_indexer/configfile.py:72`) — a public wrapper whose only caller is that step
+  (`setup_wizard/__init__.py:432`). Covered by `tests/test_setup_wizard.py:1098`.
+- **Suggested fix**: delete `_step_migrate_local_config` and its call in `run()`, plus the
+  `merge_configs` wrapper (keep `_deep_merge`, still used by `load_layered_config`) and the
+  `docs/ARCH.md:1296` / `NOTES.md:139` / `GLOSSARY.md:192` migration mentions; drop the test.
+
+### ISS-010: The `qdrant:` section still selects the Qdrant backend implicitly
+
+- **Symptom**: a config with a non-empty `qdrant:` block and no `vector_store` key silently resolves
+  to the Qdrant backend, so a leftover block from the pre-ADR-017 era changes which store is used
+  with no explicit setting anywhere.
+- **Where flagged**: 2026-11-27, sweep for legacy migration code to retire.
+- **Cause**: `src/simple_code_indexer/config.py:346` (`return "qdrant" if qdrant else "sqlite-vec"`
+  in `_vector_store`, docstring at `:335`), mirrored for the wizard's display by
+  `_vector_store_from_raw`. Three tests pin the behaviour: `tests/test_config.py:427`, `:438`, `:443`.
+- **Suggested fix**: default to `sqlite-vec` unconditionally when neither `SIMPLE_CI_VECTOR_STORE`
+  nor `vector_store` is set, delete the three tests, and update the ARCH §6.4 table note.
+
+### ISS-011: A pre-`vector_backend` database is still inferred to be Qdrant-bound
+
+- **Symptom**: an index DB with no `vector_backend` meta row but with Qdrant keys present is treated
+  as Qdrant-bound, so such a DB can be accepted as "unchanged" instead of being invalidated and
+  re-embedded.
+- **Where flagged**: 2026-11-27, sweep for legacy migration code to retire.
+- **Cause**: `src/simple_code_indexer/db.py:481-487` infers `stored_backend = "qdrant"` from the
+  presence of `_QDRANT_URL_KEY`/`_COLLECTION_KEY`, and `:490` then backfills the explicit binding —
+  a compatibility path that only matters for DBs written before `vector_backend` existed (docstring
+  at `:473-474`).
+- **Suggested fix**: drop the inference so a missing `vector_backend` counts as "different" and
+  invalidates (the existing rule already handles a real mismatch), then delete the note in
+  `tests/test_db.py:330` and re-run `uv run pytest tests/test_db.py`.
+
+### ISS-012: A pre-0.1 `~/.simple-ci/models` rename runs on every setup, though nothing released before 0.1
+
+- **Symptom**: `setup` can print `Found …\.simple-ci\models. Move it to …\.simple-ci\model?` and
+  `os.replace` the directory — a migration for a layout that only ever existed in this checkout's
+  own development history.
+- **Where flagged**: 2026-11-27, sweep for legacy migration code to retire.
+- **Cause**: `src/simple_code_indexer/setup_wizard/__init__.py:391` `_step_migrate_global_assets`
+  (called at `:223`), whose docstring says it renames the "pre-0.1" directory. `pyproject.toml` is
+  `version = "0.1.0"` and `docs/CHANGELOG.md` has no released section, so no published version ever
+  wrote `models/`; covered by `tests/test_setup_wizard.py:1782`.
+- **Suggested fix**: delete the step and its call, then re-run `uv run pytest tests/test_setup_wizard.py`
+  and confirm no fixture depends on the moved directory. Keep the step only if a 0.1.0 wheel is
+  published before this is resolved.

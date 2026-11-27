@@ -150,6 +150,11 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 | [021](#adr-021-embedded-regions-are-indexed-through-the-grammars-injections-query-opt-in-per-host) | Embedded regions via the grammar's injections query |
 | [022](#adr-022-harness-entries-can-be-project-scoped-pinned-by-serve---workspace) | Harness entries can be project-scoped, pinned by `serve --workspace` |
 | [023](#adr-023-embeddinggemma-2-is-the-default-model-and-the-sweep-defaults-to-300-s) | EmbeddingGemma 2 is the default model; the sweep defaults to 300 s |
+| [024](#adr-024-flags-are-for-production-environment-variables-are-for-debugging) | Flags are for production, environment variables are for debugging |
+| [025](#adr-025-harness-detection-probes-the-client-cli-with-a-directory-fallback) | Harness detection probes the client CLI, with a directory fallback |
+| [026](#adr-026-the-harness-menu-prefills-from-the-recorded-selection-not-detection) | The harness menu prefills from the recorded selection |
+| [027](#adr-027-absence-in-a-discovery-file-is-empty-content-never-a-missing-file) | Absence in a discovery file is empty content |
+| [028](#adr-028-the-daemon-wakes-its-accept-loop-with-a-self-connection) | The daemon wakes its accept loop with a self-connection |
 
 
 ## ADR-001: Index on save, not git-committed state
@@ -707,12 +712,14 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   2. **`--harness <NAME>` replaces the `SIMPLE_CI_HARNESS` entry key.** It names the plugin allowed
      to publish a session's workspace (ADR-018). The variable is still *read* as a debug and
      pre-ADR-024 fallback — the flag wins — so an older entry keeps resolving.
-  3. **Every variable of ours is prefixed `SIMPLE_CI_`.** `env.get("LOG_LEVEL")` reads
-     `SIMPLE_CI_LOG_LEVEL` first and a bare legacy name second, with a one-shot deprecation
-     warning. `simple_code_indexer/env.py` is the only seam, imports nothing from the package, and
-     is shared by `config`, `mcp_roots`, `registry`, `parse` and the sidecar. Third-party names
-     (`COMSPEC`, `ProgramFiles`, `HF_TOKEN`, `XDG_RUNTIME_DIR`, `APPDATA`, `LOCALAPPDATA`, `HOME`,
-     Cline's own `CLINE_*`) are never renamed.
+  3. **Every variable of ours is prefixed `SIMPLE_CI_`, and only that spelling is read.**
+     `simple_code_indexer/env.py` is the only seam (`env.get("LOG_LEVEL")` reads
+     `SIMPLE_CI_LOG_LEVEL`), imports nothing from the package, and is shared by `config`,
+     `mcp_roots`, `registry`, `parse` and the sidecar. There is no bare-name fallback: the
+     rename is complete, and honouring the old spelling would keep a second vocabulary alive and
+     make "what do we read?" unanswerable from the code. A stale shell profile is fixed by renaming
+     the variable. Third-party names (`COMSPEC`, `ProgramFiles`, `HF_TOKEN`, `XDG_RUNTIME_DIR`,
+     `APPDATA`, `LOCALAPPDATA`, `HOME`, Cline's own `CLINE_*`) are never renamed.
   4. **A child process is production.** The sidecar daemon is spawned with `--workspace` and
      `--index-db` arguments, not with `WORKSPACE_ROOT`/`INDEX_DB` in its environment.
 - **Consequences:** An entry is self-describing: what it does is what it says, and it survives being
@@ -775,4 +782,56 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   and re-adds). The two meanings of `--harnesses` — bare lists, valued selects — are distinguished
   by an argparse `nargs="?"` sentinel, and combining the bare form with `--uninstall`/`--install-only`
   is a parser error so the read-only path can never be mistaken for an action.
+
+## ADR-027: Absence in a discovery file is empty content, never a missing file
+
+**Status**: Accepted
+**Date**: 2026-11-27
+
+- **Context:** `daemon.json` and `daemon.token` are how a reader finds its writer. Readers poll the
+  ready file continuously, and on Windows an open read handle denies `unlink` (`FILE_SHARE_DELETE` is
+  not granted by `Path.read_text`), so the daemon's shutdown-side delete failed often enough that a
+  stale file outlived the process it described — the reader then kept "connecting" to a dead
+  endpoint. Treating a delete failure as fatal is not an option: the file is best-effort state and
+  no reader can be asked to stop polling first.
+- **Decision:** every discovery write is a temp file plus `os.replace`, and every clear goes through
+  `paths._clear`: delete, else truncate to empty. Empty content is the documented absence signal —
+  `read_ready` and `read_spawn_claim` reject it, `read_token` returns `None` — so "the daemon is
+  gone" is represented by content, not by `Path.exists()`. `read_ready` remains the only liveness
+  check callers use.
+- **Consequences:**
+  **Good:** a clear succeeds regardless of concurrent readers, so a dead daemon can never keep
+  looking alive; the same rule covers the token and the spawn claim, and a kill -9 still leaves a
+  file the next reader corrects by pid-liveness.
+  **Bad:** an empty leftover file stays on disk until the next daemon overwrites it, so a manual
+  `ls` can show a "present" file that means nothing, and `Path.exists()` is no longer a valid
+  liveness probe anywhere in this module.
+  **Mitigations:** ARCH §2.1 states the contract and NOTES carries the do-not-simplify warning;
+  `tests/test_sidecar_protocol.py` pins the truncating clear against a simulated sharing violation.
+
+## ADR-028: The daemon wakes its accept loop with a self-connection
+
+**Status**: Accepted
+**Date**: 2026-11-27
+
+- **Context:** `SidecarDaemon` accepts control connections on a dedicated thread and stops it with
+  `join`. `Listener.close()` does not interrupt a thread already parked in `accept()`: the Windows
+  `PipeListener` keeps its pending pipe handle open, and a POSIX socket close is not a reliable
+  wake either. Every shutdown therefore waited out the full 2 s join timeout, which also kept the
+  stale discovery file pollable for longer than the idle grace period.
+- **Decision:** `_stop_accepting` connects to its own endpoint with the current token, then closes
+  the listener. `_accept_loop` checks the stop event after `accept()` returns, closes the connection
+  and exits, so the wake-up is never registered as a session. The listener is passed to the thread
+  instead of read from a mutable attribute, and the connect runs on a bounded daemon thread
+  (`_WAKE_TIMEOUT_S`) because `multiprocessing.connection.Client` has no connect timeout of its own.
+- **Consequences:**
+  **Good:** shutdown is deterministic and ends within the grace period plus process teardown, with
+  no timeout tuning and no platform branch; a partly written connection is harmless because the
+  daemon is already draining.
+  **Bad:** the daemon must be able to authenticate to itself, so the token has to exist until
+  `_stop_accepting` has run, and if the accept loop already died the wake costs its one-second cap
+  before the old close-and-join path finishes the job.
+  **Mitigations:** discovery is cleared before the runtime stops,
+  `test_daemon_shutdown_is_not_delayed_by_its_own_accept_loop` fails if the join ever stalls again,
+  and `test_stop_accepting_is_bounded_when_nobody_accepts` pins the cap.
 

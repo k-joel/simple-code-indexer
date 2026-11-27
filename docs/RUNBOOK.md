@@ -279,7 +279,7 @@ Stops one workspace's sidecar writer and removes stale discovery files after a f
    Get-Content .simple-ci\run\daemon.json
    ```
 
-   If the file does not exist, no daemon is published and there is nothing to stop.
+   If the file does not exist — or exists but is empty — no daemon is published and there is nothing to stop. A shutdown clears discovery by emptying the file when a reader holds it open, so an empty file is a cleared file (ADR-027).
 
 2. Confirm the recorded pid is live:
 
@@ -302,14 +302,15 @@ Stops one workspace's sidecar writer and removes stale discovery files after a f
 
    Do not delete these files first. A new daemon could publish an endpoint that the old process then deletes.
 
-5. Confirm the process is gone and the discovery file is absent:
+5. Confirm the process is gone and the discovery file is absent or empty:
 
    ```
    Get-Process -Id $state.pid -ErrorAction SilentlyContinue
    Test-Path .simple-ci\run\daemon.json
+   (Get-Item .simple-ci\run\daemon.json -ErrorAction SilentlyContinue).Length
    ```
 
-   The first command returns nothing and the second prints `False`. The next reader session spawns a fresh daemon.
+   The first command returns nothing. The file is gone (`False`) or present with length `0`; either way no endpoint is published and the next reader session spawns a fresh daemon.
 
 **Troubleshooting**
 
