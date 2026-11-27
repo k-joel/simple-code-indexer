@@ -554,8 +554,17 @@ def test_cli_adapters_build_the_documented_argv(tmp_path: Path) -> None:
         "claude_desktop": (None, None),
         "kilo": (None, None),
         "hermes": (None, None),
-        # OpenClaw's shipped build has no MCP support yet: merge only.
-        "openclaw": (None, None),
+        # OpenClaw's `set` takes the whole definition as one JSON object.
+        "openclaw": (
+            [
+                "openclaw",
+                "mcp",
+                "set",
+                NAME,
+                json.dumps(_spec("openclaw").entry(command, {})),
+            ],
+            None,
+        ),
         "cline": (
             ["cline", "mcp", "add", NAME, "--yes", "--", *command],
             None,
