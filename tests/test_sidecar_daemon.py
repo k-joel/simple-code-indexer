@@ -49,15 +49,15 @@ def _settings(
 
 
 def _env(monkeypatch: pytest.MonkeyPatch, workspace: Path, *, grace: float) -> None:
-    monkeypatch.setenv("WORKSPACE_ROOT", str(workspace))
-    monkeypatch.setenv("INDEX_DB", str(workspace / ".simple-ci" / "index.db"))
+    monkeypatch.setenv("SIMPLE_CI_WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("SIMPLE_CI_INDEX_DB", str(workspace / ".simple-ci" / "index.db"))
     monkeypatch.setenv("SIMPLE_CI_MODE", "sidecar")
-    monkeypatch.setenv("IDLE_GRACE_S", str(grace))
-    monkeypatch.setenv("HEARTBEAT_S", "0.5")
-    monkeypatch.setenv("EMBED_BASE_URL", "http://127.0.0.1:9")
-    monkeypatch.setenv("EMBED_TIMEOUT_S", "1")
-    monkeypatch.setenv("SWEEP_SECONDS", "0")
-    monkeypatch.setenv("PREFETCH_GRAMMARS", "0")
+    monkeypatch.setenv("SIMPLE_CI_IDLE_GRACE_S", str(grace))
+    monkeypatch.setenv("SIMPLE_CI_HEARTBEAT_S", "0.5")
+    monkeypatch.setenv("SIMPLE_CI_EMBED_BASE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("SIMPLE_CI_EMBED_TIMEOUT_S", "1")
+    monkeypatch.setenv("SIMPLE_CI_SWEEP_SECONDS", "0")
+    monkeypatch.setenv("SIMPLE_CI_PREFETCH_GRAMMARS", "0")
     monkeypatch.setenv("SIMPLE_CI_PARENT_WATCH", "0")
     existing = os.environ.get("PYTHONPATH")
     monkeypatch.setenv(

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -22,16 +21,18 @@ from urllib.request import url2pathname
 
 from mcp import types
 
+from simple_code_indexer import env
+
 logger = logging.getLogger(__name__)
 
 ROOTS_ENV = "SIMPLE_CI_ROOTS_TIMEOUT_S"
 DEFAULT_TIMEOUT_S = 1.0
-_WORKSPACE_ROOT_ENV = "WORKSPACE_ROOT"
+_WORKSPACE_ROOT_ENV = "SIMPLE_CI_WORKSPACE_ROOT"
 
 
 def timeout_s() -> float:
     """Probe budget; `SIMPLE_CI_ROOTS_TIMEOUT_S=0` disables the probe."""
-    raw = os.environ.get(ROOTS_ENV)
+    raw = env.get(ROOTS_ENV)
     if raw is None:
         return DEFAULT_TIMEOUT_S
     try:
@@ -62,11 +63,11 @@ def _root_path(uri: object) -> Path | None:
 async def first_workspace(session: Any) -> Path | None:
     """First existing directory in the client's MCP roots, or None.
 
-    Returns early when `WORKSPACE_ROOT` is set (it already wins), when the
+    Returns early when `SIMPLE_CI_WORKSPACE_ROOT` is set (it already wins), when the
     connection has no back-channel, when the client did not declare `roots`,
     or when the request fails or times out. Never raises.
     """
-    if os.environ.get(_WORKSPACE_ROOT_ENV):
+    if env.get(_WORKSPACE_ROOT_ENV):
         return None
     budget = timeout_s()
     if budget <= 0:

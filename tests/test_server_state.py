@@ -75,6 +75,7 @@ def test_ensure_started_resolves_the_workspace_once(
         mcp_workspace: Path | None = None,
         cli_workspace: Path | None = None,
         cli_harness: str | None = None,
+        cli_index_db: Path | None = None,
     ) -> Settings:
         loads.append(mcp_workspace)
         return settings
@@ -118,6 +119,7 @@ def test_a_workspace_pin_skips_the_roots_probe(tmp_path: Path, monkeypatch) -> N
         mcp_workspace: Path | None = None,
         cli_workspace: Path | None = None,
         cli_harness: str | None = None,
+        cli_index_db: Path | None = None,
     ) -> Settings:
         loads.append((mcp_workspace, cli_workspace))
         return settings
@@ -140,7 +142,7 @@ def test_ensure_started_refuses_an_inferred_home_workspace(
     home.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.chdir(home)
-    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_WORKSPACE_ROOT", raising=False)
 
     async def no_roots(session: object) -> None:
         return None

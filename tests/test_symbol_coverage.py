@@ -106,7 +106,7 @@ def test_a_found_symbol_is_unaffected_by_coverage(tmp_path: Path) -> None:
 
 def test_fallback_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """`SYMBOL_FALLBACK=0` disables the pack's `process()` step."""
-    monkeypatch.setenv("SYMBOL_FALLBACK", "0")
+    monkeypatch.setenv("SIMPLE_CI_SYMBOL_FALLBACK", "0")
     spec = LanguageSpec(
         name="demo",
         grammar="elixir",

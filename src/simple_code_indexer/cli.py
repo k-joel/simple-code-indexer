@@ -51,15 +51,17 @@ def _serve(argv: list[str]) -> int:
     # Unknown flags are ignored on purpose: a stray argument in a harness config
     # must never leave the pipe without a server. `--workspace` and `--harness`
     # are the exceptions — a project-scope entry pins its workspace (ADR-022) and
-    # a resolver-owning entry names its plugin (ADR-024).
+    # a resolver-owning entry names its plugin (ADR-024). `--index-db` is not a
+    # harness flag: the sidecar spawns its daemon with it (ADR-024).
     workspace, rest = _flag_arg(argv, "--workspace")
     harness, rest = _flag_arg(rest, "--harness")
+    index_db, rest = _flag_arg(rest, "--index-db")
     _parser().parse_known_args(rest)
     logging_setup.configure_console()
     from simple_code_indexer.server import main as server_main
 
     path = _absolute(workspace)
-    server_main(workspace=path, harness=harness)
+    server_main(workspace=path, harness=harness, index_db=_absolute(index_db))
     return 0
 
 

@@ -327,7 +327,7 @@ def test_existing_endpoint_writes_one_global_config(
     assert document["qdrant"] == {"url": QDRANT_URL}
     assert not (project / ".simple-ci" / "config.yaml").exists()
 
-    monkeypatch.setenv("WORKSPACE_ROOT", str(project))
+    monkeypatch.setenv("SIMPLE_CI_WORKSPACE_ROOT", str(project))
     monkeypatch.setenv("SIMPLE_CI_CONFIG", str(global_config))
     settings = load_settings()
     assert settings.vector_store == "qdrant"

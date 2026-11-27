@@ -37,21 +37,21 @@ from simple_code_indexer.setup_wizard import probe
 
 DEFAULT_QUERY_FILE = Path(__file__).with_name("retrieval_queries.json")
 _ENV_OVERRIDES = (
-    "EMBED_BASE_URL",
-    "EMBED_MODEL",
-    "EMBED_DIM",
-    "EMBED_API_KEY",
-    "EMBED_TIMEOUT_S",
-    "EMBED_QUERY_PREFIX",
-    "EMBED_DOCUMENT_PREFIX",
-    "VECTOR_STORE",
-    "QDRANT_URL",
-    "QDRANT_COLLECTION",
-    "SQLITE_VEC_CHUNK_SIZE",
-    "SQLITE_VEC_MMAP_SIZE",
-    "SQLITE_VEC_CACHE_SIZE",
-    "SWEEP_SECONDS",
-    "DEBOUNCE_MS",
+    "SIMPLE_CI_EMBED_BASE_URL",
+    "SIMPLE_CI_EMBED_MODEL",
+    "SIMPLE_CI_EMBED_DIM",
+    "SIMPLE_CI_EMBED_API_KEY",
+    "SIMPLE_CI_EMBED_TIMEOUT_S",
+    "SIMPLE_CI_EMBED_QUERY_PREFIX",
+    "SIMPLE_CI_EMBED_DOCUMENT_PREFIX",
+    "SIMPLE_CI_VECTOR_STORE",
+    "SIMPLE_CI_QDRANT_URL",
+    "SIMPLE_CI_QDRANT_COLLECTION",
+    "SIMPLE_CI_SQLITE_VEC_CHUNK_SIZE",
+    "SIMPLE_CI_SQLITE_VEC_MMAP_SIZE",
+    "SIMPLE_CI_SQLITE_VEC_CACHE_SIZE",
+    "SIMPLE_CI_SWEEP_SECONDS",
+    "SIMPLE_CI_DEBOUNCE_MS",
 )
 
 
@@ -59,8 +59,8 @@ def _local_state_env(local_path: Path) -> dict[str, str]:
     """Point the index and the vectors at one folder instead of `.simple-ci`."""
     resolved = local_path.expanduser().resolve()
     return {
-        "INDEX_DB": str(resolved / "index.db"),
-        "FAISS_PATH": str(resolved / "vectors.faiss"),
+        "SIMPLE_CI_INDEX_DB": str(resolved / "index.db"),
+        "SIMPLE_CI_FAISS_PATH": str(resolved / "vectors.faiss"),
     }
 
 
@@ -216,7 +216,7 @@ def run(args: argparse.Namespace) -> int:
         os.environ.pop(name, None)
     if args.local_path is not None:
         os.environ.update(_local_state_env(args.local_path))
-    os.environ["WORKSPACE_ROOT"] = str(workspace)
+    os.environ["SIMPLE_CI_WORKSPACE_ROOT"] = str(workspace)
 
     http = probe.Http()
     dim = args.dim

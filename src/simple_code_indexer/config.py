@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from simple_code_indexer import configfile, model_prompts
+from simple_code_indexer import configfile, env, model_prompts
 from simple_code_indexer.errors import ConfigError
 
 IGNORE_DIRS: frozenset[str] = frozenset(
@@ -158,7 +157,7 @@ def _prompt(
     placeholders: tuple[str, ...],
 ) -> str | None:
     """Env > explicit file value > model default; empty disables the prompt."""
-    env_value = os.environ.get(env_name)
+    env_value = env.get(env_name)
     if env_value is not None:
         value: str | None = env_value
     elif key in section:
@@ -185,7 +184,7 @@ def resolve_workspace_root(
     cli_workspace: Path | None = None,
     harness: str | None = None,
 ) -> tuple[Path, str]:
-    """WORKSPACE_ROOT > --workspace > MCP roots > harness workspace > cwd.
+    """SIMPLE_CI_WORKSPACE_ROOT > --workspace > MCP roots > harness workspace > cwd.
 
     Returns the workspace and its source — ``env``, ``arg``, ``roots``,
     ``harness:<name>`` or ``cwd`` — so the choice is observable through
@@ -198,7 +197,7 @@ def resolve_workspace_root(
     plugin with a resolver is asked instead. A plausible cwd is never
     overridden: a terminal launch keeps indexing where it was started.
     """
-    env_root = os.environ.get("WORKSPACE_ROOT")
+    env_root = env.get("WORKSPACE_ROOT")
     if env_root:
         return Path(env_root).resolve(), "env"
     if cli_workspace is not None:
@@ -247,7 +246,7 @@ def _implausible_reason(workspace_root: Path) -> str | None:
 def _reject_implausible_workspace(workspace_root: Path, source: str) -> None:
     """Refuse an *inferred* workspace that cannot be a project root.
 
-    An explicit `WORKSPACE_ROOT`, a `--workspace` argument, and a
+    An explicit `SIMPLE_CI_WORKSPACE_ROOT`, a `--workspace` argument, and a
     client-published MCP root are opt-ins: in all three cases the user chose the
     directory. Everything else must look like a project, so a harness that
     spawns the server outside one fails loudly instead of silently building an
@@ -261,7 +260,7 @@ def _reject_implausible_workspace(workspace_root: Path, source: str) -> None:
     raise ConfigError(
         f"the harness started the server in {reason} ({workspace_root}); "
         "refusing to index it. Start a session in a project folder or set "
-        "WORKSPACE_ROOT to the directory to index. If the harness spawns the "
+        "SIMPLE_CI_WORKSPACE_ROOT to the directory to index. If the harness spawns the "
         "server outside the project, rewrite its entry with "
         "`python setup.py --harnesses <name>` so the harness can publish its "
         "workspace."
@@ -269,30 +268,34 @@ def _reject_implausible_workspace(workspace_root: Path, source: str) -> None:
 
 
 def _pick_str(env_name: str, file_value: str | None, default: str) -> str:
-    env_value = os.environ.get(env_name)
+    env_value = env.get(env_name)
     if env_value is not None:
         return env_value
     return file_value if file_value is not None else default
 
 
 def _pick_int(env_name: str, file_value: int | None, default: int) -> int:
-    env_value = os.environ.get(env_name)
+    env_value = env.get(env_name)
     if env_value is None:
         return file_value if file_value is not None else default
     try:
         return int(env_value)
     except ValueError as exc:
-        raise ConfigError(f"{env_name} must be an integer, got {env_value!r}") from exc
+        raise ConfigError(
+            f"{env.name(env_name)} must be an integer, got {env_value!r}"
+        ) from exc
 
 
 def _pick_float(env_name: str, file_value: float | None, default: float) -> float:
-    env_value = os.environ.get(env_name)
+    env_value = env.get(env_name)
     if env_value is None:
         return file_value if file_value is not None else default
     try:
         return float(env_value)
     except ValueError as exc:
-        raise ConfigError(f"{env_name} must be a number, got {env_value!r}") from exc
+        raise ConfigError(
+            f"{env.name(env_name)} must be a number, got {env_value!r}"
+        ) from exc
 
 
 def _managed_service(section: dict[str, Any], where: str) -> ManagedService | None:
@@ -329,14 +332,15 @@ def _managed_service(section: dict[str, Any], where: str) -> ManagedService | No
 def _vector_store(
     qdrant: dict[str, Any], file_value: str | None, env_value: str | None
 ) -> str:
-    """VECTOR_STORE > `vector_store` > legacy `qdrant:` section > sqlite-vec."""
+    """SIMPLE_CI_VECTOR_STORE > `vector_store` > legacy `qdrant:` > sqlite-vec."""
     for name, value in (("VECTOR_STORE", env_value), ("vector_store", file_value)):
         if value is None:
             continue
         normalized = value.strip().lower()
         if normalized not in VECTOR_STORES:
+            label = env.name(name) if name == "VECTOR_STORE" else name
             raise ConfigError(
-                f"{name} must be one of {sorted(VECTOR_STORES)}, got {value!r}"
+                f"{label} must be one of {sorted(VECTOR_STORES)}, got {value!r}"
             )
         return normalized
     return "qdrant" if qdrant else "sqlite-vec"
@@ -386,20 +390,22 @@ def _mode(file_value: str | None, env_value: str | None) -> str:
             continue
         normalized = value.strip().lower()
         if normalized not in MODES:
-            raise ConfigError(f"{name} must be one of {sorted(MODES)}, got {value!r}")
+            label = env.name(name) if name == "SIMPLE_CI_MODE" else name
+            raise ConfigError(f"{label} must be one of {sorted(MODES)}, got {value!r}")
         return normalized
     return "sidecar"
 
 
 def _log_level(file_value: str | None, env_value: str | None) -> str:
-    """LOG_LEVEL > `log.level` > debug; an unknown name is a config error."""
+    """SIMPLE_CI_LOG_LEVEL > `log.level` > debug; an unknown name is an error."""
     for name, value in (("LOG_LEVEL", env_value), ("log.level", file_value)):
         if value is None:
             continue
         normalized = value.strip().lower()
         if normalized not in LOG_LEVELS:
+            label = env.name(name) if name == "LOG_LEVEL" else name
             raise ConfigError(
-                f"{name} must be one of {sorted(LOG_LEVELS)}, got {value!r}"
+                f"{label} must be one of {sorted(LOG_LEVELS)}, got {value!r}"
             )
         return normalized
     return "debug"
@@ -410,6 +416,7 @@ def load_settings(
     mcp_workspace: Path | None = None,
     cli_workspace: Path | None = None,
     cli_harness: str | None = None,
+    cli_index_db: Path | None = None,
 ) -> Settings:
     from simple_code_indexer.registry import get_registry
 
@@ -425,14 +432,14 @@ def load_settings(
     faiss = configfile.get_mapping(raw, "faiss")
     sqlite_vec = configfile.get_mapping(raw, "sqlite_vec")
     log = configfile.get_mapping(raw, "log")
-    env_log_level = os.environ.get("LOG_LEVEL")
+    env_log_level = env.get("LOG_LEVEL")
     file_log_level = (
         None
         if env_log_level is not None
         else configfile.get_str(log, "level", where="log")
     )
     log_level = _log_level(file_log_level, env_log_level)
-    env_vector_store = os.environ.get("VECTOR_STORE")
+    env_vector_store = env.get("VECTOR_STORE")
     file_vector_store = (
         None
         if env_vector_store is not None
@@ -441,7 +448,7 @@ def load_settings(
     vector_store = _vector_store(qdrant, file_vector_store, env_vector_store)
     vec_chunk_size, vec_mmap_size, vec_cache_size = _sqlite_vec_section(sqlite_vec)
     faiss_path = _faiss_path(
-        os.environ.get("FAISS_PATH")
+        env.get("FAISS_PATH")
         or configfile.get_str(faiss, "path", where="faiss"),
         workspace_root,
     )
@@ -467,12 +474,12 @@ def load_settings(
     )
     fingerprint = embedding_fingerprint(document_prefix)
     index_db = Path(
-        os.environ.get(
-            "INDEX_DB",
-            str(workspace_root / configfile.LOCAL_DIRNAME / "index.db"),
-        )
+        str(cli_index_db)
+        if cli_index_db is not None
+        else env.get("INDEX_DB")
+        or str(workspace_root / configfile.LOCAL_DIRNAME / "index.db")
     )
-    api_key = os.environ.get("EMBED_API_KEY")
+    api_key = env.get("EMBED_API_KEY")
     if api_key is None:
         api_key = configfile.get_str(embedding, "api_key", where="embedding")
     sweep_seconds = _pick_float(
@@ -485,7 +492,7 @@ def load_settings(
             "sweep_seconds must be 0 to disable the periodic reconciliation "
             "sweep or a positive number of seconds"
         )
-    env_mode = os.environ.get("SIMPLE_CI_MODE")
+    env_mode = env.get("SIMPLE_CI_MODE")
     file_mode = (
         None
         if env_mode is not None
@@ -514,7 +521,7 @@ def load_settings(
             configfile.get_str(qdrant, "url", where="qdrant"),
             "http://localhost:6333",
         ),
-        qdrant_collection=os.environ.get("QDRANT_COLLECTION")
+        qdrant_collection=env.get("QDRANT_COLLECTION")
         or configfile.get_str(qdrant, "collection", where="qdrant")
         or derive_collection_name(workspace_root, embed_dim, fingerprint),
         embed_base_url=_pick_str(

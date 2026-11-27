@@ -91,16 +91,16 @@ def test_local_state_env_moves_the_whole_local_folder(tmp_path: Path) -> None:
     env = bench._local_state_env(local)
 
     assert env == {
-        "INDEX_DB": str(local.resolve() / "index.db"),
-        "FAISS_PATH": str(local.resolve() / "vectors.faiss"),
+        "SIMPLE_CI_INDEX_DB": str(local.resolve() / "index.db"),
+        "SIMPLE_CI_FAISS_PATH": str(local.resolve() / "vectors.faiss"),
     }
 
 
 def test_local_state_env_isolates_settings(tmp_path: Path, monkeypatch) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    monkeypatch.setenv("WORKSPACE_ROOT", str(workspace))
-    for name in ("INDEX_DB", "FAISS_PATH"):
+    monkeypatch.setenv("SIMPLE_CI_WORKSPACE_ROOT", str(workspace))
+    for name in ("SIMPLE_CI_INDEX_DB", "SIMPLE_CI_FAISS_PATH"):
         monkeypatch.delenv(name, raising=False)
 
     baseline = load_settings()
@@ -121,9 +121,9 @@ def test_env_overrides_still_win_when_no_local_path_is_passed(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    monkeypatch.setenv("WORKSPACE_ROOT", str(workspace))
-    monkeypatch.setenv("INDEX_DB", str(tmp_path / "custom.db"))
-    monkeypatch.setenv("FAISS_PATH", str(tmp_path / "custom.faiss"))
+    monkeypatch.setenv("SIMPLE_CI_WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("SIMPLE_CI_INDEX_DB", str(tmp_path / "custom.db"))
+    monkeypatch.setenv("SIMPLE_CI_FAISS_PATH", str(tmp_path / "custom.faiss"))
 
     settings = load_settings()
 
@@ -136,8 +136,8 @@ def test_local_path_derives_a_scratch_qdrant_collection(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    monkeypatch.setenv("WORKSPACE_ROOT", str(workspace))
-    for name in ("INDEX_DB", "FAISS_PATH", "QDRANT_COLLECTION"):
+    monkeypatch.setenv("SIMPLE_CI_WORKSPACE_ROOT", str(workspace))
+    for name in ("SIMPLE_CI_INDEX_DB", "SIMPLE_CI_FAISS_PATH", "SIMPLE_CI_QDRANT_COLLECTION"):
         monkeypatch.delenv(name, raising=False)
     settings = load_settings()
 
@@ -154,5 +154,5 @@ def test_local_path_derives_a_scratch_qdrant_collection(
 
 
 def test_local_path_is_not_present_in_the_cleared_env_overrides() -> None:
-    assert "INDEX_DB" not in bench._ENV_OVERRIDES
-    assert "FAISS_PATH" not in bench._ENV_OVERRIDES
+    assert "SIMPLE_CI_INDEX_DB" not in bench._ENV_OVERRIDES
+    assert "SIMPLE_CI_FAISS_PATH" not in bench._ENV_OVERRIDES

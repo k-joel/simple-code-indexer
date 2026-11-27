@@ -11,10 +11,10 @@ catalog (regenerate it with ``tools/gen_language_catalog.py``).
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from pathlib import Path
 
+from simple_code_indexer import env
 from simple_code_indexer.languages import catalog
 from simple_code_indexer.languages.spec import ExtractFn, LanguageSpec
 
@@ -165,7 +165,7 @@ def prefetch_grammars(registry: PluginRegistry | None = None) -> None:
 
 def start_prefetch_thread() -> threading.Thread | None:
     """Daemon-thread prefetch so startup stays fast. None when disabled."""
-    if os.environ.get("PREFETCH_GRAMMARS", "1") == "0":
+    if env.get("PREFETCH_GRAMMARS") == "0":
         return None
 
     def _run() -> None:

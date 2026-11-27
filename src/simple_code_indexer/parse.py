@@ -9,12 +9,12 @@ a specialized extractor use those; the rest fall back to the pack's own
 from __future__ import annotations
 
 import logging
-import os
 import re
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from simple_code_indexer import env
 from simple_code_indexer.models import Chunk, Symbol
 from simple_code_indexer.registry import LanguageSpec, get_registry
 from simple_code_indexer.tsutil import signature, text, walk
@@ -484,7 +484,7 @@ def _region_symbols(target: str, node: Any, source: str, registry: Any) -> list[
 
 
 def _symbol_fallback_enabled() -> bool:
-    return os.environ.get("SYMBOL_FALLBACK", "1") != "0"
+    return env.get("SYMBOL_FALLBACK") != "0"
 
 
 def _process_symbols(grammar: str, source: str) -> list[Symbol]:

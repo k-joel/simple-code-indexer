@@ -18,7 +18,7 @@ from pathlib import Path
 from mcp_probe import ProbeError, _read_until, _rpc, _send, _spawn, _stderr_tail
 
 SYMBOL = f"liveWatchProbeIndexOnSave{os.getpid()}"
-WORKSPACE = Path(os.environ.get("WORKSPACE_ROOT") or Path.cwd()).resolve()
+WORKSPACE = Path(os.environ.get("SIMPLE_CI_WORKSPACE_ROOT") or Path.cwd()).resolve()
 PROBE_FILE = WORKSPACE / f"watch_probe_tmp_{os.getpid()}.cpp"
 SOURCE = f"""\
 // index-on-save probe fixture (created and removed by live_watch_probe.py)

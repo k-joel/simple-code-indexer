@@ -27,23 +27,23 @@ def test_ipv4_loopback_rewrites_only_loopback_hosts() -> None:
 
 def test_defaults_come_from_the_process_cwd(monkeypatch) -> None:
     for name in (
-        "WORKSPACE_ROOT",
-        "INDEX_DB",
-        "QDRANT_COLLECTION",
-        "QDRANT_URL",
-        "EMBED_BASE_URL",
-        "EMBED_DIM",
-        "VECTOR_STORE",
-        "FAISS_PATH",
-        "SQLITE_VEC_CHUNK_SIZE",
-        "SQLITE_VEC_MMAP_SIZE",
-        "SQLITE_VEC_CACHE_SIZE",
-        "LOG_LEVEL",
-        "LOG_MAX_BYTES",
-        "LOG_BACKUPS",
+        "SIMPLE_CI_WORKSPACE_ROOT",
+        "SIMPLE_CI_INDEX_DB",
+        "SIMPLE_CI_QDRANT_COLLECTION",
+        "SIMPLE_CI_QDRANT_URL",
+        "SIMPLE_CI_EMBED_BASE_URL",
+        "SIMPLE_CI_EMBED_DIM",
+        "SIMPLE_CI_VECTOR_STORE",
+        "SIMPLE_CI_FAISS_PATH",
+        "SIMPLE_CI_SQLITE_VEC_CHUNK_SIZE",
+        "SIMPLE_CI_SQLITE_VEC_MMAP_SIZE",
+        "SIMPLE_CI_SQLITE_VEC_CACHE_SIZE",
+        "SIMPLE_CI_LOG_LEVEL",
+        "SIMPLE_CI_LOG_MAX_BYTES",
+        "SIMPLE_CI_LOG_BACKUPS",
         "SIMPLE_CI_MODE",
-        "IDLE_GRACE_S",
-        "HEARTBEAT_S",
+        "SIMPLE_CI_IDLE_GRACE_S",
+        "SIMPLE_CI_HEARTBEAT_S",
     ):
         monkeypatch.delenv(name, raising=False)
     cwd = Path.cwd().resolve()
@@ -87,7 +87,7 @@ def test_inferred_home_workspace_is_refused(tmp_path: Path, monkeypatch) -> None
 
     home = tmp_path / "home"
     home.mkdir()
-    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_WORKSPACE_ROOT", raising=False)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.setattr(harnesses, "discover_workspace", lambda *a, **k: None)
     monkeypatch.chdir(home)
@@ -105,7 +105,7 @@ def test_an_implausible_cwd_asks_legacy_entries_for_a_workspace(
     workspace = tmp_path / "project"
     workspace.mkdir()
     monkeypatch.chdir(cwd)
-    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_WORKSPACE_ROOT", raising=False)
 
     def reason(path: Path) -> str | None:
         return "an editor installation directory" if path == cwd.resolve() else None
@@ -133,7 +133,7 @@ def test_a_plausible_cwd_is_not_overridden_by_a_legacy_entry(
 
     workspace = tmp_path / "published"
     workspace.mkdir()
-    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_WORKSPACE_ROOT", raising=False)
     monkeypatch.setattr(config, "_implausible_reason", lambda path: None)
     calls: list[bool] = []
 
@@ -175,7 +175,7 @@ def test_an_editor_install_cwd_is_refused_when_no_harness_publishes(
     cwd = tmp_path / "editor"
     cwd.mkdir()
     monkeypatch.chdir(cwd)
-    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_WORKSPACE_ROOT", raising=False)
     monkeypatch.setattr(harnesses, "discover_workspace", lambda *a, **k: None)
     monkeypatch.setattr(
         config,
@@ -192,7 +192,7 @@ def test_explicit_workspace_root_may_be_the_home_directory(
 ) -> None:
     home = tmp_path / "home"
     home.mkdir()
-    monkeypatch.setenv("WORKSPACE_ROOT", str(home))
+    monkeypatch.setenv("SIMPLE_CI_WORKSPACE_ROOT", str(home))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.chdir(home)
     settings = load_settings()
@@ -201,7 +201,7 @@ def test_explicit_workspace_root_may_be_the_home_directory(
 
 
 def test_workspace_source_defaults_to_the_cwd(monkeypatch) -> None:
-    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_WORKSPACE_ROOT", raising=False)
     settings = load_settings()
     assert settings.workspace_source == "cwd"
 
@@ -218,7 +218,7 @@ def test_the_workspace_argument_beats_roots_and_the_harness(
     roots.mkdir()
     published = tmp_path / "published"
     published.mkdir()
-    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_WORKSPACE_ROOT", raising=False)
     monkeypatch.setattr(
         harnesses, "discover_workspace", lambda cwd, **_: (published, "commandcode")
     )
@@ -236,7 +236,7 @@ def test_workspace_root_beats_the_workspace_argument(
     env_root.mkdir()
     pinned = tmp_path / "pinned"
     pinned.mkdir()
-    monkeypatch.setenv("WORKSPACE_ROOT", str(env_root))
+    monkeypatch.setenv("SIMPLE_CI_WORKSPACE_ROOT", str(env_root))
 
     settings = load_settings(cli_workspace=pinned)
 
@@ -251,7 +251,7 @@ def test_an_implausible_workspace_is_allowed_when_pinned(
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_WORKSPACE_ROOT", raising=False)
 
     settings = load_settings(cli_workspace=home)
 
@@ -266,7 +266,7 @@ def test_harness_published_workspace_wins_over_the_cwd(
 
     workspace = tmp_path / "project"
     workspace.mkdir()
-    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_WORKSPACE_ROOT", raising=False)
     monkeypatch.setattr(
         harnesses, "discover_workspace", lambda cwd, **_: (workspace, "commandcode")
     )
@@ -286,7 +286,7 @@ def test_mcp_roots_beat_the_harness_published_workspace(
     roots.mkdir()
     published = tmp_path / "published"
     published.mkdir()
-    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_WORKSPACE_ROOT", raising=False)
     monkeypatch.setattr(
         harnesses, "discover_workspace", lambda cwd, **_: (published, "commandcode")
     )
@@ -302,7 +302,7 @@ def test_workspace_root_env_beats_mcp_roots(tmp_path: Path, monkeypatch) -> None
     env_root.mkdir()
     roots = tmp_path / "roots"
     roots.mkdir()
-    monkeypatch.setenv("WORKSPACE_ROOT", str(env_root))
+    monkeypatch.setenv("SIMPLE_CI_WORKSPACE_ROOT", str(env_root))
 
     settings = load_settings(mcp_workspace=roots)
 
@@ -313,7 +313,7 @@ def test_workspace_root_env_beats_mcp_roots(tmp_path: Path, monkeypatch) -> None
 def test_a_published_home_workspace_is_allowed(tmp_path: Path, monkeypatch) -> None:
     home = tmp_path / "home"
     home.mkdir()
-    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_WORKSPACE_ROOT", raising=False)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.chdir(home)
 
@@ -324,10 +324,10 @@ def test_a_published_home_workspace_is_allowed(tmp_path: Path, monkeypatch) -> N
 
 
 def test_env_overrides(monkeypatch) -> None:
-    monkeypatch.setenv("WORKSPACE_ROOT", "/data")
-    monkeypatch.setenv("SWEEP_SECONDS", "10")
-    monkeypatch.delenv("INDEX_DB", raising=False)
-    monkeypatch.delenv("QDRANT_COLLECTION", raising=False)
+    monkeypatch.setenv("SIMPLE_CI_WORKSPACE_ROOT", "/data")
+    monkeypatch.setenv("SIMPLE_CI_SWEEP_SECONDS", "10")
+    monkeypatch.delenv("SIMPLE_CI_INDEX_DB", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_QDRANT_COLLECTION", raising=False)
     settings = load_settings()
     assert settings.workspace_root == Path("/data").resolve()
     assert settings.index_db_path == Path("/data").resolve() / ".simple-ci" / "index.db"
@@ -345,20 +345,20 @@ def test_negative_sweep_seconds_are_rejected(tmp_path: Path, monkeypatch) -> Non
         load_settings()
 
     _config(tmp_path, monkeypatch, "sweep_seconds: 0\n")
-    monkeypatch.setenv("SWEEP_SECONDS", "-1")
+    monkeypatch.setenv("SIMPLE_CI_SWEEP_SECONDS", "-1")
     with pytest.raises(ConfigError, match="sweep_seconds"):
         load_settings()
 
 
 def test_collection_env_override_wins(monkeypatch) -> None:
-    monkeypatch.setenv("WORKSPACE_ROOT", "/data")
-    monkeypatch.setenv("QDRANT_COLLECTION", "shared_manual")
+    monkeypatch.setenv("SIMPLE_CI_WORKSPACE_ROOT", "/data")
+    monkeypatch.setenv("SIMPLE_CI_QDRANT_COLLECTION", "shared_manual")
     assert load_settings().qdrant_collection == "shared_manual"
 
 
 def test_embed_dim_env_is_encoded_in_the_name(monkeypatch) -> None:
-    monkeypatch.setenv("EMBED_DIM", "1024")
-    monkeypatch.delenv("QDRANT_COLLECTION", raising=False)
+    monkeypatch.setenv("SIMPLE_CI_EMBED_DIM", "1024")
+    monkeypatch.delenv("SIMPLE_CI_QDRANT_COLLECTION", raising=False)
     settings = load_settings()
     assert settings.embed_dim == 1024
     assert "_1024_" in settings.qdrant_collection
@@ -421,7 +421,7 @@ def _config(tmp_path: Path, monkeypatch, text: str) -> None:
     path = tmp_path / "config.yaml"
     path.write_text(text, encoding="utf-8")
     monkeypatch.setenv("SIMPLE_CI_CONFIG", str(path))
-    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("SIMPLE_CI_WORKSPACE_ROOT", str(tmp_path))
 
 
 def test_a_legacy_qdrant_section_selects_qdrant(tmp_path: Path, monkeypatch) -> None:
@@ -453,7 +453,7 @@ def test_explicit_faiss_beats_the_legacy_qdrant_section(
 
 def test_vector_store_env_overrides_the_file(tmp_path: Path, monkeypatch) -> None:
     _config(tmp_path, monkeypatch, "vector_store: faiss\n")
-    monkeypatch.setenv("VECTOR_STORE", "qdrant")
+    monkeypatch.setenv("SIMPLE_CI_VECTOR_STORE", "qdrant")
     assert load_settings().vector_store == "qdrant"
 
 
@@ -463,7 +463,7 @@ def test_invalid_vector_store_values_raise(tmp_path: Path, monkeypatch) -> None:
         load_settings()
 
     _config(tmp_path, monkeypatch, "vector_store: faiss\n")
-    monkeypatch.setenv("VECTOR_STORE", "chroma")
+    monkeypatch.setenv("SIMPLE_CI_VECTOR_STORE", "chroma")
     with pytest.raises(ConfigError):
         load_settings()
 
@@ -472,7 +472,7 @@ def test_vector_store_env_ignores_a_malformed_file_value(
     tmp_path: Path, monkeypatch
 ) -> None:
     _config(tmp_path, monkeypatch, "vector_store: [1, 2]\n")
-    monkeypatch.setenv("VECTOR_STORE", "faiss")
+    monkeypatch.setenv("SIMPLE_CI_VECTOR_STORE", "faiss")
     assert load_settings().vector_store == "faiss"
 
 
@@ -488,7 +488,7 @@ def test_faiss_path_from_config_is_relative_to_the_workspace(
 def test_faiss_path_env_overrides_the_file(tmp_path: Path, monkeypatch) -> None:
     _config(tmp_path, monkeypatch, "faiss:\n  path: cache/vectors.faiss\n")
     other = tmp_path / "elsewhere" / "index.faiss"
-    monkeypatch.setenv("FAISS_PATH", str(other))
+    monkeypatch.setenv("SIMPLE_CI_FAISS_PATH", str(other))
     assert load_settings().faiss_path == other.resolve()
 
 
@@ -500,9 +500,9 @@ def test_absolute_faiss_path_is_kept(tmp_path: Path, monkeypatch) -> None:
 
 def test_sqlite_vec_tuning_reaches_the_settings(tmp_path: Path, monkeypatch) -> None:
     for name in (
-        "SQLITE_VEC_CHUNK_SIZE",
-        "SQLITE_VEC_MMAP_SIZE",
-        "SQLITE_VEC_CACHE_SIZE",
+        "SIMPLE_CI_SQLITE_VEC_CHUNK_SIZE",
+        "SIMPLE_CI_SQLITE_VEC_MMAP_SIZE",
+        "SIMPLE_CI_SQLITE_VEC_CACHE_SIZE",
     ):
         monkeypatch.delenv(name, raising=False)
     _config(
@@ -518,8 +518,8 @@ def test_sqlite_vec_tuning_reaches_the_settings(tmp_path: Path, monkeypatch) -> 
 
 def test_sqlite_vec_env_overrides_the_file(tmp_path: Path, monkeypatch) -> None:
     _config(tmp_path, monkeypatch, "sqlite_vec:\n  chunk_size: 128\n")
-    monkeypatch.setenv("SQLITE_VEC_CHUNK_SIZE", "32")
-    monkeypatch.setenv("SQLITE_VEC_MMAP_SIZE", "0")
+    monkeypatch.setenv("SIMPLE_CI_SQLITE_VEC_CHUNK_SIZE", "32")
+    monkeypatch.setenv("SIMPLE_CI_SQLITE_VEC_MMAP_SIZE", "0")
     settings = load_settings()
     assert settings.sqlite_vec_chunk_size == 32
     assert settings.sqlite_vec_mmap_size == 0
@@ -540,9 +540,9 @@ def test_invalid_sqlite_vec_values_raise(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_log_section_values_reach_the_settings(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.delenv("LOG_LEVEL", raising=False)
-    monkeypatch.delenv("LOG_MAX_BYTES", raising=False)
-    monkeypatch.delenv("LOG_BACKUPS", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_LOG_LEVEL", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_LOG_MAX_BYTES", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_LOG_BACKUPS", raising=False)
     _config(
         tmp_path,
         monkeypatch,
@@ -558,9 +558,9 @@ def test_log_env_overrides_the_file_and_normalizes_case(
     tmp_path: Path, monkeypatch
 ) -> None:
     _config(tmp_path, monkeypatch, "log:\n  level: warning\n")
-    monkeypatch.setenv("LOG_LEVEL", "INFO")
-    monkeypatch.setenv("LOG_MAX_BYTES", "2048")
-    monkeypatch.setenv("LOG_BACKUPS", "1")
+    monkeypatch.setenv("SIMPLE_CI_LOG_LEVEL", "INFO")
+    monkeypatch.setenv("SIMPLE_CI_LOG_MAX_BYTES", "2048")
+    monkeypatch.setenv("SIMPLE_CI_LOG_BACKUPS", "1")
     settings = load_settings()
     assert settings.log_level == "info"
     assert settings.log_max_bytes == 2048
@@ -568,19 +568,19 @@ def test_log_env_overrides_the_file_and_normalizes_case(
 
 
 def test_invalid_log_levels_raise(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_LOG_LEVEL", raising=False)
     _config(tmp_path, monkeypatch, "log:\n  level: loud\n")
     with pytest.raises(ConfigError, match="log.level"):
         load_settings()
 
     _config(tmp_path, monkeypatch, "log:\n  level: debug\n")
-    monkeypatch.setenv("LOG_LEVEL", "verbose")
-    with pytest.raises(ConfigError, match="LOG_LEVEL"):
+    monkeypatch.setenv("SIMPLE_CI_LOG_LEVEL", "verbose")
+    with pytest.raises(ConfigError, match="SIMPLE_CI_LOG_LEVEL"):
         load_settings()
 
 
 def test_sidecar_settings_come_from_config_and_env(tmp_path: Path, monkeypatch) -> None:
-    for name in ("SIMPLE_CI_MODE", "IDLE_GRACE_S", "HEARTBEAT_S"):
+    for name in ("SIMPLE_CI_MODE", "SIMPLE_CI_IDLE_GRACE_S", "SIMPLE_CI_HEARTBEAT_S"):
         monkeypatch.delenv(name, raising=False)
     _config(
         tmp_path,
@@ -593,8 +593,8 @@ def test_sidecar_settings_come_from_config_and_env(tmp_path: Path, monkeypatch) 
     assert settings.heartbeat_s == 1.5
 
     monkeypatch.setenv("SIMPLE_CI_MODE", "SIDECAR")
-    monkeypatch.setenv("IDLE_GRACE_S", "0")
-    monkeypatch.setenv("HEARTBEAT_S", "2.5")
+    monkeypatch.setenv("SIMPLE_CI_IDLE_GRACE_S", "0")
+    monkeypatch.setenv("SIMPLE_CI_HEARTBEAT_S", "2.5")
     settings = load_settings()
     assert settings.mode == "sidecar"
     assert settings.idle_grace_s == 0.0

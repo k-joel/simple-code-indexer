@@ -20,8 +20,8 @@ def test_faiss_is_importable() -> None:
 
 
 def test_the_default_vector_store_is_sqlite_vec(monkeypatch) -> None:
-    monkeypatch.delenv("VECTOR_STORE", raising=False)
-    monkeypatch.delenv("FAISS_PATH", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_VECTOR_STORE", raising=False)
+    monkeypatch.delenv("SIMPLE_CI_FAISS_PATH", raising=False)
     from simple_code_indexer.config import load_settings
 
     assert load_settings().vector_store == "sqlite-vec"
@@ -56,7 +56,7 @@ def test_serve_passes_unknown_flags_through(monkeypatch) -> None:
     """A stray argument in a harness config must not leave a dead pipe."""
     imported: list[bool] = []
 
-    def fake_server_main(workspace=None, harness=None) -> None:
+    def fake_server_main(workspace=None, harness=None, index_db=None) -> None:
         imported.append(True)
 
     monkeypatch.setattr("simple_code_indexer.server.main", fake_server_main)
@@ -69,7 +69,7 @@ def test_serve_reads_the_workspace_pin(monkeypatch, tmp_path) -> None:
     """A project-scope entry pins its workspace with `serve --workspace <dir>`."""
     seen: list[object] = []
 
-    def fake_server_main(workspace=None, harness=None) -> None:
+    def fake_server_main(workspace=None, harness=None, index_db=None) -> None:
         seen.append(workspace)
 
     monkeypatch.setattr("simple_code_indexer.server.main", fake_server_main)
@@ -84,7 +84,7 @@ def test_serve_reads_the_harness_marker(monkeypatch) -> None:
     """`serve --harness <name>` names the plugin allowed to publish a workspace."""
     seen: list[object] = []
 
-    def fake_server_main(workspace=None, harness=None) -> None:
+    def fake_server_main(workspace=None, harness=None, index_db=None) -> None:
         seen.append(harness)
 
     monkeypatch.setattr("simple_code_indexer.server.main", fake_server_main)

@@ -969,6 +969,6 @@ def test_every_plugin_declares_a_probeable_binary_or_a_directory() -> None:
 
 
 def test_default_user_dirs_follow_the_workspace(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("SIMPLE_CI_WORKSPACE_ROOT", str(tmp_path))
 
     assert tmp_path.resolve() / "harnesses" in default_user_harness_dirs()

@@ -39,7 +39,7 @@ def _settings(workspace: Path) -> Settings:
 
 @pytest.fixture(autouse=True)
 def _no_grammar_prefetch(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("PREFETCH_GRAMMARS", "0")
+    monkeypatch.setenv("SIMPLE_CI_PREFETCH_GRAMMARS", "0")
 
 
 def _start(settings: Settings) -> runtime.WriterRuntime:

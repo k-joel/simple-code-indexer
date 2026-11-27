@@ -19,21 +19,21 @@ SRC = REPO_ROOT / "src"
 READY_PATH = Path(".simple-ci") / "run" / "daemon.json"
 
 _ENV_EXCLUDES = (
-    "WORKSPACE_ROOT",
-    "INDEX_DB",
-    "VECTOR_STORE",
-    "FAISS_PATH",
-    "QDRANT_URL",
-    "QDRANT_COLLECTION",
+    "SIMPLE_CI_WORKSPACE_ROOT",
+    "SIMPLE_CI_INDEX_DB",
+    "SIMPLE_CI_VECTOR_STORE",
+    "SIMPLE_CI_FAISS_PATH",
+    "SIMPLE_CI_QDRANT_URL",
+    "SIMPLE_CI_QDRANT_COLLECTION",
     "SIMPLE_CI_CONFIG",
     "SIMPLE_CI_MODE",
-    "IDLE_GRACE_S",
-    "HEARTBEAT_S",
-    "EMBED_BASE_URL",
-    "EMBED_TIMEOUT_S",
-    "SWEEP_SECONDS",
+    "SIMPLE_CI_IDLE_GRACE_S",
+    "SIMPLE_CI_HEARTBEAT_S",
+    "SIMPLE_CI_EMBED_BASE_URL",
+    "SIMPLE_CI_EMBED_TIMEOUT_S",
+    "SIMPLE_CI_SWEEP_SECONDS",
     "SIMPLE_CI_PARENT_WATCH",
-    "PREFETCH_GRAMMARS",
+    "SIMPLE_CI_PREFETCH_GRAMMARS",
 )
 
 
@@ -43,16 +43,16 @@ def _env(workspace: Path) -> dict[str, str]:
     }
     env["SIMPLE_CI_CONFIG"] = "none"
     env["SIMPLE_CI_MODE"] = "sidecar"
-    env["WORKSPACE_ROOT"] = str(workspace)
-    env["INDEX_DB"] = str(workspace / ".simple-ci" / "index.db")
-    env["VECTOR_STORE"] = "faiss"
-    env["EMBED_BASE_URL"] = "http://127.0.0.1:9"
-    env["EMBED_TIMEOUT_S"] = "1"
-    env["SWEEP_SECONDS"] = "0"
-    env["PREFETCH_GRAMMARS"] = "0"
+    env["SIMPLE_CI_WORKSPACE_ROOT"] = str(workspace)
+    env["SIMPLE_CI_INDEX_DB"] = str(workspace / ".simple-ci" / "index.db")
+    env["SIMPLE_CI_VECTOR_STORE"] = "faiss"
+    env["SIMPLE_CI_EMBED_BASE_URL"] = "http://127.0.0.1:9"
+    env["SIMPLE_CI_EMBED_TIMEOUT_S"] = "1"
+    env["SIMPLE_CI_SWEEP_SECONDS"] = "0"
+    env["SIMPLE_CI_PREFETCH_GRAMMARS"] = "0"
     env["SIMPLE_CI_PARENT_WATCH"] = "0"
-    env["IDLE_GRACE_S"] = "3"
-    env["HEARTBEAT_S"] = "0.5"
+    env["SIMPLE_CI_IDLE_GRACE_S"] = "3"
+    env["SIMPLE_CI_HEARTBEAT_S"] = "0.5"
     existing = env.get("PYTHONPATH")
     env["PYTHONPATH"] = str(SRC) + (os.pathsep + existing if existing else "")
     return env

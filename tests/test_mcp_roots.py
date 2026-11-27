@@ -64,7 +64,7 @@ def test_first_workspace_returns_the_first_existing_directory(tmp_path: Path) ->
 def test_first_workspace_is_skipped_when_workspace_root_is_set(
     tmp_path: Path, monkeypatch
 ) -> None:
-    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("SIMPLE_CI_WORKSPACE_ROOT", str(tmp_path))
     session = FakeSession([tmp_path])
 
     assert asyncio.run(mcp_roots.first_workspace(session)) is None

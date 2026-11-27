@@ -17,17 +17,17 @@ import pytest
 
 from mcp_client import StdioServer
 
-EMBED_BASE_URL = os.environ.get("EMBED_BASE_URL", "http://localhost:8080")
+EMBED_BASE_URL = os.environ.get("SIMPLE_CI_EMBED_BASE_URL", "http://localhost:8080")
 STEP_TIMEOUT_S = 60.0
 
 # Ambient overrides would break the per-workspace contract under test.
 _CHILD_ENV_EXCLUDES = (
-    "WORKSPACE_ROOT",
-    "INDEX_DB",
-    "VECTOR_STORE",
-    "FAISS_PATH",
-    "QDRANT_URL",
-    "QDRANT_COLLECTION",
+    "SIMPLE_CI_WORKSPACE_ROOT",
+    "SIMPLE_CI_INDEX_DB",
+    "SIMPLE_CI_VECTOR_STORE",
+    "SIMPLE_CI_FAISS_PATH",
+    "SIMPLE_CI_QDRANT_URL",
+    "SIMPLE_CI_QDRANT_COLLECTION",
     "SIMPLE_CI_CONFIG",
     "SIMPLE_CI_MODE",
 )
@@ -41,7 +41,7 @@ def _child_env() -> dict[str, str]:
     }
     env["SIMPLE_CI_CONFIG"] = "none"
     env["SIMPLE_CI_MODE"] = "embedded"
-    env["VECTOR_STORE"] = "faiss"
+    env["SIMPLE_CI_VECTOR_STORE"] = "faiss"
     return env
 
 

@@ -366,17 +366,18 @@ class SidecarDaemon:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="simple-code-indexer-sidecar")
     parser.add_argument("--workspace")
+    parser.add_argument("--index-db")
     args = parser.parse_args(argv)
-    settings = load_settings()
-    if args.workspace:
-        requested = Path(args.workspace).resolve()
-        if requested != settings.workspace_root:
-            print(
-                "simple-code-indexer sidecar: workspace mismatch "
-                f"({requested} != {settings.workspace_root})",
-                file=sys.stderr,
-            )
-            return 2
+    workspace = Path(args.workspace).resolve() if args.workspace else None
+    index_db = Path(args.index_db).resolve() if args.index_db else None
+    settings = load_settings(cli_workspace=workspace, cli_index_db=index_db)
+    if workspace is not None and workspace != settings.workspace_root:
+        print(
+            "simple-code-indexer sidecar: workspace mismatch "
+            f"({workspace} != {settings.workspace_root})",
+            file=sys.stderr,
+        )
+        return 2
     log_file = logging_setup.configure_file(
         settings, filename=logging_setup.WRITER_LOG_FILENAME
     )

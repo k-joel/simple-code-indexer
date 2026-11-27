@@ -95,10 +95,10 @@ def test_model_defaults_supply_code_prompts(tmp_path: Path, monkeypatch) -> None
     )
     monkeypatch.setenv("SIMPLE_CI_CONFIG", str(path))
     for name in (
-        "EMBED_MODEL",
-        "EMBED_DIM",
-        "EMBED_QUERY_PREFIX",
-        "EMBED_DOCUMENT_PREFIX",
+        "SIMPLE_CI_EMBED_MODEL",
+        "SIMPLE_CI_EMBED_DIM",
+        "SIMPLE_CI_EMBED_QUERY_PREFIX",
+        "SIMPLE_CI_EMBED_DOCUMENT_PREFIX",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -116,10 +116,10 @@ def test_qwen_gets_a_query_only_instruction(tmp_path: Path, monkeypatch) -> None
     )
     monkeypatch.setenv("SIMPLE_CI_CONFIG", str(path))
     for name in (
-        "EMBED_MODEL",
-        "EMBED_DIM",
-        "EMBED_QUERY_PREFIX",
-        "EMBED_DOCUMENT_PREFIX",
+        "SIMPLE_CI_EMBED_MODEL",
+        "SIMPLE_CI_EMBED_DIM",
+        "SIMPLE_CI_EMBED_QUERY_PREFIX",
+        "SIMPLE_CI_EMBED_DOCUMENT_PREFIX",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -146,9 +146,9 @@ def test_explicit_empty_prompt_disables_defaults(tmp_path: Path, monkeypatch) ->
     )
     monkeypatch.setenv("SIMPLE_CI_CONFIG", str(path))
     for name in (
-        "EMBED_MODEL",
-        "EMBED_QUERY_PREFIX",
-        "EMBED_DOCUMENT_PREFIX",
+        "SIMPLE_CI_EMBED_MODEL",
+        "SIMPLE_CI_EMBED_QUERY_PREFIX",
+        "SIMPLE_CI_EMBED_DOCUMENT_PREFIX",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -171,7 +171,7 @@ def test_bad_prompt_placeholders_raise(tmp_path: Path, monkeypatch) -> None:
         path,
     )
     monkeypatch.setenv("SIMPLE_CI_CONFIG", str(path))
-    for name in ("EMBED_DOCUMENT_PREFIX",):
+    for name in ("SIMPLE_CI_EMBED_DOCUMENT_PREFIX",):
         monkeypatch.delenv(name, raising=False)
 
     with pytest.raises(ConfigError, match="document_prefix"):
@@ -249,17 +249,17 @@ def test_file_values_reach_settings(tmp_path: Path, monkeypatch) -> None:
         path,
     )
     monkeypatch.setenv("SIMPLE_CI_CONFIG", str(path))
-    monkeypatch.setenv("WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("SIMPLE_CI_WORKSPACE_ROOT", str(workspace))
     for name in (
-        "EMBED_BASE_URL",
-        "EMBED_MODEL",
-        "EMBED_DIM",
-        "EMBED_API_KEY",
-        "EMBED_TIMEOUT_S",
-        "QDRANT_URL",
-        "QDRANT_COLLECTION",
-        "SWEEP_SECONDS",
-        "DEBOUNCE_MS",
+        "SIMPLE_CI_EMBED_BASE_URL",
+        "SIMPLE_CI_EMBED_MODEL",
+        "SIMPLE_CI_EMBED_DIM",
+        "SIMPLE_CI_EMBED_API_KEY",
+        "SIMPLE_CI_EMBED_TIMEOUT_S",
+        "SIMPLE_CI_QDRANT_URL",
+        "SIMPLE_CI_QDRANT_COLLECTION",
+        "SIMPLE_CI_SWEEP_SECONDS",
+        "SIMPLE_CI_DEBOUNCE_MS",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -282,8 +282,8 @@ def test_env_overrides_file_values(tmp_path: Path, monkeypatch) -> None:
     path = tmp_path / "config.yaml"
     configfile.write_config({"embedding": {"dim": 1024, "api_key": "file-key"}}, path)
     monkeypatch.setenv("SIMPLE_CI_CONFIG", str(path))
-    monkeypatch.setenv("EMBED_DIM", "768")
-    monkeypatch.setenv("EMBED_API_KEY", "env-key")
+    monkeypatch.setenv("SIMPLE_CI_EMBED_DIM", "768")
+    monkeypatch.setenv("SIMPLE_CI_EMBED_API_KEY", "env-key")
 
     settings = load_settings()
 

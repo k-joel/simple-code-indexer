@@ -33,7 +33,7 @@ _CREATE_NEW_PROCESS_GROUP = 0x00000200
 _CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 
 
-def _daemon_command(workspace_root: Path) -> list[str]:
+def _daemon_command(workspace_root: Path, index_db: Path | None = None) -> list[str]:
     """Argv for the detached daemon, skipping the Windows venv launcher.
 
     A venv's ``pythonw.exe`` is a redirector that re-executes the base
@@ -42,8 +42,13 @@ def _daemon_command(workspace_root: Path) -> list[str]:
     the real interpreter, and ``sys.path`` already resolves the venv's entries
     (the installed package comes from a ``.pth``), so the daemon can run there
     directly. Falls back to ``sys.executable`` when there is no distinct base.
+
+    The workspace and index path are arguments, not environment variables: a
+    child process is production, and production passes arguments (ADR-024).
     """
     arguments = ["--workspace", str(workspace_root)]
+    if index_db is not None:
+        arguments += ["--index-db", str(index_db)]
     base = getattr(sys, "_base_executable", "") if sys.platform == "win32" else ""
     if base and os.path.normcase(base) != os.path.normcase(sys.executable):
         entries = [str(Path(entry).resolve()) for entry in sys.path if entry]
@@ -331,13 +336,10 @@ class ReaderSession:
 
     def _spawn_daemon(self) -> subprocess.Popen[Any] | None:
         root = self.settings.workspace_root.resolve()
-        env = dict(os.environ)
-        env["WORKSPACE_ROOT"] = str(root)
-        env["INDEX_DB"] = str(self.settings.index_db_path.resolve())
-        command = _daemon_command(root)
+        command = _daemon_command(root, self.settings.index_db_path.resolve())
         options: dict[str, Any] = {
             "cwd": str(root),
-            "env": env,
+            "env": dict(os.environ),
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.DEVNULL,
             "stderr": subprocess.DEVNULL,

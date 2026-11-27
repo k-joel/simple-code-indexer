@@ -21,8 +21,8 @@ SRC = REPO_ROOT / "src"
 FAKE_HARNESS = Path(__file__).resolve().parent / "fixtures" / "fake_harness.py"
 
 _ENV_EXCLUDES = (
-    "WORKSPACE_ROOT",
-    "INDEX_DB",
+    "SIMPLE_CI_WORKSPACE_ROOT",
+    "SIMPLE_CI_INDEX_DB",
     "SIMPLE_CI_CONFIG",
     "SIMPLE_CI_MODE",
     "SIMPLE_CI_PARENT_WATCH",
@@ -351,10 +351,10 @@ def test_server_exits_when_the_harness_process_dies(tmp_path: Path) -> None:
     }
     env["SIMPLE_CI_CONFIG"] = "none"
     env["SIMPLE_CI_MODE"] = "embedded"
-    env["VECTOR_STORE"] = "faiss"
-    env["PREFETCH_GRAMMARS"] = "0"
-    env["EMBED_BASE_URL"] = "http://127.0.0.1:9"
-    env["EMBED_TIMEOUT_S"] = "1"
+    env["SIMPLE_CI_VECTOR_STORE"] = "faiss"
+    env["SIMPLE_CI_PREFETCH_GRAMMARS"] = "0"
+    env["SIMPLE_CI_EMBED_BASE_URL"] = "http://127.0.0.1:9"
+    env["SIMPLE_CI_EMBED_TIMEOUT_S"] = "1"
     pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = str(SRC) + (os.pathsep + pythonpath if pythonpath else "")
 
