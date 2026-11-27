@@ -149,6 +149,7 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 | [020](#adr-020-symbol-maps-are-derived-from-the-packs-tags-queries-at-catalog-generation-time) | Symbol maps from the pack's tags queries |
 | [021](#adr-021-embedded-regions-are-indexed-through-the-grammars-injections-query-opt-in-per-host) | Embedded regions via the grammar's injections query |
 | [022](#adr-022-harness-entries-can-be-project-scoped-pinned-by-serve---workspace) | Harness entries can be project-scoped, pinned by `serve --workspace` |
+| [023](#adr-023-embeddinggemma-2-is-the-default-model-and-the-sweep-defaults-to-300-s) | EmbeddingGemma 2 is the default model; the sweep defaults to 300 s |
 
 
 ## ADR-001: Index on save, not git-committed state
@@ -660,4 +661,27 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   plugin module; the wizard has no per-client branches. A client that requires interactive
   approval for project servers (Claude Code) or project trust (Codex, Pi) still connects only after
   the user grants it, which no config writer can shortcut.
+
+## ADR-023: EmbeddingGemma 2 is the default model; the sweep defaults to 300 s
+
+**Status**: Accepted
+**Date**: 2026-11-27
+
+- **Context:** The defaults were sized for the largest supported model: `EMBED_DIM` defaulted to
+  2560 and the wizard suggested `Qwen3-Embedding-4B-Q6_K` for any endpoint or container it did not
+  provision itself. That made the zero-config path depend on a 3.3 GB download and a 2560-wide
+  vector table, even though EmbeddingGemma 2 is already the first catalog entry (0.6 GB, 768-dim)
+  and the model the README and benchmarks use. Separately, the wizard's suggested sweep interval
+  was 45 s while the runtime backs off to a 600 s cap, so the suggested value mostly exercised the
+  backoff rather than reconciling at a steady cadence.
+- **Decision:** `embedding.model` / `EMBED_MODEL` defaults to `embeddinggemma-2` and
+  `embedding.dim` / `EMBED_DIM` to 768, matching the existing first catalog entry; the wizard's
+  `DEFAULT_EMBED_MODEL` / `DEFAULT_EMBED_DIM` for a bare URL or container follow. `DEFAULT_SWEEP_SECONDS`
+  (the interval the wizard offers when the sweep is enabled) is 300 s. The sweep *question* still
+  defaults to no, and an existing `config.yaml` keeps its recorded model, dimension, and interval.
+- **Consequences:** The fallback path no longer assumes a model the user did not download, and a
+  fresh `setup --yes` and the docs agree. The default is only a fallback: load precedence is
+  unchanged, so a config file or environment variable still wins, and no existing index is migrated
+  — a dimension change invalidates the vector binding and re-embeds (the normal identity rule, not
+  a new one). A 768-dim table is also ~3× smaller and cheaper to scan than 2560.
 

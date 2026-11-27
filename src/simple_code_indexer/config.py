@@ -441,12 +441,12 @@ def load_settings(
     )
 
     embed_dim = _pick_int(
-        "EMBED_DIM", configfile.get_int(embedding, "dim", where="embedding"), 2560
+        "EMBED_DIM", configfile.get_int(embedding, "dim", where="embedding"), 768
     )
     embed_model = _pick_str(
         "EMBED_MODEL",
         configfile.get_str(embedding, "model", where="embedding"),
-        "Qwen3-Embedding-4B-Q6_K",
+        "embeddinggemma-2",
     )
     default_query, default_document = model_prompts.defaults_for_model(embed_model)
     query_prefix = _prompt(

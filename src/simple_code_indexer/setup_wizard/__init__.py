@@ -45,10 +45,10 @@ from simple_code_indexer.setup_wizard.prompts import Prompter
 
 SERVER_NAME = "simple-code-indexer"
 DEFAULT_EMBED_URL = "http://localhost:8080"
-DEFAULT_EMBED_MODEL = "Qwen3-Embedding-4B-Q6_K"
-DEFAULT_EMBED_DIM = 2560
+DEFAULT_EMBED_MODEL = "embeddinggemma-2"
+DEFAULT_EMBED_DIM = 768
 DEFAULT_STARTUP_TIMEOUT_S = 120.0
-DEFAULT_SWEEP_SECONDS = 45.0
+DEFAULT_SWEEP_SECONDS = 300.0
 
 
 class SetupAborted(Exception):
@@ -60,6 +60,15 @@ class ExistingSetup:
     embedding: dict[str, Any]
     backend: str
     qdrant: dict[str, Any] | None
+    sweep_seconds: float
+
+
+def _sweep_from_raw(raw: dict[str, Any]) -> float:
+    """The sweep interval a config requests; 0 when absent or invalid."""
+    value = raw.get("sweep_seconds")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return max(0.0, float(value))
 
 
 def _default_repo_root() -> Path | None:
@@ -191,11 +200,17 @@ class Wizard:
                 embedding = self._step_embedding()
                 backend = self._step_vector_store()
                 qdrant = self._step_qdrant() if backend == "qdrant" else None
+                sweep_seconds = self._step_sweep()
             else:
                 embedding = reused.embedding
                 backend = reused.backend
                 qdrant = reused.qdrant
-            sweep_seconds = self._step_sweep()
+                # Reused settings are not asked again; --sweep-seconds still wins.
+                sweep_seconds = (
+                    reused.sweep_seconds
+                    if self.sweep_seconds is None
+                    else self.sweep_seconds
+                )
             install_result = self._step_install()
             self._step_harnesses(install_result)
             config_paths = self._write_global_config(
@@ -413,11 +428,14 @@ class Wizard:
         if base_url is None or model is None:
             self.prompts.say(f"{path} has no embedding.base_url/model; reconfiguring.")
             return None
+        sweep_seconds = _sweep_from_raw(raw)
         self.prompts.say(f"Global config: {path}")
         self.prompts.say(f"  embedding:    {model} ({dim or '?'}-dim) at {base_url}")
         self.prompts.say(f"  vector store: {backend}")
         if service_raw.get("container"):
             self.prompts.say(f"  container:    {service_raw['container']}")
+        if sweep_seconds > 0:
+            self.prompts.say(f"  sweep:        every {sweep_seconds:.0f} s")
         choice = 0
         if self.config_mode is None:
             while True:
@@ -462,7 +480,7 @@ class Wizard:
             qdrant_value.setdefault("url", "http://localhost:6333")
         if self.dry_run:
             self.prompts.say(f"Would reuse {base_url} ({model}).")
-            return ExistingSetup(result, backend, qdrant_value)
+            return ExistingSetup(result, backend, qdrant_value, sweep_seconds)
         probed = probe.embedding_dim(self.http, base_url, model, result["api_key"])
         if probed is None and service_raw.get("container"):
             container = provision.container_name_for(
@@ -504,7 +522,7 @@ class Wizard:
         else:
             result["dim"] = probed
             self.prompts.say(f"Reusing the global embedding setup at {base_url}.")
-        return ExistingSetup(result, backend, qdrant_value)
+        return ExistingSetup(result, backend, qdrant_value, sweep_seconds)
 
     # -- embedding -------------------------------------------------------
 
@@ -1145,10 +1163,7 @@ class Wizard:
             raw = configfile.load_layered_config(paths)
         except ConfigError:
             return 0.0
-        value = raw.get("sweep_seconds")
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return 0.0
-        return max(0.0, float(value))
+        return _sweep_from_raw(raw)
 
     def _step_sweep(self) -> float:
         """Ask about the periodic reconciliation sweep; 0 means watcher only."""

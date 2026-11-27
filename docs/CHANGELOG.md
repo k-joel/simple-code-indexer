@@ -164,6 +164,17 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
   directly after the embedding model and vector store, instead of after the harness selection.
   The prompt order is now: embedding model → vector store → sweep → harness entries
   (global or project) → `.gitignore` (project scope only).
+- Choosing "Use the existing settings and continue" no longer re-asks the sweep question: the
+  stored `sweep_seconds` is kept as-is. It is a global setting, so only a fresh setup or a
+  reconfigure prompts for it; `--sweep-seconds` still overrides a reused config. The existing
+  setup summary now prints the enabled interval as `sweep:` right after `container:`, and omits
+  the line when the sweep is off.
+- **Default model is now EmbeddingGemma 2** (`embeddinggemma-2`, 768-dim), replacing
+  `Qwen3-Embedding-4B-Q6_K` (2560-dim) as the `EMBED_MODEL` / `EMBED_DIM` fallback and the
+  wizard's default for an existing endpoint or container. It is also the first catalog entry, so
+  `setup --yes` downloads it. An existing `config.yaml` keeps its recorded model and dimension.
+- **The wizard offers a 300 s sweep interval by default**, up from 45 s; the answer to the
+  enable/disable question is still off unless asked otherwise.
 - **`symbol_lookup` now works for 167 of the 322 indexable languages, up from 29** (ADR-020).
   Symbol maps are derived at catalog-generation time from each grammar's own tags query
   (`get_tags_query`), which names the real declaration node types; grammars that ship no tags query

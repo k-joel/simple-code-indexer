@@ -58,7 +58,8 @@ def test_defaults_come_from_the_process_cwd(monkeypatch) -> None:
     assert settings.sqlite_vec_cache_size == -262_144
     assert settings.qdrant_url == "http://localhost:6333"
     assert settings.embed_base_url == "http://localhost:8080"
-    assert settings.embed_dim == 2560
+    assert settings.embed_model == "embeddinggemma-2"
+    assert settings.embed_dim == 768
     assert settings.embed_timeout_s == 15.0
     assert settings.embed_api_key is None
     assert settings.embedding_service is None

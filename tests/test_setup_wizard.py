@@ -276,6 +276,20 @@ def _global(home: Path) -> Any:
     return _yaml(home / ".simple-ci" / "config.yaml")
 
 
+def _global_config_block(messages: Sequence[str]) -> list[str]:
+    """The lines printed under "Global config:", stopping at the first prompt."""
+    lines: list[str] = []
+    for message in messages:
+        if message.startswith("Global config: "):
+            lines = [message]
+            continue
+        if lines and message.startswith("  "):
+            lines.append(message)
+        elif lines:
+            break
+    return lines
+
+
 def test_existing_endpoint_writes_one_global_config(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -686,12 +700,88 @@ def test_existing_global_setup_is_reused(tmp_path: Path, monkeypatch) -> None:
     assert any(
         "Reusing the global embedding setup" in line for line in prompts.messages
     )
+    block = _global_config_block(prompts.messages)
+    assert "  container:    simple-ci-embed" in block
+    # This config has no sweep_seconds, so the line is omitted.
+    assert not any(line.startswith("  sweep:") for line in block)
     document = _global(home)
     assert document["embedding"]["dim"] == 768
     assert document["setup"]["model_key"] == "embeddinggemma2"
     assert document["embedding"]["service"]["compose_file"] == str(compose_file)
     assert document["vector_store"] == "sqlite-vec"
     assert not (project / ".simple-ci" / "config.yaml").exists()
+
+
+def test_existing_config_shows_the_sweep_interval_after_the_container(
+    tmp_path: Path,
+) -> None:
+    project, home, repo = _workspace(tmp_path)
+    configfile.write_config(
+        {
+            "version": 1,
+            "sweep_seconds": 300,
+            "vector_store": "faiss",
+            "embedding": {
+                "base_url": "http://localhost:8099",
+                "model": "embeddinggemma-2",
+                "dim": 768,
+                "service": {"container": "simple-ci-embed"},
+            },
+        },
+        home / ".simple-ci" / "config.yaml",
+    )
+    prompts = ScriptedPrompter()
+    wizard = Wizard(
+        cwd=project,
+        home=home,
+        repo_root=repo,
+        prompts=prompts,
+        runner=_docker_runner(),
+        http=FakeHttp(dim=768),
+        harnesses="none",
+        config_mode="use",
+    )
+
+    assert wizard.run() == 0
+
+    block = _global_config_block(prompts.messages)
+    container = next(
+        index for index, line in enumerate(block) if line.startswith("  container:")
+    )
+    assert block[container + 1] == "  sweep:        every 300 s"
+
+
+def test_existing_config_hides_a_disabled_sweep(tmp_path: Path) -> None:
+    project, home, repo = _workspace(tmp_path)
+    configfile.write_config(
+        {
+            "version": 1,
+            "sweep_seconds": 0,
+            "vector_store": "faiss",
+            "embedding": {
+                "base_url": "http://localhost:8099",
+                "model": "embeddinggemma-2",
+                "dim": 768,
+            },
+        },
+        home / ".simple-ci" / "config.yaml",
+    )
+    prompts = ScriptedPrompter()
+    wizard = Wizard(
+        cwd=project,
+        home=home,
+        repo_root=repo,
+        prompts=prompts,
+        runner=_docker_runner(),
+        http=FakeHttp(dim=768),
+        harnesses="none",
+        config_mode="use",
+    )
+
+    assert wizard.run() == 0
+
+    block = _global_config_block(prompts.messages)
+    assert not any(line.startswith("  sweep:") for line in block)
 
 
 def test_a_malformed_global_config_is_not_reused(tmp_path: Path) -> None:
@@ -839,7 +929,7 @@ def test_sweep_is_off_by_default_and_can_be_enabled(tmp_path: Path) -> None:
         repo_root=repo,
         prompts=ScriptedPrompter(yes=[True]),
     )
-    assert enabled._step_sweep() == 45.0
+    assert enabled._step_sweep() == 300.0
 
     custom = Wizard(
         cwd=project,
@@ -864,6 +954,74 @@ def test_existing_sweep_interval_is_reused(tmp_path: Path) -> None:
     )
 
     assert wizard._step_sweep() == 30.0
+
+
+def test_reuse_skips_the_sweep_question_and_keeps_the_stored_interval(
+    tmp_path: Path,
+) -> None:
+    """The sweep is a global setting: a reused config must not re-ask it."""
+    project, home, repo = _workspace(tmp_path)
+    configfile.write_config(
+        {
+            "version": 1,
+            "sweep_seconds": 30,
+            "vector_store": "faiss",
+            "embedding": {
+                "base_url": "http://localhost:8099",
+                "model": "embeddinggemma-2",
+                "dim": DIM,
+            },
+        },
+        home / ".simple-ci" / "config.yaml",
+    )
+    prompts = ScriptedPrompter(yes=[False])
+    wizard = Wizard(
+        cwd=project,
+        home=home,
+        repo_root=repo,
+        prompts=prompts,
+        runner=_docker_runner(),
+        http=FakeHttp(),
+        harnesses="none",
+        config_mode="use",
+    )
+
+    assert wizard.run() == 0
+
+    # A False here would answer the sweep question and store 0.
+    assert _global(home)["sweep_seconds"] == 30
+
+
+def test_sweep_seconds_flag_overrides_a_reused_interval(tmp_path: Path) -> None:
+    project, home, repo = _workspace(tmp_path)
+    configfile.write_config(
+        {
+            "version": 1,
+            "sweep_seconds": 30,
+            "vector_store": "faiss",
+            "embedding": {
+                "base_url": "http://localhost:8099",
+                "model": "embeddinggemma-2",
+                "dim": DIM,
+            },
+        },
+        home / ".simple-ci" / "config.yaml",
+    )
+    wizard = Wizard(
+        cwd=project,
+        home=home,
+        repo_root=repo,
+        prompts=ScriptedPrompter(yes=[False]),
+        runner=_docker_runner(),
+        http=FakeHttp(),
+        harnesses="none",
+        config_mode="use",
+        sweep_seconds=90,
+    )
+
+    assert wizard.run() == 0
+
+    assert _global(home)["sweep_seconds"] == 90
 
 
 def test_sweep_seconds_option_reaches_the_config(tmp_path: Path) -> None:

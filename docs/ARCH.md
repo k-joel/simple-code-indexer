@@ -845,8 +845,8 @@ Precedence is **environment variable > global YAML value > default**. Discovery:
 | `sqlite_vec.mmap_size` | `SQLITE_VEC_MMAP_SIZE` | `1073741824` (mapping limit, not preallocation) |
 | `sqlite_vec.cache_size` | `SQLITE_VEC_CACHE_SIZE` | `-262144` (KiB; negative means KiB) |
 | `embedding.base_url` | `EMBED_BASE_URL` | `http://localhost:8080` |
-| `embedding.model` | `EMBED_MODEL` | `Qwen3-Embedding-4B-Q6_K` |
-| `embedding.dim` | `EMBED_DIM` | `2560` |
+| `embedding.model` | `EMBED_MODEL` | `embeddinggemma-2` |
+| `embedding.dim` | `EMBED_DIM` | `768` |
 | `embedding.api_key` | `EMBED_API_KEY` | unset |
 | `embedding.timeout_s` | `EMBED_TIMEOUT_S` | `15` |
 | `embedding.query_prefix` / `document_prefix` | `EMBED_QUERY_PREFIX` / `EMBED_DOCUMENT_PREFIX` | model default; empty disables |
@@ -1261,7 +1261,11 @@ The setup wizard:
   interpreter can load the extension before offering it) and optionally
   provisions services;
 - asks whether to run the periodic reconciliation sweep and for its interval
-  (global, right after the vector store; default off, `--sweep-seconds` to skip);
+  (global, right after the vector store; default off, `--sweep-seconds` to skip;
+  the offered interval is 300 s). Reusing an existing config (`config_mode: use`)
+  skips the question, keeps the stored `sweep_seconds`, and prints the enabled
+  interval in the "Global config:" block after `container:`, because the sweep is
+  a global setting rather than a per-workspace one;
 - writes **one** global `~/.simple-ci/config.yaml`, merging a legacy local file
   and deleting it;
 - installs the tool with `uv tool install`, editable when a checkout is detectable

@@ -19,8 +19,8 @@ lives in `~/.simple-ci/config.yaml`.
   `semantic=true`, vector search over 30-line chunk windows — overlapping hits are de-duplicated
   automatically.
 - **Fresh on every save.** A file watcher indexes each save as it happens; a startup reconcile
-  heals anything the watcher missed, and an opt-in periodic sweep (`sweep_seconds`) is the
-  backstop. No manual reindex step.
+  heals anything the watcher missed, and a periodic sweep (`sweep_seconds`, every 5 minutes by
+  default) is the backstop. No manual reindex step.
 - **322 indexable languages.** All 371 tree-sitter grammars from `tree-sitter-language-pack`
   are catalogued. Documentation and serialization formats — `.md`, `.txt`, `.json`, `.yaml`,
   `.toml`, and the rest — are deliberately never indexed.
@@ -201,7 +201,7 @@ embedding:
   base_url: http://localhost:8080
   model: embeddinggemma-2
   dim: 768                 # probed by the wizard from the endpoint
-sweep_seconds: 0           # 0 = watcher only (default); >0 = periodic reconcile backstop
+sweep_seconds: 300         # 0 = watcher only; 300 s = periodic reconcile backstop (default)
 ```
 
 Optional sqlite-vec tuning (defaults shown): `sqlite_vec.chunk_size: 64`,
