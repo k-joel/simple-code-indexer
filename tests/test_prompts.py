@@ -36,6 +36,9 @@ class FakeQuestionary:
     def Choice(self, title: str, value: Any, checked: bool = False) -> dict[str, Any]:
         return {"title": title, "value": value, "checked": checked}
 
+    def Separator(self, text: str = "") -> dict[str, Any]:
+        return {"separator": text}
+
     def select(self, message: str, **kwargs: Any) -> FakeQuestion:
         self.calls.append(("select", message, kwargs))
         return FakeQuestion(self.select_answer)
@@ -147,3 +150,55 @@ def test_questionary_is_lazy_imported() -> None:
 
     module: Callable[[], Any] = prompts.Prompter._questionary
     assert module() is not None
+
+
+def test_harness_multi_offers_the_two_shortcut_rows(monkeypatch) -> None:
+    fake = FakeQuestionary(checkbox=[0])
+    _install_fake(monkeypatch, fake)
+
+    Prompter(interactive=True).ask_harness_multi(
+        "which", ["a (a)", "b (b)"], default=[0], detected=[1]
+    )
+
+    _, _, kwargs = fake.calls[-1]
+    choices = kwargs["choices"]
+    assert choices[0]["title"] == "Select all detected"
+    assert choices[1]["title"] == "Unselect all"
+    assert choices[2] == {"separator": ""}
+    assert [choice["checked"] for choice in choices[3:]] == [True, False]
+
+
+def test_select_all_detected_returns_the_detected_set(monkeypatch) -> None:
+    fake = FakeQuestionary(checkbox=["__select_detected__"])
+    _install_fake(monkeypatch, fake)
+
+    selected = Prompter(interactive=True).ask_harness_multi(
+        "which", ["a", "b", "c"], default=[2], detected=[0, 2]
+    )
+
+    assert selected == [0, 2]
+
+
+def test_unselect_all_wins_over_select_all_detected(monkeypatch) -> None:
+    """Clearing is the stronger intent, so it is never silently ignored."""
+    fake = FakeQuestionary(checkbox=["__select_detected__", "__unselect_all__"])
+    _install_fake(monkeypatch, fake)
+
+    assert Prompter(interactive=True).ask_harness_multi("which", ["a"], detected=[0]) == []
+
+
+def test_harness_multi_falls_back_to_numbered_answers() -> None:
+    answers = iter(["", "all", "all-detected", "none", "1,3"])
+    output: list[str] = []
+    prompter = Prompter(
+        input_fn=lambda _prompt: next(answers),
+        output_fn=output.append,
+        interactive=False,
+    )
+
+    assert prompter.ask_harness_multi("which", ["a", "b", "c"], default=[1]) == [1]
+    assert prompter.ask_harness_multi("which", ["a", "b", "c"]) == [0, 1, 2]
+    assert prompter.ask_harness_multi("which", ["a", "b", "c"], detected=[2]) == [2]
+    assert prompter.ask_harness_multi("which", ["a", "b", "c"]) == []
+    assert prompter.ask_harness_multi("which", ["a", "b", "c"]) == [0, 2]
+    assert any("Select all detected" in line for line in output)

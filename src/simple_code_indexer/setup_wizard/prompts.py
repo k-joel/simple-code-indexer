@@ -17,6 +17,26 @@ from collections.abc import Callable, Sequence
 
 _DISABLE_ENV = "SIMPLE_CI_NO_TUI"
 
+_SELECT_DETECTED = "__select_detected__"
+_UNSELECT_ALL = "__unselect_all__"
+
+
+def _resolve_harness_answer(
+    answer: Sequence[object], detected: Sequence[int]
+) -> list[int]:
+    """Fold the two sentinel rows into a plain list of indices.
+
+    "Unselect all" wins over "select all detected" — clearing is the more
+    destructive intent, so it must never be silently ignored — and neither
+    sentinel ever leaks into the returned indices.
+    """
+    chosen = {item for item in answer}
+    if _UNSELECT_ALL in chosen:
+        return []
+    if _SELECT_DETECTED in chosen:
+        return list(detected)
+    return sorted(int(item) for item in chosen if isinstance(item, int))
+
 
 class Prompter:
     def __init__(
@@ -177,6 +197,81 @@ class Prompter:
                     selected.append(index)
             except ValueError:
                 self.say("Enter numbers from the list, or 'all'.")
+                continue
+            return sorted(set(selected))
+
+    # -- harness selection -----------------------------------------------
+
+    def ask_harness_multi(
+        self,
+        question: str,
+        options: Sequence[str],
+        *,
+        default: Sequence[int] = (),
+        detected: Sequence[int] = (),
+        select_all_hint: str = "Select all detected",
+        unselect_all_hint: str = "Unselect all",
+    ) -> list[int]:
+        """A checkbox of harnesses with "select all detected" / "unselect all".
+
+        The two shortcuts are real choices rather than a keybinding, because a
+        questionary checkbox has no portable "select all". They are handled
+        after the answer: either sentinel wins over the individually checked
+        rows, and an answer that keeps them unchecked leaves the selection as
+        the user ticked it.
+        """
+        detected = sorted(set(detected))
+        if self.interactive:
+            prompter = self._questionary()
+            choices = [
+                prompter.Choice(title=select_all_hint, value=_SELECT_DETECTED),
+                prompter.Choice(title=unselect_all_hint, value=_UNSELECT_ALL),
+                prompter.Separator(),
+            ]
+            choices.extend(
+                prompter.Choice(
+                    title=label, value=index, checked=index in set(default)
+                )
+                for index, label in enumerate(options)
+            )
+            answer = prompter.checkbox(question, choices=choices).ask()
+            if answer is None:
+                raise KeyboardInterrupt
+            return _resolve_harness_answer(answer, detected)
+        self.say(question)
+        self.say(f"  all. {select_all_hint}")
+        self.say(f"  none. {unselect_all_hint}")
+        for index, label in enumerate(options, start=1):
+            self.say(f"  {index}. {label}")
+        hint = ", ".join(str(item + 1) for item in default) or "none"
+        while True:
+            answer = (
+                self._input(
+                    f"Numbers, comma-separated, 'all', 'all-detected', "
+                    f"'none', or blank [{hint}]: "
+                )
+                .strip()
+                .lower()
+            )
+            if not answer:
+                return list(default)
+            if answer == "all":
+                return list(range(len(options)))
+            if answer == "all-detected":
+                return detected
+            if answer == "none":
+                return []
+            selected = []
+            try:
+                for token in answer.replace(" ", "").split(","):
+                    index = int(token) - 1
+                    if not 0 <= index < len(options):
+                        raise ValueError
+                    selected.append(index)
+            except ValueError:
+                self.say(
+                    "Enter numbers from the list, 'all', 'all-detected', or 'none'."
+                )
                 continue
             return sorted(set(selected))
 

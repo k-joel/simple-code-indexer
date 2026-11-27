@@ -28,6 +28,7 @@ from simple_code_indexer.harnesses import (
     Scope,
     load_harnesses,
 )
+from simple_code_indexer.harnesses._probe import Detection
 from simple_code_indexer.setup_wizard import (
     catalog,
     entries,
@@ -43,6 +44,8 @@ from simple_code_indexer.setup_wizard.prereqs import gpu_runtime_hint, install_d
 from simple_code_indexer.setup_wizard.prompts import Prompter
 
 SERVER_NAME = "simple-code-indexer"
+LIST_HARNESSES = "__list_harnesses__"
+"""`--harnesses` const: print the detection table and exit, writing nothing."""
 DEFAULT_EMBED_URL = "http://localhost:8080"
 DEFAULT_EMBED_MODEL = "embeddinggemma-2"
 DEFAULT_EMBED_DIM = 768
@@ -107,6 +110,31 @@ def _pinned(
 ) -> list[str]:
     """The argv an entry for `spec` carries; delegates to the one builder."""
     return entries.launch_argv(spec, command, scope, workspace)
+
+
+def _detection_suffix(found: Detection | None) -> str:
+    """The menu label's reason, so an ORed fallback is never silent.
+
+    `cli` means the binary answered its probe; `dir` means only a config
+    directory was found, which is all an extension-only harness can offer.
+    """
+    if found is None:
+        return ""
+    return f" — detected: {found.detail}"
+
+
+def _detection_table(specs: list[HarnessSpec], home: Path, runner: object) -> list[str]:
+    """The `setup --harnesses` report: every plugin, its proof and its scope."""
+    rows = [f"{'harness':16} {'label':22} {'detected':32} config"]
+    for spec in specs:
+        found = spec.detection(home, runner)  # type: ignore[arg-type]
+        state = f"{found.state}: {found.detail}" if found else "-"
+        scope = "global" if not spec.local_configs else "global + project"
+        rows.append(
+            f"{spec.name:16} {spec.label[:22]:22} {state[:32]:32} "
+            f"{spec.global_configs[0]} ({scope})"
+        )
+    return rows
 
 
 def _record(
@@ -282,6 +310,21 @@ class Wizard:
         if self.assume_yes:
             return list(default)
         return self.prompts.ask_multi(question, options, default=default)
+
+    def _ask_harness_multi(
+        self,
+        question: str,
+        options: list[str],
+        *,
+        default: list[int],
+        detected: list[int],
+    ) -> list[int]:
+        """Harness selection with the "select all detected" / "unselect all" rows."""
+        if self.assume_yes:
+            return list(default)
+        return self.prompts.ask_harness_multi(
+            question, options, default=default, detected=detected
+        )
 
     # -- steps -----------------------------------------------------------
 
@@ -1314,23 +1357,31 @@ class Wizard:
         if not specs:
             self.prompts.say("No harness plugins found.")
             return
-        detected = [
-            index
+        detections = {
+            index: spec.detection(self.home, self.runner)
             for index, spec in enumerate(specs)
-            if spec.detected(self.home, self.runner)
-        ]
+        }
+        detected = [index for index, found in detections.items() if found is not None]
         if self.harnesses is not None:
             selected = self._parse_harness_selection(self.harnesses, specs)
         else:
+            recorded = {item["name"] for item in self._record_harnesses}
+            already = [
+                index for index, spec in enumerate(specs) if spec.name in recorded
+            ]
+            # A recorded selection is the user's own answer from a previous run,
+            # so it wins over detection; only a first run (or one that recorded
+            # nothing, e.g. `--harnesses none`) preselects what is installed.
+            default = already if already else detected
             labels = [
-                f"{spec.label} ({spec.name})"
-                + (" — detected" if index in detected else "")
+                f"{spec.label} ({spec.name})" + _detection_suffix(detections[index])
                 for index, spec in enumerate(specs)
             ]
-            selected = self._ask_multi(
+            selected = self._ask_harness_multi(
                 "Install the MCP server for which harnesses?",
                 labels,
-                default=detected,
+                default=default,
+                detected=detected,
             )
         by_name = {spec.name: spec for spec in specs}
         records = {item["name"]: item for item in self._record_harnesses}
@@ -1713,8 +1764,13 @@ def run(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--harnesses",
+        nargs="?",
+        const=LIST_HARNESSES,
         default=None,
-        help="'all', 'none', or a comma-separated list of harness names",
+        help=(
+            "with no value: list every harness and whether it was detected; "
+            "otherwise 'all', 'none', or a comma-separated list of names to install"
+        ),
     )
     parser.add_argument(
         "--harness-scope",
@@ -1781,6 +1837,13 @@ def run(argv: list[str] | None = None) -> int:
         parser.error("--keep-models requires --uninstall")
     if args.install_only and args.uninstall:
         parser.error("--install-only and --uninstall cannot be combined")
+    if args.harnesses == LIST_HARNESSES:
+        # A read-only report: no prompt, no config write, no tool install.
+        if args.uninstall or args.install_only:
+            parser.error("--harnesses without a value only lists; drop the flag")
+        for row in _detection_table(load_harnesses(), Path.home(), provision.Runner()):
+            print(row)
+        return 0
     if args.uninstall:
         conflicts = [name for name, value in install_flags.items() if value is not None]
         if args.wheel:

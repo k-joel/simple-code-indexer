@@ -45,6 +45,8 @@ class ScriptedPrompter(Prompter):
         self._multis = list(multis)
         self.messages: list[str] = []
         self.menus: list[list[str]] = []
+        self.harness_defaults: list[list[int]] = []
+        self.harness_detected: list[list[int]] = []
 
     def say(self, message: str = "") -> None:
         self.messages.append(message)
@@ -84,6 +86,20 @@ class ScriptedPrompter(Prompter):
         default: Sequence[int] = (),
         instruction: str | None = None,
     ) -> list[int]:
+        return self._multis.pop(0) if self._multis else list(default)
+
+    def ask_harness_multi(
+        self,
+        question: str,
+        options: Sequence[str],
+        *,
+        default: Sequence[int] = (),
+        detected: Sequence[int] = (),
+        select_all_hint: str = "Select all detected",
+        unselect_all_hint: str = "Unselect all",
+    ) -> list[int]:
+        self.harness_defaults.append(list(default))
+        self.harness_detected.append(list(detected))
         return self._multis.pop(0) if self._multis else list(default)
 
 
@@ -1930,6 +1946,81 @@ def _scope_wizard(
         harness_scope=scope,
     )
     return wizard, project, home, repo
+
+
+def test_a_recorded_selection_is_preselected_over_detection(tmp_path: Path) -> None:
+    """A second run offers what the user chose last time, not what is installed."""
+    project, home, repo = _workspace(tmp_path)
+    (home / ".cursor").mkdir()
+    prompts = ScriptedPrompter()
+    specs = load_harnesses(user_dirs=[])
+    names = [spec.name for spec in specs]
+    wizard = Wizard(
+        cwd=project,
+        home=home,
+        repo_root=repo,
+        prompts=prompts,
+        runner=FakeRunner(which_map={"cursor": "/bin/cursor"}),
+    )
+    wizard._record_harnesses = [{"name": "kilo", "config": str(tmp_path / "k.json")}]
+
+    wizard._step_harnesses(
+        install_mod.InstallResult(root=tmp_path / "tool-env", platform="linux")
+    )
+
+    assert prompts.harness_defaults == [[names.index("kilo")]]
+    assert names.index("cursor") in prompts.harness_detected[0]
+
+
+def test_the_first_run_preselects_the_detected_harnesses(tmp_path: Path) -> None:
+    project, home, repo = _workspace(tmp_path)
+    (home / ".cursor").mkdir()
+    prompts = ScriptedPrompter(multis=[[]])
+    specs = load_harnesses(user_dirs=[])
+    names = [spec.name for spec in specs]
+    wizard = Wizard(
+        cwd=project,
+        home=home,
+        repo_root=repo,
+        prompts=prompts,
+        runner=FakeRunner(which_map={"codex": "/bin/codex"}),
+    )
+
+    wizard._step_harnesses(
+        install_mod.InstallResult(root=tmp_path / "tool-env", platform="linux")
+    )
+
+    default = prompts.harness_defaults[0]
+    assert names.index("cursor") in default  # config directory
+    assert names.index("codex") in default  # binary that answers
+    assert names.index("zed") not in default
+
+
+def test_listing_the_harnesses_writes_nothing(tmp_path: Path, monkeypatch, capsys) -> None:
+    from simple_code_indexer.setup_wizard import run as wizard_run
+
+    project, home, _repo = _workspace(tmp_path)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+    assert wizard_run(["--harnesses"]) == 0
+
+    out = capsys.readouterr().out
+    assert "claude_code" in out
+    assert "kilo" in out
+    assert "hermes" in out
+    assert not (home / ".simple-ci").exists()
+
+
+def test_a_harness_selection_still_needs_a_value(tmp_path: Path) -> None:
+    """`--harnesses all` keeps selecting; only a bare flag lists."""
+    wizard, _project, _home, _repo = _scope_wizard(
+        tmp_path, harnesses="all", scope="global"
+    )
+    specs = load_harnesses(user_dirs=[])
+
+    assert wizard._parse_harness_selection("all", specs) == list(range(len(specs)))
 
 
 def test_a_project_entry_pins_the_workspace(tmp_path: Path) -> None:
