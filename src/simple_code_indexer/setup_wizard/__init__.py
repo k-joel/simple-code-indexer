@@ -195,9 +195,9 @@ class Wizard:
                 embedding = reused.embedding
                 backend = reused.backend
                 qdrant = reused.qdrant
+            sweep_seconds = self._step_sweep()
             install_result = self._step_install()
             self._step_harnesses(install_result)
-            sweep_seconds = self._step_sweep()
             config_paths = self._write_global_config(
                 embedding, backend, qdrant, sweep_seconds
             )

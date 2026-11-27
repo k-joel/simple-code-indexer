@@ -1260,6 +1260,8 @@ The setup wizard:
 - chooses sqlite-vec, FAISS, or Qdrant (sqlite-vec first, and it probes that the
   interpreter can load the extension before offering it) and optionally
   provisions services;
+- asks whether to run the periodic reconciliation sweep and for its interval
+  (global, right after the vector store; default off, `--sweep-seconds` to skip);
 - writes **one** global `~/.simple-ci/config.yaml`, merging a legacy local file
   and deleting it;
 - installs the tool with `uv tool install`, editable when a checkout is detectable

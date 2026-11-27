@@ -160,6 +160,10 @@ EXAMPLE LAYOUT (4-SPACE INDENTED)
 
 ### Changed
 
+- `setup` asks the periodic-sweep question (and its interval) as part of the global settings,
+  directly after the embedding model and vector store, instead of after the harness selection.
+  The prompt order is now: embedding model → vector store → sweep → harness entries
+  (global or project) → `.gitignore` (project scope only).
 - **`symbol_lookup` now works for 167 of the 322 indexable languages, up from 29** (ADR-020).
   Symbol maps are derived at catalog-generation time from each grammar's own tags query
   (`get_tags_query`), which names the real declaration node types; grammars that ship no tags query

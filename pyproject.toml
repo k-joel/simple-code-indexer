@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Minimal code-index MCP server: file-watcher indexing into SQLite/FTS5 + FAISS (Qdrant optional)"
 readme = "README.md"
 authors = [
-    { name = "k-joel", email = "kjoel86@gmail.com" }
+    { name = "k-joel" }
 ]
 license = "Apache-2.0"
 license-files = ["LICENSE"]

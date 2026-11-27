@@ -68,8 +68,7 @@ machine-wide (global config, uv tool env, harness configs, `~/.simple-ci/`). Red
 
 Do this before calling work done: **`ruff check` → `pyright` → `pytest`**.
 
-On this host `%TEMP%\pytest-of-KJ` is unreadable, so use
-`uv run pytest -p no:cacheprovider --basetemp <writable dir>` (see NOTES.md).
+On this host use `uv run pytest -p no:cacheprovider --basetemp <writable dir>` (see NOTES.md).
 
 After editing Python: `uv run ruff check --fix <file> && uv run ruff format <file>`, then re-run pyright on changed files.
 
