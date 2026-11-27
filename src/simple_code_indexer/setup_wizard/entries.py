@@ -18,7 +18,6 @@ inspects a harness name.
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +31,7 @@ from simple_code_indexer.harnesses import (
     entry_argv,
     expand_config_path,
     pinned_command,
+    spawnable,
 )
 from simple_code_indexer.setup_wizard import write
 from simple_code_indexer.setup_wizard.provision import Runner
@@ -352,19 +352,11 @@ def _run_cli(
 
 
 def _spawnable(argv: list[str]) -> list[str]:
-    """Route a Windows `.cmd`/`.bat` shim through `cmd /c`.
+    """Route a Windows `.cmd`/`.bat` shim through `cmd /c` (see `spawnable`).
 
-    `shutil.which("cursor")` finds `cursor.cmd`, and `subprocess` cannot execute
-    a batch file directly (`WinError 2`). Every Windows client that ships a
-    shim — Cursor, VS Code, npm-installed CLIs — needs this.
+    Kept as a module-local name because tests patch and assert on it here.
     """
-    if os.name != "nt" or not argv:
-        return argv
-    suffix = Path(argv[0]).suffix.lower()
-    if suffix not in {".cmd", ".bat"}:
-        return argv
-    comspec = os.environ.get("COMSPEC") or "cmd.exe"
-    return [comspec, "/c", *argv]
+    return spawnable(argv)
 
 
 def _cli_argv(

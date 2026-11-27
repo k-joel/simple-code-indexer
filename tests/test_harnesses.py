@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -15,6 +16,7 @@ from simple_code_indexer.harnesses import (
     default_user_harness_dirs,
     load_harnesses,
 )
+from simple_code_indexer.harnesses._probe import Detection
 
 COMMAND = ["uvx", "--from", "/repo", "simple-code-indexer"]
 NAME = "simple-code-indexer"
@@ -815,24 +817,82 @@ def test_candidates_use_the_supplied_home(tmp_path: Path) -> None:
     ]
 
 
-def test_detection_uses_home_dirs(tmp_path: Path, monkeypatch) -> None:
-    codex = _spec("codex")
-    monkeypatch.setattr(harnesses_pkg, "_which", lambda _name: None)
+class ProbeRunner:
+    """A `_probe.Runnable` whose binaries answer only if `answers` names them."""
 
-    assert codex.detected(tmp_path) is False
-    (tmp_path / ".codex").mkdir()
-    assert codex.detected(tmp_path) is True
+    def __init__(
+        self,
+        *,
+        which_map: dict[str, str] | None = None,
+        answers: set[str] | None = None,
+        rc: int = 0,
+    ) -> None:
+        self.which_map = which_map or {}
+        self.answers = answers or set()
+        self.rc = rc
+        self.calls: list[list[str]] = []
+
+    def which(self, name: str) -> str | None:
+        return self.which_map.get(name)
+
+    def run(self, argv: list[str], *, timeout: float = 0.0, cwd=None):
+        self.calls.append(list(argv))
+        binary = Path(argv[0]).name.split(".")[0]
+        return SimpleNamespace(returncode=self.rc if binary in self.answers else 1)
 
 
-def test_detection_uses_binaries(tmp_path: Path, monkeypatch) -> None:
-    cursor = _spec("cursor")
-    monkeypatch.setattr(
-        harnesses_pkg,
-        "_which",
-        lambda name: "/bin/cursor" if name == "cursor" else None,
+def test_detection_probes_the_client_cli(tmp_path: Path) -> None:
+    runner = ProbeRunner(which_map={"codex": "/bin/codex"}, answers={"codex"})
+
+    assert _spec("codex").detection(tmp_path, runner) == Detection(
+        "cli", "codex --version"
     )
+    assert runner.calls == [["/bin/codex", "--version"]]
 
-    assert cursor.detected(tmp_path) is True
+
+def test_a_silent_binary_does_not_prove_an_install(tmp_path: Path) -> None:
+    # On PATH but `--version` fails: the binary alone is the weak signal.
+    runner = ProbeRunner(which_map={"codex": "/bin/codex"}, answers=set())
+
+    assert _spec("codex").detection(tmp_path, runner) == Detection(
+        "binary", "codex on PATH"
+    )
+    assert _spec("codex").detected(tmp_path, runner) is True
+
+
+def test_detection_falls_back_to_the_config_directory(tmp_path: Path) -> None:
+    runner = ProbeRunner()
+    codex = _spec("codex")
+
+    assert codex.detection(tmp_path, runner) is None
+    (tmp_path / ".codex").mkdir()
+    assert codex.detection(tmp_path, runner) == Detection("dir", "config dir .codex")
+
+
+def test_a_probe_that_raises_is_never_a_cli_proof(tmp_path: Path) -> None:
+    class Exploding(ProbeRunner):
+        def run(self, argv, *, timeout=0.0, cwd=None):
+            raise OSError("cannot execute")
+
+    spec = _spec("codex")
+    found = spec.detection(tmp_path, Exploding(which_map={"codex": "/bin/codex"}))
+    # On PATH but unexecutable: the weak signal, never the strong one.
+    assert found == Detection("binary", "codex on PATH")
+
+
+def test_only_resolver_harnesses_need_a_harness_flag() -> None:
+    with_flag = {
+        spec.name for spec in load_harnesses(user_dirs=[]) if spec.workspace_resolver
+    }
+    assert with_flag == {"commandcode"}
+
+
+def test_every_plugin_declares_a_probeable_binary_or_a_directory() -> None:
+    """A plugin with neither could never be preselected — a silent regression."""
+    for spec in load_harnesses(user_dirs=[]):
+        assert spec.binaries or spec.home_dirs, spec.name
+        if spec.binaries:
+            assert spec.probe_args, spec.name
 
 
 def test_default_user_dirs_follow_the_workspace(tmp_path: Path, monkeypatch) -> None:

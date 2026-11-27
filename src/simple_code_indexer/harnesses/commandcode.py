@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -12,10 +13,13 @@ from simple_code_indexer.harnesses import RUNTIME_ENV
 NAME = "commandcode"
 LABEL = "Command Code"
 HOME_DIRS = [".commandcode"]
-# `cmd` is the Windows shell, so it must never be a detection binary; `cmdc` is
-# the real CLI (NOTES.md).
-BINARIES: list[str] = []
-CLI_BINARIES = ["cmdc"]
+# `cmd` is the Windows shell, so it must never be probed there; `cmdc` is the
+# real CLI alias (NOTES.md). On POSIX the full name is `command-code` and the
+# short alias really is `cmd`.
+BINARIES: list[str] = (
+    ["command-code", "cmdc"] if sys.platform == "win32" else ["command-code", "cmd"]
+)
+CLI_BINARIES: list[str] = ["command-code", *BINARIES]
 GLOBAL_CONFIGS = ["~/.commandcode/mcp.json"]
 # `project` scope is `.mcp.json` at the project root. Command Code's own
 # `local` scope (`~/.commandcode/projects/<slug>/mcp.json`) is deliberately not

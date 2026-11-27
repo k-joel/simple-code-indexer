@@ -24,7 +24,9 @@ from typing import Any
 NAME = "cursor"
 LABEL = "Cursor"
 HOME_DIRS = [".cursor"]
-BINARIES = ["cursor"]
+# The editor installs the `cursor` shell command; Cursor's standalone agent CLI
+# is a separate install that ships `agent` (cursor.com/docs/cli).
+BINARIES = ["cursor", "agent"]
 CLI_BINARIES = ["cursor"]
 # `%APPDATA%/Cursor/User/settings.json` is deliberately **not** listed: it is
 # Cursor's whole editor settings file, and the wizard's merge would insert an

@@ -10,7 +10,6 @@ import pytest
 import yaml
 
 from simple_code_indexer import configfile, logging_setup, model_prompts
-from simple_code_indexer import harnesses as harnesses_pkg
 from simple_code_indexer.config import ipv4_loopback, load_settings
 from simple_code_indexer.harnesses import load_harnesses
 from simple_code_indexer.setup_wizard import (
@@ -1418,7 +1417,6 @@ def test_install_only_rejects_setup_flags() -> None:
 
 
 def test_an_entry_carries_no_env(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(harnesses_pkg, "_which", lambda _name: None)
     project, home, repo = _workspace(tmp_path)
     (home / ".cursor").mkdir()
     specs = load_harnesses(user_dirs=[])
@@ -1507,7 +1505,6 @@ def test_install_only_refreshes_the_recorded_entries(
 
 
 def test_harness_install_merges_and_backs_up(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(harnesses_pkg, "_which", lambda _name: None)
     project, home, repo = _workspace(tmp_path)
     (home / ".cursor").mkdir()
     target = home / ".cursor" / "mcp.json"
@@ -1661,7 +1658,6 @@ def test_deselecting_the_only_harness_removes_the_created_config(
 def test_a_recorded_harness_path_that_moved_is_cleaned_up(
     tmp_path: Path, monkeypatch
 ) -> None:
-    monkeypatch.setattr(harnesses_pkg, "_which", lambda _name: None)
     project, home, repo = _workspace(tmp_path)
     stale = home / ".old" / "mcp.json"
     stale.parent.mkdir(parents=True)
@@ -2046,7 +2042,6 @@ def test_a_client_without_a_project_config_falls_back_to_global(
 def test_the_client_cli_is_preferred_when_it_is_on_path(
     tmp_path: Path, monkeypatch
 ) -> None:
-    monkeypatch.setattr(harnesses_pkg, "_which", lambda _name: None)
     runner = FakeRunner(
         which_map={"claude": "/usr/bin/claude"}, default=CommandResult(0)
     )
@@ -2074,7 +2069,6 @@ def test_the_client_cli_is_preferred_when_it_is_on_path(
 def test_a_failing_cli_falls_back_to_the_config_file(
     tmp_path: Path, monkeypatch
 ) -> None:
-    monkeypatch.setattr(harnesses_pkg, "_which", lambda _name: None)
 
     def fake_run(argv: list[str], *, timeout: float = 15.0, cwd=None) -> CommandResult:
         return CommandResult(1, "", "boom")
@@ -2095,7 +2089,6 @@ def test_a_failing_cli_falls_back_to_the_config_file(
 
 
 def test_project_scope_offers_gitignore_once(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(harnesses_pkg, "_which", lambda _name: None)
     wizard, project, _home, _repo = _scope_wizard(
         tmp_path, harnesses="cursor", scope="project"
     )
@@ -2114,7 +2107,6 @@ def test_project_scope_offers_gitignore_once(tmp_path: Path, monkeypatch) -> Non
 def test_gitignore_is_left_alone_outside_a_repository(
     tmp_path: Path, monkeypatch
 ) -> None:
-    monkeypatch.setattr(harnesses_pkg, "_which", lambda _name: None)
     wizard, project, _home, _repo = _scope_wizard(
         tmp_path, harnesses="cursor", scope="project"
     )
@@ -2131,7 +2123,6 @@ def test_gitignore_already_covering_the_entry_is_not_rewritten(
 ) -> None:
     from simple_code_indexer.setup_wizard import gitignore
 
-    monkeypatch.setattr(harnesses_pkg, "_which", lambda _name: None)
     wizard, project, _home, _repo = _scope_wizard(
         tmp_path, harnesses="cursor", scope="project"
     )

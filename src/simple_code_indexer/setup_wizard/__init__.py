@@ -1316,7 +1316,9 @@ class Wizard:
             self.prompts.say("No harness plugins found.")
             return
         detected = [
-            index for index, spec in enumerate(specs) if spec.detected(self.home)
+            index
+            for index, spec in enumerate(specs)
+            if spec.detected(self.home, self.runner)
         ]
         if self.harnesses is not None:
             selected = self._parse_harness_selection(self.harnesses, specs)

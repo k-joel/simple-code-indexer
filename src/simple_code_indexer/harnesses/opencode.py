@@ -18,6 +18,8 @@ HOME_DIRS = [
     "%APPDATA%/opencode",
     "%LOCALAPPDATA%/opencode",
 ]
+# `opencode-cli.exe` ships inside the desktop bundle and is not on PATH
+# (NOTES.md), so it is only a CLI fallback for `cli_add`, never a probe.
 BINARIES = ["opencode"]
 CLI_BINARIES = ["opencode", "opencode-cli"]
 GLOBAL_CONFIGS = [

@@ -12,6 +12,10 @@ so detection relies on the config directory instead.
 NAME = "zed"
 LABEL = "Zed"
 HOME_DIRS = ["%APPDATA%/Zed", "~/.config/zed", "~/.zed"]
+# `BINARIES` stays empty on purpose (see the module docstring): a runnable
+# `zed.exe` here is the real editor, but on other machines the name belongs to
+# authzed's SpiceDB CLI. Detection uses the config directory instead — a missed
+# install costs one checkbox, a wrong binary would be exec'd with `--version`.
 BINARIES: list[str] = []
 # Windows Zed writes `%APPDATA%/Zed/settings.json` (verified on 1.x); the XDG
 # path is the macOS/Linux location. `choose_target` prefers an existing file,

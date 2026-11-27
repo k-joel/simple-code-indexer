@@ -5,7 +5,8 @@ Contract (plain module globals):
     NAME            stable id (file stem by convention)
     LABEL           human label shown by the setup wizard
     HOME_DIRS       detection dirs, relative to home or absolute (%VARS% expand)
-    BINARIES        optional CLI names that also count as "installed"
+    BINARIES        optional CLI names that are the strong install signal
+    PROBE_ARGS      optional argv proving BINARIES answers (default --version)
     GLOBAL_CONFIGS  user-scope config files (``~``, ``%APPDATA%`` supported)
     LOCAL_CONFIGS   project-scope config files, relative to the workspace
     FORMAT          "json" (default), "toml" or "yaml"
@@ -23,22 +24,26 @@ Contract (plain module globals):
     cli_root_key    optional: root key inside that file (default: ROOT_KEY)
     resolve_workspace(cwd)  optional: publish this session's workspace at runtime
 
-A plugin that implements ``resolve_workspace`` must also put the reserved
-``SIMPLE_CI_HARNESS=<NAME>`` key into its entry env (``RUNTIME_ENV``), so the
-server asks that plugin — and only that plugin — for the workspace. The key is
-install-scoped (the same value for every project), never a path. Entries written
-before the key existed are still served: when the cwd is not a plausible project
-the server asks every resolver instead (see ``discover_workspace``).
+A plugin that implements ``resolve_workspace`` gets ``serve --harness <NAME>``
+appended to its entry by the wizard (``harness_flag``), so the server asks that
+plugin — and only that plugin — for the workspace. The value is install-scoped
+(the same for every project), never a path. ``SIMPLE_CI_HARNESS`` is still read
+as a debug/pre-marker fallback; the flag wins. Entries written before either
+existed are still served: when the cwd is not a plausible project the server
+asks every resolver instead (see ``discover_workspace``).
 
 Search order (later wins): builtin package → ``<repo>/harnesses`` →
 ``<workspace>/harnesses``. A user plugin overrides a builtin by NAME; bad
 plugins are logged and skipped.
 
 Entries are global-only (ADR-015): a plugin must never put per-project data in
-the entry it builds — no ``cwd`` derived from ``env``, no ``WORKSPACE_ROOT``,
-``INDEX_DB`` or ``FAISS_PATH``. The wizard passes an empty ``env`` unless
-``--no-git-pull`` (debug) adds ``SIMPLE_CI_GIT_PULL=0``, and the
-server infers the workspace from its process cwd at runtime (ADR-007).
+the entry it builds — no ``cwd`` derived from ``env``, no
+``SIMPLE_CI_WORKSPACE_ROOT``, ``SIMPLE_CI_INDEX_DB`` or ``SIMPLE_CI_FAISS_PATH``.
+
+Entries carry **arguments, never environment variables** (ADR-024): every knob
+has a parallel CLI flag, and the wizard's ``env`` is empty for every builtin, so
+a generated entry has no ``env`` block at all. The server infers the workspace
+from its process cwd at runtime (ADR-007).
 
 Project-scope entries are the exception (ADR-022): they are written into the
 workspace, so they carry the explicit pin ``serve --workspace <abs workspace>``
@@ -51,7 +56,6 @@ import importlib.util
 import logging
 import os
 import re
-import shutil
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -59,7 +63,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, cast
 
-from simple_code_indexer.harnesses import _json, _toml, _yaml
+from simple_code_indexer.harnesses import _json, _probe, _toml, _yaml
+from simple_code_indexer.harnesses._probe import Detection
+from simple_code_indexer.harnesses._probe import spawnable as spawnable
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +119,22 @@ not the global-entry hazard ADR-015 banned; it also survives a client that
 spawns stdio children from somewhere else.
 """
 
+HARNESS_FLAG = "--harness"
+"""Names the plugin that launched this session, as an argument (ADR-024).
+
+Replaces the ``SIMPLE_CI_HARNESS`` entry env key: an entry carries arguments,
+never environment variables. Only a plugin with a ``resolve_workspace`` hook
+needs it — nothing else reads it.
+"""
+
+DEFAULT_PROBE_ARGS = ("--version",)
+"""What a client binary must answer for the wizard to call it installed."""
+
+
+def harness_flag(command: list[str], name: str) -> list[str]:
+    """`command` plus the harness marker, for a resolver-owning plugin."""
+    return [*command, HARNESS_FLAG, name]
+
 
 def pinned_command(command: list[str], workspace: Path) -> list[str]:
     """`command` plus the explicit workspace pin, for a project-scope entry."""
@@ -135,7 +157,6 @@ def entry_argv(entry: dict[str, Any]) -> list[str]:
     return []
 
 
-_which = shutil.which
 _UNRESOLVED_VAR = re.compile(r"%[^%]+%")
 
 
@@ -155,19 +176,49 @@ class HarnessSpec:
     workspace_resolver: ResolveWorkspaceFn | None = None
     enabled: bool = False
     cli_binaries: tuple[str, ...] = ()
+    probe_args: tuple[str, ...] = DEFAULT_PROBE_ARGS
     cli_add: CliAddFn | None = None
     cli_remove: CliRemoveFn | None = None
     cli_target: CliTargetFn | None = None
     cli_root_key: str | None = None
 
-    def detected(self, home: Path | None = None) -> bool:
-        """True when one of the harness's home folders or binaries exists."""
+    def detection(
+        self, home: Path | None = None, runner: _probe.Runnable | None = None
+    ) -> Detection | None:
+        """How this harness proved it is installed; None when it did not.
+
+        A binary that answers ``probe_args`` is the strong signal; a binary that
+        is merely on ``PATH`` counts too, and a config directory is the fallback
+        for harnesses with no CLI at all. The signals are ORed on purpose: a
+        false negative hides a real harness (and one cannot offer it), while a
+        stale directory only costs one unchecked checkbox.
+        """
+        probe = runner or _probe.LocalRunner()
+        if self.binaries:
+            found = _probe.probe_binaries(self.binaries, self.probe_args, probe)
+            if found is not None:
+                return found
+        return self._directory_detection(home)
+
+    def detected(
+        self, home: Path | None = None, runner: _probe.Runnable | None = None
+    ) -> bool:
+        """True when the harness looks installed (see `detection`)."""
+        return self.detection(home, runner) is not None
+
+    def _directory_detection(self, home: Path | None) -> Detection | None:
+        """The config directory as the fallback proof.
+
+        The binary-on-`PATH` case belongs to `probe_binaries` and has already
+        been tried; this only answers for a present config directory, which
+        covers the extension-only harnesses that have no CLI at all.
+        """
         root = home or Path.home()
         for raw in self.home_dirs:
             path = expand_config_path(raw, root, root)
             if path is not None and path.is_dir():
-                return True
-        return any(_which(binary) is not None for binary in self.binaries)
+                return Detection(_probe.DIR, f"config dir {raw}")
+        return None
 
     def candidates(
         self, scope: str, workspace: Path, home: Path | None = None
@@ -472,6 +523,7 @@ def _spec_from_module(module: ModuleType, path: Path) -> HarnessSpec | None:
         ),
         enabled=enabled,
         cli_binaries=_string_tuple(module, "CLI_BINARIES", path),
+        probe_args=_string_tuple(module, "PROBE_ARGS", path) or DEFAULT_PROBE_ARGS,
         cli_add=cast(CliAddFn, cli_add) if cli_add is not None else None,
         cli_remove=cast(CliRemoveFn, cli_remove) if cli_remove is not None else None,
         cli_target=cast(CliTargetFn, cli_target) if cli_target is not None else None,
