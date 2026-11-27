@@ -29,3 +29,4 @@ artifacts/
 .env
 .env.*
 *.token
+.mcp.json
