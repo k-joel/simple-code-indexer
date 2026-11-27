@@ -154,6 +154,63 @@ def test_daemon_registers_then_exits_after_grace(
     )
 
 
+def test_daemon_shutdown_is_not_delayed_by_its_own_accept_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ISS-003: a plain `Listener.close()` leaves `accept()` parked on Windows.
+
+    That stalled every shutdown for the full 2 s join timeout, which kept the
+    stale discovery file pollable far longer than the grace period. The daemon
+    now wakes the loop with one self-connection, so exit follows `idle_grace_s`
+    plus a margin instead of the join timeout.
+    """
+    _env(monkeypatch, tmp_path, grace=1.0)
+    settings = _settings(tmp_path, idle_grace_s=1.0)
+    session = _start(settings)
+    try:
+        ready = paths.read_ready(settings)
+        assert ready is not None
+        assert _writer_pid(session) == ready["pid"]
+    finally:
+        session.close()
+
+    closed_at = time.monotonic()
+    _wait_until(
+        lambda: paths.read_ready(settings) is None,
+        timeout=20.0,
+        label="the daemon to exit after the grace period",
+    )
+    elapsed = time.monotonic() - closed_at
+    assert elapsed < 1.0 + 1.5, f"shutdown took {elapsed:.2f}s; the accept join stalled"
+
+
+def test_stop_accepting_is_bounded_when_nobody_accepts(tmp_path: Path) -> None:
+    """A dead accept loop must not hang shutdown.
+
+    `multiprocessing.connection.Client` waits for a pipe instance without a
+    timeout, so the wake-up itself runs on a bounded thread.
+    """
+    from simple_code_indexer.sidecar.daemon import SidecarDaemon
+
+    settings = _settings(tmp_path)
+    daemon = SidecarDaemon(settings)
+    paths.write_token(settings, "0123456789abcdef0123456789abcdef")
+
+    class _Listener:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    listener = _Listener()
+    daemon._listener = listener  # type: ignore[assignment]
+    started = time.monotonic()
+    daemon._stop_accepting()
+    elapsed = time.monotonic() - started
+    assert elapsed < 3.0, f"stop accepting took {elapsed:.2f}s"
+    assert listener.closed
+
+
 def test_a_new_session_during_grace_keeps_the_daemon(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

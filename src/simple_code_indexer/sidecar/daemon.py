@@ -16,7 +16,7 @@ import signal
 import sys
 import threading
 import time
-from multiprocessing.connection import Listener
+from multiprocessing.connection import Client, Listener
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,10 @@ from simple_code_indexer.sidecar import paths, protocol
 from simple_code_indexer.sidecar.registry import Lease, LeaseRegistry
 
 logger = logging.getLogger("simple_code_indexer.sidecar")
+
+# Bound on the self-connection that wakes `_accept_loop` at shutdown; a local
+# pipe/socket connect either completes immediately or the loop is already gone.
+_WAKE_TIMEOUT_S = 1.0
 
 
 class SidecarDaemon:
@@ -69,8 +73,13 @@ class SidecarDaemon:
             self._ready_written = True
             atexit.register(self._shutdown)
             self._install_signal_handlers()
+            listener = self._listener
+            assert listener is not None
             self._accept_thread = threading.Thread(
-                target=self._accept_loop, name="sidecar-accept", daemon=True
+                target=self._accept_loop,
+                args=(listener,),
+                name="sidecar-accept",
+                daemon=True,
             )
             self._accept_thread.start()
             self._reaper_thread = threading.Thread(
@@ -103,12 +112,19 @@ class SidecarDaemon:
             except OSError:
                 pass
 
-    def _accept_loop(self) -> None:
-        assert self._listener is not None
+    def _accept_loop(self, listener: Listener) -> None:
         while not self._stop.is_set():
             try:
-                connection = self._listener.accept()
+                connection = listener.accept()
             except (OSError, EOFError):
+                break
+            if self._stop.is_set():
+                # The self-connection from `_stop_accepting`: acknowledge it and
+                # leave, so shutdown never registers a phantom session.
+                try:
+                    connection.close()
+                except OSError:
+                    pass
                 break
             with self._clients_lock:
                 self._clients.add(connection)
@@ -323,18 +339,54 @@ class SidecarDaemon:
             except (ValueError, OSError):
                 pass
 
+    def _wake_accept_loop(self, token: str) -> None:
+        try:
+            Client(self.endpoint, authkey=token.encode("ascii")).close()
+        except (OSError, EOFError):
+            logger.debug("cannot wake the accept loop", exc_info=True)
+
+    def _stop_accepting(self) -> None:
+        """Wake `_accept_loop`, then close the listener.
+
+        `Listener.close()` does not interrupt a thread already blocked in
+        `accept()` (a Windows named pipe keeps its pending handle, and a POSIX
+        socket close is not a reliable wake either), so a plain close leaves that
+        thread parked and shutdown waits out its join timeout — 2 s on every
+        exit. One self-connection ends the loop deterministically: `_accept_loop`
+        recognises it by the already-set stop event and closes it without
+        registering a session.
+
+        The connect runs on its own thread with a short join because
+        `multiprocessing.connection.Client` waits for a pipe instance with no
+        timeout: if the accept loop has already died, the connect would block
+        shutdown forever. The thread is a daemon, so a pathological case costs at
+        most the join below and never the process.
+        """
+        listener, self._listener = self._listener, None
+        if listener is None:
+            return
+        token = paths.read_token(self.settings)
+        if token is not None:
+            wake = threading.Thread(
+                target=self._wake_accept_loop,
+                args=(token,),
+                name="sidecar-wake",
+                daemon=True,
+            )
+            wake.start()
+            wake.join(_WAKE_TIMEOUT_S)
+        try:
+            listener.close()
+        except OSError:
+            pass
+
     def _shutdown(self) -> None:
         if self._shutdown_done:
             return
         self._shutdown_done = True
         self._draining = True
         self._stop.set()
-        listener, self._listener = self._listener, None
-        if listener is not None:
-            try:
-                listener.close()
-            except OSError:
-                pass
+        self._stop_accepting()
         with self._clients_lock:
             clients = list(self._clients)
         for connection in clients:
@@ -342,17 +394,17 @@ class SidecarDaemon:
                 connection.close()
             except OSError:
                 pass
-        for thread in (self._accept_thread, self._reaper_thread):
-            if thread is not None:
-                thread.join(2.0)
-        # Clear discovery while the writer lease is still held, so a new daemon
-        # cannot publish its own files and have this process delete them.
+        # Clear discovery before the runtime stops, so a reader that has just
+        # lost the session cannot see a ready file that points at a dying daemon.
         if self._ready_written:
             paths.clear_ready(self.settings)
             self._ready_written = False
         if self._token_written:
             paths.clear_token(self.settings)
             self._token_written = False
+        for thread in (self._accept_thread, self._reaper_thread):
+            if thread is not None:
+                thread.join(2.0)
         if sys.platform != "win32":
             try:
                 Path(self.endpoint).unlink()

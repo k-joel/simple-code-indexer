@@ -67,6 +67,32 @@ def test_ready_file_round_trip_and_clear(tmp_path: Path) -> None:
     assert paths.read_ready(settings) is None
 
 
+def test_ready_clear_survives_a_reader_holding_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ISS-003: on Windows an open read handle defeats `unlink`, not the clear.
+
+    A reader polls `daemon.json` continuously, so a daemon's shutdown has to
+    invalidate it even while another handle holds it open; otherwise the file
+    outlives the daemon and `read_ready` keeps reporting a live endpoint.
+    """
+    settings = _settings(tmp_path)
+    paths.write_ready(settings, pid=12345, endpoint=paths.endpoint(settings))
+    ready = paths.state_paths(settings).ready
+    original_unlink = Path.unlink
+
+    def sharing_violation(path: Path, *, missing_ok: bool = False) -> None:
+        if path == ready:
+            raise PermissionError(13, "sharing violation", str(path))
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", sharing_violation)
+    with ready.open("rb") as handle:
+        paths.clear_ready(settings)
+        assert handle.read() == b""
+    assert paths.read_ready(settings) is None
+
+
 def test_token_round_trip_and_clear(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     assert paths.read_token(settings) is None

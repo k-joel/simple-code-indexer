@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from simple_code_indexer.config import Settings, normalize_workspace_path
+
+logger = logging.getLogger("simple_code_indexer.sidecar")
 
 PROTOCOL_VERSION = 1
 READY_FILENAME = "daemon.json"
@@ -105,11 +108,29 @@ def read_ready(settings: Settings) -> dict[str, Any] | None:
     return payload
 
 
-def clear_ready(settings: Settings) -> None:
+def _clear(path: Path) -> None:
+    """Invalidate a discovery file, even while a reader has it open.
+
+    Windows denies `unlink` while another handle has the file open for reading
+    (no `FILE_SHARE_DELETE`), and readers poll `daemon.json` continuously, so a
+    failed delete is routine at shutdown rather than exceptional. Truncation
+    succeeds under a shared read handle and every reader already treats empty
+    content as absent (`read_ready`/`read_spawn_claim` reject it, `read_token`
+    returns None), so the file can never outlive the daemon that published it.
+    """
     try:
-        state_paths(settings).ready.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+        return
     except OSError:
         pass
+    try:
+        path.write_text("", encoding="utf-8")
+    except OSError:
+        logger.warning("cannot invalidate the discovery file %s", path, exc_info=True)
+
+
+def clear_ready(settings: Settings) -> None:
+    _clear(state_paths(settings).ready)
 
 
 def write_spawn_claim(settings: Settings, *, pid: int) -> Path:
@@ -142,10 +163,7 @@ def read_spawn_claim(settings: Settings) -> dict[str, Any] | None:
 
 
 def clear_spawn_claim(settings: Settings) -> None:
-    try:
-        state_paths(settings).spawn_claim.unlink(missing_ok=True)
-    except OSError:
-        pass
+    _clear(state_paths(settings).spawn_claim)
 
 
 def write_token(settings: Settings, token: str) -> Path:
@@ -165,7 +183,4 @@ def read_token(settings: Settings) -> str | None:
 
 
 def clear_token(settings: Settings) -> None:
-    try:
-        state_paths(settings).token.unlink(missing_ok=True)
-    except OSError:
-        pass
+    _clear(state_paths(settings).token)
