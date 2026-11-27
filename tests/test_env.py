@@ -1,8 +1,7 @@
-"""The env-var seam: every knob is prefixed, legacy names still work (ADR-024)."""
+"""The env-var seam: every knob is prefixed, and nothing else is read (ADR-024)."""
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 
 import pytest
@@ -16,30 +15,23 @@ def test_names_are_prefixed() -> None:
     assert env.name("SIMPLE_CI_LOG_LEVEL") == "SIMPLE_CI_LOG_LEVEL"
 
 
-def test_the_prefixed_name_is_read_first(monkeypatch) -> None:
+def test_get_reads_the_prefixed_name(monkeypatch) -> None:
     monkeypatch.setenv("SIMPLE_CI_LOG_LEVEL", "error")
-    monkeypatch.setenv("LOG_LEVEL", "debug")
 
     assert env.get("LOG_LEVEL") == "error"
+    assert env.get("SIMPLE_CI_LOG_LEVEL") == "error"
 
 
-def test_a_legacy_name_still_works_and_warns_once(monkeypatch, caplog) -> None:
+def test_a_bare_legacy_name_is_not_read(monkeypatch) -> None:
+    """The rename is complete: there is no second vocabulary to honour."""
     monkeypatch.delenv("SIMPLE_CI_LOG_LEVEL", raising=False)
     monkeypatch.setenv("LOG_LEVEL", "info")
-    env._warned.clear()
 
-    with caplog.at_level(logging.WARNING):
-        assert env.get("LOG_LEVEL") == "info"
-        assert env.get("LOG_LEVEL") == "info"
-
-    warnings = [line for line in caplog.text.splitlines() if "deprecated" in line]
-    assert len(warnings) == 1
-    assert "SIMPLE_CI_LOG_LEVEL" in warnings[0]
+    assert env.get("LOG_LEVEL") is None
 
 
 def test_unset_returns_none(monkeypatch) -> None:
     monkeypatch.delenv("SIMPLE_CI_LOG_LEVEL", raising=False)
-    monkeypatch.delenv("LOG_LEVEL", raising=False)
 
     assert env.get("LOG_LEVEL") is None
 
