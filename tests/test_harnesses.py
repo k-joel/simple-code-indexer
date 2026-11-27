@@ -37,7 +37,7 @@ def test_builtin_harnesses_load() -> None:
     specs = load_harnesses(user_dirs=[])
     names = {spec.name for spec in specs}
 
-    assert len(specs) >= 12
+    assert len(specs) >= 17
     assert {
         "claude_code",
         "claude_desktop",
@@ -52,6 +52,10 @@ def test_builtin_harnesses_load() -> None:
         "mimo",
         "goose",
         "pi",
+        "hermes",
+        "openclaw",
+        "kilo",
+        "cline",
     } <= names
 
 
@@ -401,8 +405,12 @@ LOCAL_CONFIGS = {
     "zed": [".zed/settings.json"],
     "mimo": [".mimocode/mimocode.jsonc", ".mimocode/mimocode.json"],
     "windsurf": [".devin/mcp_config.json", ".devin/mcp_config.local.json"],
+    "kilo": ["kilo.jsonc", "kilo.json", ".kilo/kilo.jsonc", ".kilo/kilo.json"],
     "goose": [],
     "claude_desktop": [],
+    "hermes": [],
+    "openclaw": [],
+    "cline": [],
 }
 
 
@@ -434,8 +442,8 @@ def test_entry_argv_handles_every_client_shape() -> None:
 
 
 def test_only_supported_clients_emit_enabled() -> None:
-    """`enabled` exists in Codex/Pi/Goose/MiMo/Command Code, and nowhere else."""
-    supported = {"codex", "pi", "goose", "mimo", "commandcode"}
+    """`enabled` exists where the client documents it, and nowhere else."""
+    supported = {"codex", "pi", "goose", "mimo", "commandcode", "kilo"}
     for spec in load_harnesses(user_dirs=[]):
         rendered = spec.render("", name=NAME, command=COMMAND, env={})
         if spec.name in supported:
@@ -455,6 +463,52 @@ def test_pi_enables_the_server() -> None:
     entry = json.loads(_spec("pi").render("", name=NAME, command=COMMAND, env={}))
 
     assert entry["mcpServers"][NAME]["enabled"] is True
+
+
+def test_the_new_clients_write_their_documented_shape() -> None:
+    """Hermes (YAML), OpenClaw (JSON5), Kilo (command array), Cline (mcpServers)."""
+    hermes = yaml.safe_load(
+        _spec("hermes").render("", name=NAME, command=COMMAND, env={})
+    )
+    assert hermes["mcp_servers"][NAME] == {
+        "command": "uvx",
+        "args": ["--from", "/repo", NAME],
+    }
+
+    openclaw = json.loads(
+        _spec("openclaw").render("", name=NAME, command=COMMAND, env={})
+    )
+    assert openclaw["mcp"]["servers"][NAME] == {
+        "command": "uvx",
+        "args": ["--from", "/repo", NAME],
+    }
+
+    kilo = json.loads(_spec("kilo").render("", name=NAME, command=COMMAND, env={}))
+    assert kilo["mcp"][NAME] == {
+        "type": "local",
+        "command": COMMAND,
+        "enabled": True,
+        "timeout": 120000,
+    }
+
+    cline = json.loads(_spec("cline").render("", name=NAME, command=COMMAND, env={}))
+    assert cline["mcpServers"][NAME] == {
+        "command": "uvx",
+        "args": ["--from", "/repo", NAME],
+        "disabled": False,
+        "autoApprove": [],
+    }
+
+
+def test_a_jsonc_client_keeps_comments_it_can_parse() -> None:
+    """Kilo's `~/.config/kilo/kilo.jsonc` and OpenClaw's JSON5 both comment."""
+    existing = '{\n  // a comment\n  "theme": "dark",\n}\n'
+
+    updated = _spec("kilo").render(existing, name=NAME, command=COMMAND, env={})
+
+    document = json.loads(updated)
+    assert document["theme"] == "dark"
+    assert document["mcp"][NAME]["type"] == "local"
 
 
 def test_cli_adapters_build_the_documented_argv(tmp_path: Path) -> None:
@@ -498,6 +552,23 @@ def test_cli_adapters_build_the_documented_argv(tmp_path: Path) -> None:
         "mimo": (None, None),
         "goose": (None, None),
         "claude_desktop": (None, None),
+        "kilo": (None, None),
+        "hermes": (None, None),
+        # OpenClaw hands its CLI the entry as one JSON object, like `cmdc`.
+        "openclaw": (
+            [
+                "openclaw",
+                "mcp",
+                "set",
+                NAME,
+                json.dumps(_spec("openclaw").entry(command, {})),
+            ],
+            None,
+        ),
+        "cline": (
+            ["cline", "mcp", "add", NAME, "--yes", "--", *command],
+            None,
+        ),
     }
     for name, (global_argv, project_argv) in cases.items():
         spec = _spec(name)
